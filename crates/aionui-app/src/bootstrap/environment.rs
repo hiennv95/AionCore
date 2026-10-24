@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use tracing::{info, warn};
 
-use aionui_app::{AppConfig, IdentityMode};
+use aionui_app::{AllowedOrigins, AppConfig, IdentityMode};
 use aionui_db::Database;
 use aionui_runtime::ShellProbeStatus;
 
@@ -23,6 +23,8 @@ pub struct ServerEnvironment {
     pub config: AppConfig,
     /// Built web client to serve alongside the API (`--static-dir`).
     pub static_dir: Option<PathBuf>,
+    /// Browser origins allowed to call the server (`--allowed-origin`).
+    pub allowed_origins: Option<AllowedOrigins>,
 }
 
 /// Layer 1: Logging + config resolution.
@@ -126,10 +128,26 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         info!(static_dir = %dir.display(), "startup: static web client enabled");
     }
 
+    let allowed_origins = if cli.allowed_origins.is_empty() {
+        None
+    } else {
+        let origins = AllowedOrigins::parse(&cli.allowed_origins).map_err(|error| {
+            BootstrapError::new(
+                BootstrapErrorCode::ConfigInvalid,
+                "config.allowed_origin",
+                "invalid startup configuration",
+            )
+            .with_source(error)
+        })?;
+        info!(allowed_origins = ?origins.sorted(), "startup: browser origin allowlist enabled");
+        Some(origins)
+    };
+
     Ok(ServerEnvironment {
         _log_guard: log_guard,
         config,
         static_dir,
+        allowed_origins,
     })
 }
 

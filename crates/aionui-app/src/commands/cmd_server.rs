@@ -14,7 +14,9 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use aionui_api_types::{RuntimeStatusScope, RuntimeStatusScopeKind};
-use aionui_app::{AppConfig, AppServices, RouterBuildError, create_router_with_runtime, with_static_web};
+use aionui_app::{
+    AppConfig, AppServices, RouterBuildError, create_router_with_runtime, with_origin_guard, with_static_web,
+};
 use aionui_system::RuntimePrepareService;
 use aionui_team::TeamIdleCleanupCoordinator;
 
@@ -278,6 +280,11 @@ pub(crate) async fn run_server(
         .map_err(router_build_error_to_bootstrap)?;
     let router = match &env.static_dir {
         Some(dir) => with_static_web(router, dir),
+        None => router,
+    };
+    // Outermost: must see every request before CORS, auth, WS upgrade or static files.
+    let router = match &env.allowed_origins {
+        Some(allowed) => with_origin_guard(router, allowed.clone()),
         None => router,
     };
     info!(

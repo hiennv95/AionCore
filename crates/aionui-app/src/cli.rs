@@ -66,6 +66,12 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub static_dir: Option<PathBuf>,
 
+    /// Browser origin (scheme://host[:port]) allowed to call this server; repeatable.
+    /// When given, any request whose Origin header is not listed is rejected with 403,
+    /// including CORS preflights and WebSocket upgrades. Disabled when omitted.
+    #[arg(long = "allowed-origin", value_name = "URL")]
+    pub allowed_origins: Vec<String>,
+
     /// Managed runtime resource source selection.
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,
