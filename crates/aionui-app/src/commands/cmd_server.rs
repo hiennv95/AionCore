@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 use aionui_api_types::{RuntimeStatusScope, RuntimeStatusScopeKind};
-use aionui_app::{AppConfig, AppServices, RouterBuildError, create_router_with_runtime};
+use aionui_app::{AppConfig, AppServices, RouterBuildError, create_router_with_runtime, with_static_web};
 use aionui_system::RuntimePrepareService;
 use aionui_team::TeamIdleCleanupCoordinator;
 
@@ -276,6 +276,10 @@ pub(crate) async fn run_server(
     let (router, router_runtime) = create_router_with_runtime(&services)
         .await
         .map_err(router_build_error_to_bootstrap)?;
+    let router = match &env.static_dir {
+        Some(dir) => with_static_web(router, dir),
+        None => router,
+    };
     info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: router ready for bound socket"

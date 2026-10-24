@@ -61,6 +61,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub recover_corrupted_database: bool,
 
+    /// Serve a built single-page web client from this directory for every path the
+    /// API does not handle. Must contain index.html. Disabled when omitted.
+    #[arg(long)]
+    pub static_dir: Option<PathBuf>,
+
     /// Managed runtime resource source selection.
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,

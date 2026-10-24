@@ -1,5 +1,6 @@
 //! Bootstrap layers shared by non-MCP subcommands.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use tracing::{info, warn};
@@ -20,6 +21,8 @@ pub struct ServerEnvironment {
     /// Must be held alive for the process lifetime to flush log buffers.
     pub _log_guard: LogGuards,
     pub config: AppConfig,
+    /// Built web client to serve alongside the API (`--static-dir`).
+    pub static_dir: Option<PathBuf>,
 }
 
 /// Layer 1: Logging + config resolution.
@@ -98,9 +101,35 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         "startup: identity mode resolved"
     );
 
+    let static_dir = cli
+        .static_dir
+        .as_deref()
+        .map(std::path::absolute)
+        .transpose()
+        .map_err(|error| {
+            BootstrapError::new(
+                BootstrapErrorCode::ConfigInvalid,
+                "config.static_dir",
+                "invalid startup configuration",
+            )
+            .with_source(error)
+        })?;
+    if let Some(dir) = &static_dir {
+        aionui_app::validate_static_dir(dir).map_err(|error| {
+            BootstrapError::new(
+                BootstrapErrorCode::ConfigInvalid,
+                "config.static_dir",
+                "invalid startup configuration",
+            )
+            .with_source(error)
+        })?;
+        info!(static_dir = %dir.display(), "startup: static web client enabled");
+    }
+
     Ok(ServerEnvironment {
         _log_guard: log_guard,
         config,
+        static_dir,
     })
 }
 

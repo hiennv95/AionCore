@@ -9,6 +9,7 @@ mod routes;
 mod runtime_team_tools;
 mod scm_monitor;
 mod state;
+mod static_web;
 mod system_file_opener;
 mod team_capability_resolver;
 mod team_conversation_adapters;
@@ -21,3 +22,4 @@ pub use state::{
     ChannelOrchestratorComponents, ModuleStates, RouterBuildError, build_assistant_state, build_conversation_state,
     build_extension_states, build_module_states, build_ws_state,
 };
+pub use static_web::{StaticDirError, validate_static_dir, with_static_web};
