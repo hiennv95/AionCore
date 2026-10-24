@@ -683,6 +683,62 @@ async fn t9_1_refresh_token_success() {
 }
 
 #[tokio::test]
+async fn t9_strict_refresh_rejects_access_token_in_body() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    ctx.jwt_service.set_strict_refresh(true);
+
+    let body = format!(r#"{{"token":"{token}"}}"#);
+    let resp = app.oneshot(json_post("/api/auth/refresh", &body)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+    assert!(json.get("token").is_none());
+}
+
+#[tokio::test]
+async fn t9_strict_refresh_accepts_refresh_token_in_body() {
+    let (app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let login_resp = app
+        .clone()
+        .oneshot(json_post("/login", r#"{"username":"admin","password":"StrongP@ss1"}"#))
+        .await
+        .unwrap();
+    let refresh = extract_refresh_token(&login_resp).expect("login should set the refresh cookie");
+    ctx.jwt_service.set_strict_refresh(true);
+
+    let body = format!(r#"{{"token":"{refresh}"}}"#);
+    let resp = app.oneshot(json_post("/api/auth/refresh", &body)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(ctx.jwt_service.verify_access(json["token"].as_str().unwrap()).is_ok());
+    assert!(
+        ctx.jwt_service
+            .verify_refresh(json["refresh_token"].as_str().unwrap())
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn t9_short_access_ttl_applies_to_login_and_refresh() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    ctx.jwt_service.set_access_ttl(std::time::Duration::from_secs(900));
+    let (token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    let login_claims = ctx.jwt_service.verify_access(&token).unwrap();
+    assert_eq!(login_claims.exp - login_claims.iat, 900);
+
+    let body = format!(r#"{{"token":"{token}"}}"#);
+    let json = body_json(app.oneshot(json_post("/api/auth/refresh", &body)).await.unwrap()).await;
+    let refreshed = ctx.jwt_service.verify_access(json["token"].as_str().unwrap()).unwrap();
+    assert_eq!(refreshed.exp - refreshed.iat, 900);
+}
+
+#[tokio::test]
 async fn t9_2_refresh_invalid_token() {
     let (app, _ctx) = test_app().await;
 

@@ -1,5 +1,6 @@
 use std::fmt::Write as _;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -82,6 +83,12 @@ pub struct JwtService {
     secret: RwLock<String>,
     /// Blacklisted token hashes -> expiry timestamps.
     blacklist: DashMap<String, u64>,
+    /// Lifetime of newly signed access tokens, in seconds. Defaults to
+    /// [`ACCESS_TOKEN_EXPIRY`]; a host may shorten it once at startup.
+    access_ttl_secs: AtomicU64,
+    /// When set, the refresh endpoint accepts only refresh tokens on every
+    /// path (body included), never an access token. Set once at startup.
+    strict_refresh: AtomicBool,
 }
 
 impl JwtService {
@@ -92,7 +99,25 @@ impl JwtService {
         Self {
             secret: RwLock::new(secret),
             blacklist: DashMap::new(),
+            access_ttl_secs: AtomicU64::new(ACCESS_TOKEN_EXPIRY.as_secs()),
+            strict_refresh: AtomicBool::new(false),
         }
+    }
+
+    /// Override the lifetime of access tokens signed from now on.
+    /// Intended to be called once at startup, before serving requests.
+    pub fn set_access_ttl(&self, ttl: Duration) {
+        self.access_ttl_secs.store(ttl.as_secs(), Ordering::Relaxed);
+    }
+
+    /// Require refresh tokens on every refresh path. Intended to be called once at startup.
+    pub fn set_strict_refresh(&self, strict: bool) {
+        self.strict_refresh.store(strict, Ordering::Relaxed);
+    }
+
+    /// Whether the refresh endpoint must reject access tokens on the body path too.
+    pub fn strict_refresh(&self) -> bool {
+        self.strict_refresh.load(Ordering::Relaxed)
     }
 
     /// Sign a new access JWT for the given user. Convenience for callers that
@@ -103,8 +128,8 @@ impl JwtService {
 
     /// Sign an access JWT bound to the user's current session generation.
     ///
-    /// Access tokens authenticate ordinary requests and carry the
-    /// [`ACCESS_TOKEN_EXPIRY`]. Pair with [`JwtService::sign_refresh`] to also
+    /// Access tokens authenticate ordinary requests and carry the configured
+    /// access lifetime ([`ACCESS_TOKEN_EXPIRY`] unless overridden). Pair with [`JwtService::sign_refresh`] to also
     /// issue the long-lived refresh token used to renew this one.
     pub fn sign_with_session_generation(
         &self,
@@ -117,7 +142,7 @@ impl JwtService {
             username,
             session_generation,
             TokenType::Access,
-            ACCESS_TOKEN_EXPIRY,
+            Duration::from_secs(self.access_ttl_secs.load(Ordering::Relaxed)),
         )
     }
 
@@ -382,6 +407,26 @@ mod tests {
         assert_eq!(payload.iss, JWT_ISSUER);
         assert_eq!(payload.aud, JWT_AUDIENCE);
         assert!(payload.exp > payload.iat);
+    }
+
+    #[test]
+    fn access_ttl_override_applies_to_new_access_tokens_only() {
+        let service = test_service();
+        service.set_access_ttl(Duration::from_secs(900));
+        let access = service.verify(&service.sign("user_1", "admin").unwrap()).unwrap();
+        assert_eq!(access.exp - access.iat, 900);
+        let refresh = service
+            .verify_refresh(&service.sign_refresh("user_1", "admin", 0).unwrap())
+            .unwrap();
+        assert_eq!(refresh.exp - refresh.iat, REFRESH_TOKEN_EXPIRY.as_secs());
+    }
+
+    #[test]
+    fn strict_refresh_defaults_off_and_can_be_enabled() {
+        let service = test_service();
+        assert!(!service.strict_refresh());
+        service.set_strict_refresh(true);
+        assert!(service.strict_refresh());
     }
 
     #[test]

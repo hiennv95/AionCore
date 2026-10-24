@@ -1,7 +1,7 @@
 //! Bootstrap layers shared by non-MCP subcommands.
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
@@ -16,6 +16,10 @@ use super::tracing_init::{LogGuards, init_tracing};
 use super::work_dir::resolve_work_dir;
 use super::{BootstrapError, BootstrapErrorCode};
 
+/// Bounds for `--access-token-ttl-secs`: one minute to the default 30 days.
+const MIN_ACCESS_TOKEN_TTL_SECS: u64 = 60;
+const MAX_ACCESS_TOKEN_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Resolved environment needed by all non-MCP subcommands.
 pub struct ServerEnvironment {
     /// Must be held alive for the process lifetime to flush log buffers.
@@ -25,6 +29,10 @@ pub struct ServerEnvironment {
     pub static_dir: Option<PathBuf>,
     /// Browser origins allowed to call the server (`--allowed-origin`).
     pub allowed_origins: Option<AllowedOrigins>,
+    /// Accept only refresh tokens on every refresh path (`--strict-refresh`).
+    pub strict_refresh: bool,
+    /// Lifetime of newly issued access tokens (`--access-token-ttl-secs`).
+    pub access_token_ttl: Option<Duration>,
 }
 
 /// Layer 1: Logging + config resolution.
@@ -143,11 +151,36 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         Some(origins)
     };
 
+    let access_token_ttl = cli
+        .access_token_ttl_secs
+        .map(|secs| {
+            if (MIN_ACCESS_TOKEN_TTL_SECS..=MAX_ACCESS_TOKEN_TTL_SECS).contains(&secs) {
+                Ok(Duration::from_secs(secs))
+            } else {
+                Err(BootstrapError::new(
+                    BootstrapErrorCode::ConfigInvalid,
+                    "config.access_token_ttl",
+                    "invalid startup configuration",
+                )
+                .with_field("access_token_ttl_secs", secs.to_string()))
+            }
+        })
+        .transpose()?;
+    if cli.strict_refresh || access_token_ttl.is_some() {
+        info!(
+            strict_refresh = cli.strict_refresh,
+            access_token_ttl_secs = access_token_ttl.map(|ttl| ttl.as_secs()),
+            "startup: token policy overrides enabled"
+        );
+    }
+
     Ok(ServerEnvironment {
         _log_guard: log_guard,
         config,
         static_dir,
         allowed_origins,
+        strict_refresh: cli.strict_refresh,
+        access_token_ttl,
     })
 }
 

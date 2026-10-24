@@ -877,7 +877,9 @@ async fn refresh_tokens(
     raw_token: &str,
     from_cookie: bool,
 ) -> Result<RefreshedTokens, RefreshError> {
-    let payload = if from_cookie {
+    // The body path stays lenient for legacy clients that post their access
+    // token, unless the host opted into strict refresh (--strict-refresh).
+    let payload = if from_cookie || state.jwt_service.strict_refresh() {
         state.jwt_service.verify_refresh(raw_token)
     } else {
         state.jwt_service.verify(raw_token)

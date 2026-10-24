@@ -72,6 +72,16 @@ pub(crate) struct Cli {
     #[arg(long = "allowed-origin", value_name = "URL")]
     pub allowed_origins: Vec<String>,
 
+    /// Accept only refresh tokens at /api/auth/refresh, on the body path too
+    /// (by default the body path also accepts an access token for legacy clients).
+    #[arg(long)]
+    pub strict_refresh: bool,
+
+    /// Lifetime in seconds of newly issued access tokens (60..=2592000).
+    /// Defaults to 30 days when omitted.
+    #[arg(long, value_name = "SECS")]
+    pub access_token_ttl_secs: Option<u64>,
+
     /// Managed runtime resource source selection.
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,

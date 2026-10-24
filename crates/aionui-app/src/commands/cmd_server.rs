@@ -275,6 +275,12 @@ pub(crate) async fn run_server(
         info!("No configured users detected — initial setup required via /api/auth/status");
     }
 
+    // Token policy must be in place before any token is signed or verified.
+    if let Some(ttl) = env.access_token_ttl {
+        services.jwt_service.set_access_ttl(ttl);
+    }
+    services.jwt_service.set_strict_refresh(env.strict_refresh);
+
     let (router, router_runtime) = create_router_with_runtime(&services)
         .await
         .map_err(router_build_error_to_bootstrap)?;
