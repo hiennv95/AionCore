@@ -8,7 +8,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 
 use aionui_common::ApiError;
-use aionui_db::{IUserRepository, UserStatus, UserType};
+use aionui_db::{IDeviceRepository, IUserRepository, UserStatus, UserType};
 
 use crate::JwtService;
 use crate::extract::extract_token_from_headers;
@@ -65,6 +65,13 @@ impl CurrentUser {
     }
 }
 
+/// Marks a request authenticated through the runtime-token channel: an agent's
+/// helper CLI, not the owner at a client. Inserted only after the token was
+/// verified (request extensions cannot be set by a client); never present on a
+/// JWT-authenticated request. Owner-management routes refuse it.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeHelperCaller;
+
 /// Shared state for the authentication middleware.
 #[derive(Clone)]
 pub struct AuthState {
@@ -75,6 +82,41 @@ pub struct AuthState {
     /// (`aioncore config` / `diagnose`), which cannot carry a JWT or cookies.
     /// `None` disables the channel (requests without a JWT are rejected).
     pub runtime_token_verifier: Option<Arc<dyn IRuntimeTokenVerifier>>,
+    /// Client devices (ADR-011). When set, a token bound to a device is only
+    /// accepted while that device exists, belongs to the token's user and is not
+    /// revoked. `None` rejects every device-bound token.
+    pub device_repo: Option<Arc<dyn IDeviceRepository>>,
+}
+
+/// The device a device-bound request comes from (ADR-011). Absent for tokens
+/// without a device (legacy login, local mode, runtime tokens).
+#[derive(Debug, Clone)]
+pub struct CurrentDevice {
+    pub id: String,
+    /// `desktop_app`, `mobile` or `browser`.
+    pub kind: String,
+}
+
+/// The live device `device_id` of `user_id`, if any. Fails closed.
+async fn active_device(
+    repo: Option<&Arc<dyn IDeviceRepository>>,
+    device_id: &str,
+    user_id: &str,
+) -> Result<Option<aionui_db::DeviceRow>, aionui_db::DbError> {
+    let Some(repo) = repo else { return Ok(None) };
+    Ok(repo
+        .find(device_id)
+        .await?
+        .filter(|device| device.user_id == user_id && device.revoked_at.is_none()))
+}
+
+/// Whether `device_id` names a live device of `user_id`. Fails closed.
+pub(crate) async fn device_is_active(
+    repo: Option<&Arc<dyn IDeviceRepository>>,
+    device_id: &str,
+    user_id: &str,
+) -> Result<bool, aionui_db::DbError> {
+    Ok(active_device(repo, device_id, user_id).await?.is_some())
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -133,6 +175,27 @@ pub async fn auth_middleware(
 
     if payload.session_generation != user.session_generation {
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
+    }
+
+    if let Some(device_id) = payload.device_id.as_deref() {
+        let device = active_device(state.device_repo.as_ref(), device_id, &user.id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "auth middleware device lookup failed");
+                ApiError::Internal("Authentication service unavailable".into())
+            })?;
+        let Some(device) = device else {
+            return Err(ApiError::coded(
+                StatusCode::UNAUTHORIZED,
+                "DEVICE_REVOKED",
+                "This device is no longer allowed on this host.",
+                None,
+            ));
+        };
+        request.extensions_mut().insert(CurrentDevice {
+            id: device.id,
+            kind: device.kind,
+        });
     }
 
     request.extensions_mut().insert(CurrentUser {
@@ -200,6 +263,7 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
         user_type: user.user_type,
         status: user.status,
     });
+    request.extensions_mut().insert(RuntimeHelperCaller);
 
     Ok(next.run(request).await)
 }
@@ -211,6 +275,44 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
 pub async fn local_auth_middleware(mut request: Request, next: Next) -> Response {
     request.extensions_mut().insert(CurrentUser::local_default());
     next.run(request).await
+}
+
+/// Whether the request comes from a paired phone or browser (a device other
+/// than the desktop app).
+fn from_paired_device(extensions: &axum::http::Extensions) -> bool {
+    extensions
+        .get::<CurrentDevice>()
+        .is_some_and(|device| device.kind != aionui_api_types::DeviceKind::DesktopApp.as_str())
+}
+
+fn fs_owner_only() -> ApiError {
+    ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "FS_OWNER_ONLY",
+        "Only the desktop app can use the host filesystem.",
+        None,
+    )
+}
+
+/// Host file effects (read, write, open, reveal, link, attach roots) are for
+/// the desktop app only (ADR-013). Paired phones and browsers, and agents'
+/// helper CLIs, are refused; desktop and device-less sessions pass. Route
+/// groups add this as a route layer after `auth_middleware`.
+pub async fn desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
+    let extensions = request.extensions();
+    if extensions.get::<RuntimeHelperCaller>().is_some() || from_paired_device(extensions) {
+        return Err(fs_owner_only());
+    }
+    Ok(next.run(request).await)
+}
+
+/// Like [`desktop_only`] but lets agents' helper CLIs through, for host-path
+/// routes the helper CLI itself uses (e.g. skill import and scan).
+pub async fn no_paired_devices(request: Request, next: Next) -> Result<Response, ApiError> {
+    if from_paired_device(request.extensions()) {
+        return Err(fs_owner_only());
+    }
+    Ok(next.run(request).await)
 }
 
 #[cfg(test)]

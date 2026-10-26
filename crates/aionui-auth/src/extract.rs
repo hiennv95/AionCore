@@ -1,12 +1,30 @@
+use std::net::SocketAddr;
+
+use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Request, header};
 
 use aionui_common::constants::COOKIE_NAME;
 
-/// Extract the client IP address from request headers.
+/// The client IP used to key rate limits.
 ///
-/// Priority: `X-Forwarded-For` (first IP) > `X-Real-IP` > `"unknown"`.
+/// The socket peer address (`ConnectInfo`, attached by every listener) is the
+/// truth: `X-Forwarded-For` / `X-Real-IP` are client-supplied and would let any
+/// LAN caller rotate them to dodge a limit. They are honoured only when the
+/// connection itself comes from loopback, i.e. a reverse proxy on this machine.
+/// Without a peer address (in-process tests), the headers are all there is.
 pub fn extract_client_ip<B>(request: &Request<B>) -> String {
-    extract_client_ip_from_headers(request.headers())
+    match request.extensions().get::<ConnectInfo<SocketAddr>>() {
+        Some(ConnectInfo(peer)) if !peer.ip().is_loopback() => peer.ip().to_string(),
+        Some(ConnectInfo(peer)) => {
+            let forwarded = extract_client_ip_from_headers(request.headers());
+            if forwarded == "unknown" {
+                peer.ip().to_string()
+            } else {
+                forwarded
+            }
+        }
+        None => extract_client_ip_from_headers(request.headers()),
+    }
 }
 
 /// Extract client IP from a `HeaderMap` directly.
@@ -128,6 +146,32 @@ mod tests {
     fn ip_fallback_to_unknown() {
         let headers = HeaderMap::new();
         assert_eq!(extract_client_ip_from_headers(&headers), "unknown");
+    }
+
+    fn request_from(peer: &str, headers: &[(&str, &str)]) -> Request<()> {
+        let mut request = Request::new(());
+        *request.headers_mut() = headers_with(headers);
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        request
+    }
+
+    #[test]
+    fn a_lan_caller_cannot_choose_its_rate_limit_key() {
+        let spoofed = request_from(
+            "192.168.1.50:40000",
+            &[("x-forwarded-for", "9.9.9.9"), ("x-real-ip", "8.8.8.8")],
+        );
+        assert_eq!(extract_client_ip(&spoofed), "192.168.1.50");
+    }
+
+    #[test]
+    fn a_local_reverse_proxy_may_forward_the_client_address() {
+        let proxied = request_from("127.0.0.1:40000", &[("x-forwarded-for", "203.0.113.7")]);
+        assert_eq!(extract_client_ip(&proxied), "203.0.113.7");
+        let direct = request_from("127.0.0.1:40000", &[]);
+        assert_eq!(extract_client_ip(&direct), "127.0.0.1");
     }
 
     // --- extract_token_from_headers ---

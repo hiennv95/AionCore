@@ -18,10 +18,12 @@ mod conversation;
 mod conversation_tools;
 mod cron;
 mod custom_agent;
+mod device;
 mod extension;
 mod file;
 mod lifecycle;
 mod mcp;
+mod network;
 mod office;
 mod project;
 mod provider;
@@ -119,6 +121,11 @@ pub use custom_agent::{
     AgentOverridesResponse, CustomAgentAdvancedOverrides, CustomAgentUpsertRequest, DeleteCustomAgentResponse,
     SetAgentOverridesRequest, SetEnabledRequest,
 };
+pub use device::{
+    AppSessionRequest, ClaimRequest, ClaimResponse, CreatePairingResponse, DeviceKind, DeviceListenerInfo,
+    DeviceListenerStatus, DeviceSession, DeviceView, HostProofRequest, HostProofResponse, PairRequest, PairResponse,
+    PairingState, PairingView, UpdateDeviceListenerRequest,
+};
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,
     GetRiskLevelRequest, HubExtensionListItem, HubExtensionListResponse, HubOperationResponse, HubUpdateInfo,
@@ -138,6 +145,13 @@ pub use mcp::{
     ImportMcpServerRequest, McpAuthMethod, McpConnectionTestErrorCode, McpConnectionTestResult, McpServerResponse,
     McpToolResponse, McpTransport, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest,
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
+};
+pub use network::{
+    AddPeerRequest, CreateShareRequest, InboundRequestView, NetworkStatusResponse, OutboundRequestView,
+    PEER_CONTRACT_VERSION, PeerErrorBody, PeerHelloResponse, PeerPairingRequest, PeerPairingResponse,
+    PeerPairingReveal, PeerPairingRevealResponse, PeerRequestStatus, PeerShareEntry, PeerSharesResponse, PeerState,
+    PeerSubmitRequest, PeerView, RemoteAgentView, RemoteRequestState, SendRemoteRequest, ShareView,
+    UpdateNetworkSettingsRequest, WaitingKind,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,

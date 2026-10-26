@@ -2300,6 +2300,20 @@ impl ConversationService {
             });
         }
 
+        // A LAN share fixes the agent, its mode and its workspace; the owner may
+        // rename or pin the conversation but not re-scope what the peer runs.
+        // Any `extra` key is refused: an allowlist of nothing, so keys that pick
+        // the agent (agent_id, cli_path, ...) cannot void the mode lock either.
+        if let Some(incoming) = &req.extra
+            && crate::service_ops::lan_locked_mode_from_extra(&existing.extra).is_some()
+            && incoming.as_object().is_none_or(|fields| !fields.is_empty())
+        {
+            warn!(conversation_id = %id, "Rejected re-scoping a LAN remote conversation through extra");
+            return Err(ConversationError::Forbidden {
+                reason: "this conversation runs a LAN share; its agent, mode and workspace are fixed".into(),
+            });
+        }
+
         // Antigravity keeps its runtime mode/model in the same `acp_session`
         // snapshot ACP does, so `extra` is just as much a second source of
         // truth here — a client PATCH that set them would diverge from the
@@ -2494,12 +2508,19 @@ impl ConversationService {
         conversation_id: &str,
         mode: &str,
     ) -> Result<(), ConversationError> {
-        self.conversation_repo
+        let row = self
+            .conversation_repo
             .get(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+        // A LAN share keeps its fixed mode (ADR-009, audit run-2 SEC-F).
+        if crate::service_ops::lan_locked_mode_from_extra(&row.extra).is_some_and(|locked| locked != mode) {
+            return Err(ConversationError::Forbidden {
+                reason: "this conversation runs a LAN share and keeps the shared mode".into(),
+            });
+        }
 
         let runtime_state = self
             .acp_session_repo
@@ -4076,6 +4097,15 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound {
                 id: request.conversation_id.clone(),
             })?;
+        // A required mode (scheduled jobs force full-auto) never switches a LAN
+        // share, which keeps its fixed mode (ADR-009, audit run-2 SEC-F).
+        if request.required_runtime_mode.is_some()
+            && crate::service_ops::lan_locked_mode_from_extra(&row.extra).is_some()
+        {
+            return Err(ConversationError::Forbidden {
+                reason: "this conversation runs a LAN share and keeps the shared mode".into(),
+            });
+        }
 
         reject_deprecated_runtime_row(&row)?;
 

@@ -76,6 +76,17 @@ pub struct CronServiceDeps {
     pub data_dir: PathBuf,
 }
 
+/// Scheduled jobs force a full-auto mode, so they never attach to a LAN share,
+/// which keeps its fixed mode (ADR-009, audit run-2 SEC-F).
+fn refuse_lan_share(row: &aionui_db::models::ConversationRow) -> Result<(), CronError> {
+    if aionui_conversation::lan_share_mode(&row.extra).is_some() {
+        return Err(CronError::InvalidAgentConfig(
+            "scheduled jobs cannot run in a LAN share conversation".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl CronService {
     pub fn new(deps: CronServiceDeps) -> Self {
         Self {
@@ -240,14 +251,17 @@ impl CronService {
             ));
         }
 
-        self.executor
+        let row = self
+            .executor
             .get_conversation_row_for_user(user_id, conversation_id)
             .await?
             .ok_or_else(|| {
                 CronError::Conversation(aionui_conversation::ConversationError::NotFound {
                     id: conversation_id.to_owned(),
                 })
-            })
+            })?;
+        refuse_lan_share(&row)?;
+        Ok(row)
     }
 
     async fn add_job_internal(
@@ -1031,8 +1045,7 @@ impl CronService {
                 "Referenced conversation belongs to another user.".into(),
             ));
         }
-
-        Ok(())
+        refuse_lan_share(&row)
     }
 
     async fn is_team_conversation_job(&self, job: &CronJob) -> Result<bool, CronError> {

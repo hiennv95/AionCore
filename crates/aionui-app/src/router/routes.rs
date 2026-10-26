@@ -57,6 +57,10 @@ use super::trace::with_access_log;
 pub struct RouterRuntime {
     pub client_pref_service: ClientPrefService,
     pub team_service: Arc<TeamSessionService>,
+    /// Started by the server command once the CLI peer settings are known.
+    pub network_service: Option<Arc<aionui_network::NetworkService>>,
+    /// Attached by the server command to the final router (ADR-011 §4).
+    pub device_listener: Option<Arc<aionui_device::DeviceListener>>,
 }
 
 async fn forward_event_bus_to_websocket(
@@ -120,6 +124,8 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let (states, channel_components) = build_module_states(services).await?;
     let client_pref_service = states.system.client_pref_service.clone();
     let team_service = states.team.service.clone();
+    let network_service = states.network.as_ref().map(|network| network.service.clone());
+    let device_listener = states.device.as_ref().and_then(|device| device.listener.clone());
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
 
     // Start channel orchestrator (message loop)
@@ -186,6 +192,8 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
         RouterRuntime {
             client_pref_service,
             team_service,
+            network_service,
+            device_listener,
         },
     ))
 }
@@ -265,6 +273,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         },
         local: services.local,
         aionpro_mode: services.identity_mode == crate::config::IdentityMode::AionPro,
+        device_repo: Some(super::device_state::device_repo(services)),
     };
 
     let auth_mw_state = AuthState {
@@ -274,7 +283,28 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
             runtime_token_service: services.runtime_token_service.clone(),
         })),
+        device_repo: Some(super::device_state::device_repo(services)),
     };
+
+    // Client devices (ADR-011): pairing endpoints are rate limited like /login,
+    // the secret-proven desktop bootstrap is not; owner endpoints sit behind
+    // auth (CSRF below).
+    let device_routes = states.device.map(|device| {
+        let limiter = Arc::new(aionui_auth::RateLimiter::auth());
+        limiter.start_cleanup_task(std::time::Duration::from_secs(60));
+        aionui_device::device_public_routes(device.clone())
+            .route_layer(from_fn_with_state(limiter, aionui_auth::auth_rate_limit_middleware))
+            .merge(aionui_device::device_bootstrap_routes(device.clone()))
+            .merge(
+                aionui_device::device_owner_routes(device)
+                    .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware)),
+            )
+    });
+
+    // LAN network owner API: auth here, CSRF with the rest of /api below.
+    let network_authenticated = states.network.map(|network| {
+        aionui_network::network_routes(network).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware))
+    });
 
     // System routes protected by auth middleware
     let system_authenticated =
@@ -420,6 +450,14 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(shell_authenticated)
         .merge(assistant_authenticated)
         .merge(session_message_authenticated);
+    let router = match network_authenticated {
+        Some(network) => router.merge(network),
+        None => router,
+    };
+    let router = match device_routes {
+        Some(devices) => router.merge(devices),
+        None => router,
+    };
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]
@@ -465,7 +503,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
                 Method::OPTIONS,
             ])
             .allow_headers(Any);
-        router.layer(cors)
+        // No auth in local mode: a page from any other site must not reach the
+        // API or the WebSocket (which CORS does not cover).
+        super::origin_guard::with_origin_guard(router.layer(cors), super::origin_guard::AllowedOrigins::loopback())
     } else {
         // Non-local (external identity) mode: the desktop renderer is a
         // cross-origin browser context (localhost:5173 in dev, file:// when

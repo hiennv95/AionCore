@@ -222,6 +222,56 @@ async fn heartbeat_closes_expired_token_with_auth_expired_event() {
     handle.abort();
 }
 
+// --- Token expiry sweep ---
+
+#[tokio::test]
+async fn token_expiry_sweep_closes_only_expired_tokens() {
+    let mgr = WebSocketManager::new();
+    let (expired_tx, mut expired_rx) = new_client_tx();
+    let (valid_tx, mut valid_rx) = new_client_tx();
+    mgr.add_client("expired-token".into(), expired_tx);
+    mgr.add_client("valid-token".into(), valid_tx);
+
+    let validator: TokenValidator = Arc::new(|token| token == "valid-token");
+    let handle = mgr.start_token_expiry_sweep(validator);
+
+    let msg = tokio::time::timeout(Duration::from_secs(2), expired_rx.recv())
+        .await
+        .expect("timeout")
+        .expect("closed");
+    match msg {
+        WsOutbound::TextThenClose(text, code, reason) => {
+            assert_realtime_auth_expired(&text);
+            assert_eq!(code, WebSocketCloseCode::PolicyViolation);
+            assert_eq!(reason, "token expired");
+        }
+        other => panic!("expected realtime auth-expired terminal message, got {other:?}"),
+    }
+    assert_eq!(mgr.client_count(), 1);
+    assert!(
+        matches!(valid_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+        "valid connection must receive nothing"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn token_expiry_sweep_sends_no_ping_and_keeps_valid_connections() {
+    let mgr = WebSocketManager::new();
+    let (tx, mut rx) = new_client_tx();
+    mgr.add_client("valid-token".into(), tx);
+
+    let handle = mgr.start_token_expiry_sweep(always_valid());
+
+    // The first tick fires immediately; a heartbeat would send a ping here.
+    let received = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(received.is_err(), "sweep must not send anything, got {received:?}");
+    assert_eq!(mgr.client_count(), 1);
+
+    handle.abort();
+}
+
 // --- Concurrent access ---
 
 #[test]

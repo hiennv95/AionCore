@@ -40,7 +40,11 @@ impl std::error::Error for InvalidOriginError {}
 
 /// Normalized set of browser origins allowed to talk to this server.
 #[derive(Debug, Clone)]
-pub struct AllowedOrigins(Arc<HashSet<String>>);
+pub struct AllowedOrigins {
+    origins: Arc<HashSet<String>>,
+    /// Also allow `http(s)://localhost|127.0.0.1|[::1]` on any port.
+    any_loopback: bool,
+}
 
 impl AllowedOrigins {
     /// Parse and normalize `values`; any malformed value fails the whole set.
@@ -49,17 +53,30 @@ impl AllowedOrigins {
             .iter()
             .map(|value| normalize_origin(value).ok_or_else(|| InvalidOriginError { value: value.clone() }))
             .collect::<Result<HashSet<_>, _>>()?;
-        Ok(Self(Arc::new(origins)))
+        Ok(Self {
+            origins: Arc::new(origins),
+            any_loopback: false,
+        })
+    }
+
+    /// Pages served from this machine's loopback only (any port). `null`
+    /// (sandboxed iframes, `data:` and `file:` pages) is not loopback.
+    pub fn loopback() -> Self {
+        Self {
+            origins: Arc::new(HashSet::new()),
+            any_loopback: true,
+        }
     }
 
     /// Whether the raw `Origin` header value is allowlisted.
     pub fn allows(&self, origin: &str) -> bool {
-        normalize_origin(origin).is_some_and(|origin| self.0.contains(&origin))
+        normalize_origin(origin)
+            .is_some_and(|origin| self.origins.contains(&origin) || (self.any_loopback && is_loopback_origin(&origin)))
     }
 
     /// Normalized origins, sorted, for startup logging.
     pub fn sorted(&self) -> Vec<String> {
-        let mut origins: Vec<String> = self.0.iter().cloned().collect();
+        let mut origins: Vec<String> = self.origins.iter().cloned().collect();
         origins.sort();
         origins
     }
@@ -86,6 +103,15 @@ fn normalize_origin(value: &str) -> Option<String> {
     })
 }
 
+fn is_loopback_origin(normalized: &str) -> bool {
+    let host = normalized.split_once("://").map_or("", |(_, rest)| rest);
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
 async fn origin_guard(State(allowed): State<AllowedOrigins>, request: Request, next: Next) -> Response {
     if let Some(origin) = request.headers().get(ORIGIN) {
         let permitted = origin.to_str().is_ok_and(|origin| allowed.allows(origin));
@@ -94,7 +120,7 @@ async fn origin_guard(State(allowed): State<AllowedOrigins>, request: Request, n
                 origin = %String::from_utf8_lossy(origin.as_bytes()),
                 method = %request.method(),
                 path = request.uri().path(),
-                "rejected request from origin outside --allowed-origin"
+                "rejected request from a browser origin that is not allowed"
             );
             return ApiError::Forbidden("origin not allowed".into()).into_response();
         }
@@ -117,6 +143,28 @@ mod tests {
     use tower_http::cors::{AllowOrigin, CorsLayer};
 
     const HOST: &str = "http://127.0.0.1:25818";
+
+    #[test]
+    fn loopback_policy_allows_this_machine_on_any_port_only() {
+        let loopback = AllowedOrigins::loopback();
+        for ok in [
+            "http://localhost:5173",
+            "http://127.0.0.1:25818",
+            "https://[::1]:8443",
+            "http://LOCALHOST",
+        ] {
+            assert!(loopback.allows(ok), "{ok}");
+        }
+        for bad in [
+            "null",
+            "https://evil.example",
+            "http://localhost.evil.example",
+            "http://127.0.0.1.nip.io",
+            "file://",
+        ] {
+            assert!(!loopback.allows(bad), "{bad}");
+        }
+    }
 
     /// Mirrors the webui-mode CORS layer so tests show the guard runs before it.
     fn app() -> Router {

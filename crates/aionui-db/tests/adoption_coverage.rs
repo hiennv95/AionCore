@@ -35,6 +35,16 @@ const GLOBAL_TABLES: &[(&str, &str)] = &[
     // Canonical filesystem-path registry shared by all users by design
     // (project-bind: folders are reused globally by resource_canonical).
     ("folders", "global canonical path registry"),
+    // Private-LAN network (ADR-009, migration 045): the host's trust store keyed
+    // by peer certificate fingerprints, what the host shares, and its inbox. They
+    // belong to the host identity, not to a user; `NetworkService` gates every
+    // access to the host owner. (`network_outbound_requests` has `user_id`.)
+    (
+        "network_peers",
+        "host-level peer trust store keyed by certificate fingerprint",
+    ),
+    ("network_shares", "host-level shares granted to peers"),
+    ("network_inbound_requests", "host-level inbox of peer requests"),
 ];
 
 /// Tables whose `user_id` column is NOT a Core-user ownership column — it

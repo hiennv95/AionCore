@@ -12,9 +12,10 @@ use aionui_api_types::{
     ApiResponse, DocumentConversionRequest, PreviewUrlResponse, RefreshPreviewRequest, RefreshPreviewResponse,
     StartPreviewRequest, StopPreviewRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, desktop_only};
 use aionui_common::ApiError;
 use aionui_file::{FileError, path_safety::validate_path_with_extra_root};
+use axum::middleware::from_fn;
 
 use crate::error::OfficeError;
 use crate::proxy::ProxyError;
@@ -51,17 +52,22 @@ impl From<ProxyError> for ApiError {
 }
 
 pub fn office_routes(state: OfficeRouterState) -> Router {
-    Router::new()
+    // Starting a preview or converting reads a host document by path: desktop
+    // only until Preview adds scoped device reads (ADR-013).
+    let host_reads = Router::new()
         .route("/api/word-preview/start", post(start_word_preview))
-        .route("/api/word-preview/stop", post(stop_word_preview))
         .route("/api/word-preview/refresh", post(refresh_word_preview))
         .route("/api/excel-preview/start", post(start_excel_preview))
-        .route("/api/excel-preview/stop", post(stop_excel_preview))
         .route("/api/excel-preview/refresh", post(refresh_excel_preview))
         .route("/api/ppt-preview/start", post(start_ppt_preview))
-        .route("/api/ppt-preview/stop", post(stop_ppt_preview))
         .route("/api/ppt-preview/refresh", post(refresh_ppt_preview))
         .route("/api/document/convert", post(convert_document))
+        .route_layer(from_fn(desktop_only));
+    Router::new()
+        .route("/api/word-preview/stop", post(stop_word_preview))
+        .route("/api/excel-preview/stop", post(stop_excel_preview))
+        .route("/api/ppt-preview/stop", post(stop_ppt_preview))
+        .merge(host_reads)
         .with_state(state)
 }
 

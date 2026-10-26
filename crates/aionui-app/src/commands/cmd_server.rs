@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use aionui_api_types::{RuntimeStatusScope, RuntimeStatusScopeKind};
 use aionui_app::{
-    AppConfig, AppServices, RouterBuildError, create_router_with_runtime, with_origin_guard, with_static_web,
+    AppConfig, AppServices, RouterBuildError, create_router_with_runtime, with_origin_guard, with_static_web_clients,
 };
 use aionui_system::RuntimePrepareService;
 use aionui_team::TeamIdleCleanupCoordinator;
@@ -284,10 +284,36 @@ pub(crate) async fn run_server(
     let (router, router_runtime) = create_router_with_runtime(&services)
         .await
         .map_err(router_build_error_to_bootstrap)?;
-    let router = match &env.static_dir {
-        Some(dir) => with_static_web(router, dir),
-        None => router,
-    };
+    // Same validator as the WebSocket handshake; local mode has no tokens to expire.
+    // The sweep runs for the process lifetime (dropping the handle detaches it).
+    if env.ws_token_expiry && !services.local {
+        let jwt_service = services.jwt_service.clone();
+        services
+            .ws_manager
+            .start_token_expiry_sweep(Arc::new(move |token: &str| jwt_service.verify(token).is_ok()));
+    }
+    // LAN network (ADR-009): recover the inbox/outbox and start the peer
+    // listener when enabled (UI setting) or fixed by `--peer-listen`.
+    if let Some(network) = router_runtime.network_service.as_ref() {
+        network.start(env.peer_listen).await.map_err(|e| {
+            BootstrapError::new(
+                BootstrapErrorCode::BindFailed,
+                "peer.listen",
+                "peer listener failed to start",
+            )
+            .with_field("peerListen", env.peer_listen.map(|a| a.to_string()).unwrap_or_default())
+            .with_source(e)
+        })?;
+    }
+    let router = with_static_web_clients(router, env.static_dir.as_deref(), env.legacy_static_dir.as_deref());
+    // Device listener (ADR-011): same routes and web over TLS for paired phones
+    // and other-machine browsers, behind its own same-origin guard. A bind
+    // failure is reported in its status, not fatal: local use must keep working.
+    if let Some(listener) = router_runtime.device_listener.as_ref()
+        && let Err(error) = listener.attach(router.clone()).await
+    {
+        warn!(%error, "device listener did not start");
+    }
     // Outermost: must see every request before CORS, auth, WS upgrade or static files.
     let router = match &env.allowed_origins {
         Some(allowed) => with_origin_guard(router, allowed.clone()),
@@ -375,85 +401,90 @@ pub(crate) async fn run_server(
     // between us and process exit.
     let drain_started = shutdown_tx.subscribe();
 
-    let serve_future = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            let signal_result = shutdown_signal(parent_exit).await;
-            // From here on the process must exit in bounded time so the
-            // data-dir instance flock is released for the next backend.
-            if watchdog_for_signal.arm() {
+    // The peer address keys rate limits (`aionui_auth::extract_client_ip`), so it
+    // must come from the socket, not from client-supplied forwarding headers.
+    let serve_future = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let signal_result = shutdown_signal(parent_exit).await;
+        // From here on the process must exit in bounded time so the
+        // data-dir instance flock is released for the next backend.
+        if watchdog_for_signal.arm() {
+            info!(
+                stage = "shutdown.watchdog",
+                timeout_secs = SHUTDOWN_WATCHDOG_TIMEOUT.as_secs(),
+                "shutdown watchdog armed"
+            );
+        } else {
+            // Watchdog thread never spawned (logged at spawn time): the
+            // tail still has its per-stage bounds but no last-resort exit.
+            warn!(
+                code = "BOOTSTRAP_DEGRADED_SHUTDOWN_WATCHDOG",
+                stage = "shutdown.watchdog",
+                "shutdown watchdog unavailable; shutdown tail has stage bounds only"
+            );
+        }
+        match signal_result {
+            Err(error) => {
+                error.log_source();
+                tracing::error!(error = %error.stderr_line(), "shutdown signal handler failed");
+                let _ = shutdown_error_tx.send(error);
+            }
+            Ok(reason) => {
+                match reason {
+                    ShutdownReason::Sigint => info!("Received SIGINT, shutting down..."),
+                    #[cfg(unix)]
+                    ShutdownReason::Sigterm => info!("Received SIGTERM, shutting down..."),
+                    ShutdownReason::ParentExit => info!("Detected desktop parent exit, shutting down..."),
+                }
+                let active_turn_count = conversation_runtime_state.mark_shutting_down();
                 info!(
-                    stage = "shutdown.watchdog",
-                    timeout_secs = SHUTDOWN_WATCHDOG_TIMEOUT.as_secs(),
-                    "shutdown watchdog armed"
+                    reason = "graceful_shutdown",
+                    active_turn_count, "conversation runtime shutdown prepared"
                 );
-            } else {
-                // Watchdog thread never spawned (logged at spawn time): the
-                // tail still has its per-stage bounds but no last-resort exit.
-                warn!(
-                    code = "BOOTSTRAP_DEGRADED_SHUTDOWN_WATCHDOG",
-                    stage = "shutdown.watchdog",
-                    "shutdown watchdog unavailable; shutdown tail has stage bounds only"
-                );
-            }
-            match signal_result {
-                Err(error) => {
-                    error.log_source();
-                    tracing::error!(error = %error.stderr_line(), "shutdown signal handler failed");
-                    let _ = shutdown_error_tx.send(error);
-                }
-                Ok(reason) => {
-                    match reason {
-                        ShutdownReason::Sigint => info!("Received SIGINT, shutting down..."),
-                        #[cfg(unix)]
-                        ShutdownReason::Sigterm => info!("Received SIGTERM, shutting down..."),
-                        ShutdownReason::ParentExit => info!("Detected desktop parent exit, shutting down..."),
-                    }
-                    let active_turn_count = conversation_runtime_state.mark_shutting_down();
-                    info!(
-                        reason = "graceful_shutdown",
-                        active_turn_count, "conversation runtime shutdown prepared"
-                    );
-                    let active_task_count = worker_task_manager.active_count();
-                    match tokio::time::timeout(WORKER_TASK_SHUTDOWN_TIMEOUT, worker_task_manager.clear()).await {
-                        Ok(()) => info!(
-                            stage = "shutdown.worker_tasks",
-                            active_task_count, "worker task manager shutdown completed"
-                        ),
-                        Err(_) => warn!(
-                            code = "BOOTSTRAP_SHUTDOWN_STAGE_TIMEOUT",
-                            stage = "shutdown.worker_tasks",
-                            timeout_secs = WORKER_TASK_SHUTDOWN_TIMEOUT.as_secs(),
-                            active_task_count,
-                            "worker task manager shutdown timed out"
-                        ),
-                    }
+                let active_task_count = worker_task_manager.active_count();
+                match tokio::time::timeout(WORKER_TASK_SHUTDOWN_TIMEOUT, worker_task_manager.clear()).await {
+                    Ok(()) => info!(
+                        stage = "shutdown.worker_tasks",
+                        active_task_count, "worker task manager shutdown completed"
+                    ),
+                    Err(_) => warn!(
+                        code = "BOOTSTRAP_SHUTDOWN_STAGE_TIMEOUT",
+                        stage = "shutdown.worker_tasks",
+                        timeout_secs = WORKER_TASK_SHUTDOWN_TIMEOUT.as_secs(),
+                        active_task_count,
+                        "worker task manager shutdown timed out"
+                    ),
                 }
             }
-            // Bounded: this await sits before the drain marker below, so if it
-            // wedged unbounded no stage bound could ever start and the only
-            // escape would be the watchdog force-exit.
-            match tokio::time::timeout(
+        }
+        // Bounded: this await sits before the drain marker below, so if it
+        // wedged unbounded no stage bound could ever start and the only
+        // escape would be the watchdog force-exit.
+        match tokio::time::timeout(
+            SHUTDOWN_KEEP_AWAKE_TIMEOUT,
+            client_pref_service.release_keep_awake_for_shutdown(),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(
+                code = "BOOTSTRAP_DEGRADED_KEEP_AWAKE_RELEASE",
+                stage = "shutdown.keep_awake.release",
+                error = %error,
+                "keep-awake shutdown release failed"
+            ),
+            Err(_) => warn_stage_timeout(
+                "shutdown.keep_awake.release",
                 SHUTDOWN_KEEP_AWAKE_TIMEOUT,
-                client_pref_service.release_keep_awake_for_shutdown(),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => warn!(
-                    code = "BOOTSTRAP_DEGRADED_KEEP_AWAKE_RELEASE",
-                    stage = "shutdown.keep_awake.release",
-                    error = %error,
-                    "keep-awake shutdown release failed"
-                ),
-                Err(_) => warn_stage_timeout(
-                    "shutdown.keep_awake.release",
-                    SHUTDOWN_KEEP_AWAKE_TIMEOUT,
-                    "keep-awake release timed out; abandoning keep-awake child reap",
-                ),
-            }
-            let _ = shutdown_tx.send(true);
-        })
-        .into_future();
+                "keep-awake release timed out; abandoning keep-awake child reap",
+            ),
+        }
+        let _ = shutdown_tx.send(true);
+    })
+    .into_future();
 
     match await_serve_with_bounded_drain(serve_future, drain_started, SHUTDOWN_DRAIN_TIMEOUT).await {
         ServeOutcome::Completed(result) => {

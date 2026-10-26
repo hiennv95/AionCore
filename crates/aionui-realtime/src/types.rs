@@ -63,6 +63,8 @@ pub enum RealtimeError {
     SendFailed,
     /// Realtime boundary hit an unexpected internal failure.
     Internal,
+    /// This connection's principal may not send this message (ADR-013).
+    Forbidden,
 }
 
 impl RealtimeError {
@@ -77,6 +79,7 @@ impl RealtimeError {
             Self::Backpressure => "REALTIME_BACKPRESSURE",
             Self::SendFailed => "REALTIME_SEND_FAILED",
             Self::Internal => "REALTIME_INTERNAL_ERROR",
+            Self::Forbidden => "REALTIME_FORBIDDEN",
         }
     }
 
@@ -91,6 +94,7 @@ impl RealtimeError {
             Self::Backpressure => "Realtime connection is temporarily overloaded.",
             Self::SendFailed => "Realtime message could not be delivered.",
             Self::Internal => "Realtime service encountered an internal error.",
+            Self::Forbidden => "This connection may not send this message.",
         }
     }
 
@@ -103,6 +107,7 @@ impl RealtimeError {
             Self::HeartbeatTimeout => false,
             Self::Backpressure => true,
             Self::SendFailed | Self::Internal => false,
+            Self::Forbidden => false,
         }
     }
 
@@ -118,7 +123,8 @@ impl RealtimeError {
             | Self::HeartbeatTimeout
             | Self::Backpressure
             | Self::SendFailed
-            | Self::Internal => serde_json::json!({}),
+            | Self::Internal
+            | Self::Forbidden => serde_json::json!({}),
         }
     }
 
@@ -133,6 +139,26 @@ impl RealtimeError {
                 "details": self.details(),
             }),
         )
+    }
+}
+
+/// Who a WebSocket connection acts for, resolved once at connect time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsPrincipal {
+    /// Authenticated Core user of the connection.
+    pub user_id: String,
+    /// Message names this connection may not send (e.g. host file frames for
+    /// paired phones and browsers, ADR-013). Chosen by the app's resolver.
+    pub denied_frames: &'static [&'static str],
+}
+
+impl WsPrincipal {
+    /// A principal with no message restrictions.
+    pub fn unrestricted(user_id: impl Into<String>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            denied_frames: &[],
+        }
     }
 }
 

@@ -20,8 +20,8 @@ use aionui_api_types::{
     WebuiResetPasswordResponse, WsTokenResponse,
 };
 use aionui_common::ApiError;
-use aionui_common::constants::{COOKIE_MAX_AGE_DAYS, REFRESH_COOKIE_NAME};
-use aionui_db::{DbError, IUserRepository, UserStatus, UserType, models::User};
+use aionui_common::constants::REFRESH_COOKIE_NAME;
+use aionui_db::{DbError, IDeviceRepository, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
 use crate::extract::{extract_cookie_value, extract_token_from_headers};
@@ -59,6 +59,12 @@ impl From<RefreshError> for ApiError {
     fn from(err: RefreshError) -> Self {
         match err {
             RefreshError::Unauthorized(msg) => ApiError::Unauthorized(msg.into()),
+            RefreshError::DeviceRevoked => ApiError::coded(
+                axum::http::StatusCode::UNAUTHORIZED,
+                "DEVICE_REVOKED",
+                "This device is no longer allowed on this host.",
+                None,
+            ),
             RefreshError::UserContextRequired => user_context_required(),
             RefreshError::Internal(msg) => ApiError::Internal(msg.into()),
         }
@@ -91,6 +97,8 @@ pub struct AuthRouterState {
     pub session_revoked_hook: Option<Arc<SessionRevokedHook>>,
     pub local: bool,
     pub aionpro_mode: bool,
+    /// Client devices (ADR-011); refresh of a device-bound token requires a live device.
+    pub device_repo: Option<Arc<dyn IDeviceRepository>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,6 +278,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         // Auth endpoints manage sessions themselves; the helper CLI never
         // calls them, so the runtime-token channel stays disabled here.
         runtime_token_verifier: None,
+        device_repo: state.device_repo.clone(),
     };
 
     // Auth rate limited routes (login, qr-login)
@@ -513,6 +522,12 @@ async fn login_handler(
 
     let user = found_user.ok_or_else(|| ApiError::Unauthorized("Invalid username or password".into()))?;
 
+    issue_session(&state, user).await
+}
+
+/// Sign access + refresh tokens for `user` and return the login response with
+/// both cookies.
+async fn issue_session(state: &AuthRouterState, user: User) -> Result<Response, ApiError> {
     let token = state
         .jwt_service
         .sign_with_session_generation(
@@ -904,23 +919,31 @@ async fn refresh_tokens(
         return Err(RefreshError::Unauthorized("Invalid authentication session"));
     }
 
-    let access = state
+    if let Some(device_id) = payload.device_id.as_deref() {
+        let active = crate::middleware::device_is_active(state.device_repo.as_ref(), device_id, &user.id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "refresh device lookup failed");
+                RefreshError::Internal("Authentication service unavailable")
+            })?;
+        if !active {
+            return Err(RefreshError::DeviceRevoked);
+        }
+        if let Some(repo) = state.device_repo.as_ref()
+            && let Err(e) = repo.touch(device_id, aionui_common::now_ms()).await
+        {
+            tracing::warn!(error = %e, "failed to record device last-seen on refresh");
+        }
+    }
+
+    // The renewed pair stays bound to the same device (or to none).
+    let (access, refresh) = state
         .jwt_service
-        .sign_with_session_generation(
+        .sign_session_pair(
             &user.id,
             user.username.as_deref().unwrap_or("external_user"),
             user.session_generation,
-        )
-        .map_err(|e| {
-            tracing::error!(error = %e, "refresh access-token signing failed");
-            RefreshError::Internal("Token signing error")
-        })?;
-    let refresh = state
-        .jwt_service
-        .sign_refresh(
-            &user.id,
-            user.username.as_deref().unwrap_or("external_user"),
-            user.session_generation,
+            payload.device_id.as_deref(),
         )
         .map_err(|e| {
             tracing::error!(error = %e, "refresh token signing failed");
@@ -950,8 +973,9 @@ async fn ws_token_handler(
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
         .ok_or_else(|| ApiError::Unauthorized("User not found".into()))?;
 
-    // Cookie max age in milliseconds
-    let expires_in = u64::from(COOKIE_MAX_AGE_DAYS) * 24 * 60 * 60 * 1000;
+    // Access-token lifetime in milliseconds: the ws token is the access token, so
+    // a host that shortens it (--access-token-ttl-secs) must not advertise 30 days.
+    let expires_in = u64::try_from(state.jwt_service.access_ttl().as_millis()).unwrap_or(u64::MAX);
 
     Ok(Json(WsTokenResponse {
         success: true,
@@ -985,46 +1009,7 @@ async fn qr_login_handler(
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
         .ok_or_else(|| ApiError::Internal("No primary user configured".into()))?;
 
-    let token = state
-        .jwt_service
-        .sign_with_session_generation(
-            &user.id,
-            user.username.as_deref().unwrap_or("external_user"),
-            user.session_generation,
-        )
-        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
-    let refresh_token = state
-        .jwt_service
-        .sign_refresh(
-            &user.id,
-            user.username.as_deref().unwrap_or("external_user"),
-            user.session_generation,
-        )
-        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
-
-    // Update last login (best-effort)
-    if let Err(e) = state.user_repo.update_last_login(&user.id).await {
-        tracing::warn!("Failed to update last login for {}: {e}", user.id);
-    }
-
-    let session_cookie = state.cookie_config.build_session_cookie(&token);
-    let refresh_cookie = state.cookie_config.build_refresh_cookie(&refresh_token);
-    let resp = LoginResponse::new(
-        PublicUser {
-            id: user.id,
-            username: user.username.unwrap_or_else(|| "external_user".to_string()),
-        },
-        token,
-    );
-
-    Ok((
-        AppendHeaders([
-            (header::SET_COOKIE, session_cookie),
-            (header::SET_COOKIE, refresh_cookie),
-        ]),
-        Json(resp),
-    )
-        .into_response())
+    issue_session(&state, user).await
 }
 
 // ---------------------------------------------------------------------------

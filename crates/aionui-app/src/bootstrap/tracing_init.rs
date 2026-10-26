@@ -311,6 +311,14 @@ impl DailyDatedLogWriter {
     fn active_file(&mut self) -> io::Result<&mut File> {
         let date = (self.date_provider)();
         if self.active_date != Some(date) {
+            // Day rollover (and first write after start): drop days past retention.
+            if let Some(today) = chrono::NaiveDate::from_ymd_opt(date.year, date.month, date.day) {
+                super::log_retention::prune_old_log_days(
+                    &self.log_root,
+                    today,
+                    super::log_retention::LOG_RETENTION_DAYS,
+                );
+            }
             let file_path = dated_log_file_path(&self.log_root, date, self.filename_suffix);
             if let Some(parent) = file_path.parent() {
                 std::fs::create_dir_all(parent)?;

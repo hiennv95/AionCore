@@ -85,12 +85,31 @@ impl WebSocketManager {
     /// saturated or already-closed outbound queues are still removed from the
     /// manager so no future events are delivered to revoked sessions.
     pub fn disconnect_user(&self, user_id: &str, reason: &str) -> usize {
+        let removed = self.disconnect_where(|client| client.user_id == user_id, reason);
+        if removed > 0 {
+            info!(user_id = %user_id, removed, "websocket user connections disconnected");
+        }
+        removed
+    }
+
+    /// Close and remove every connection whose token satisfies `matches`
+    /// (e.g. tokens bound to a revoked device). Same best-effort close as
+    /// [`WebSocketManager::disconnect_user`].
+    pub fn disconnect_tokens(&self, matches: impl Fn(&str) -> bool, reason: &str) -> usize {
+        let removed = self.disconnect_where(|client| matches(&client.token), reason);
+        if removed > 0 {
+            info!(removed, "websocket connections disconnected by token");
+        }
+        removed
+    }
+
+    fn disconnect_where(&self, matches: impl Fn(&ClientInfo) -> bool, reason: &str) -> usize {
         let mut to_remove = Vec::new();
 
         for entry in self.connections.iter() {
             let conn_id = *entry.key();
             let client = entry.value();
-            if client.user_id != user_id {
+            if !matches(client) {
                 continue;
             }
 
@@ -102,9 +121,8 @@ impl WebSocketManager {
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     warn!(
                         %conn_id,
-                        user_id = %user_id,
                         code = RealtimeError::Backpressure.code(),
-                        "outbound channel full, user disconnect close dropped"
+                        "outbound channel full, disconnect close dropped"
                     );
                     to_remove.push(conn_id);
                 }
@@ -114,12 +132,7 @@ impl WebSocketManager {
         for conn_id in &to_remove {
             self.remove_client(*conn_id);
         }
-
-        let removed = to_remove.len();
-        if removed > 0 {
-            info!(user_id = %user_id, removed, "websocket user connections disconnected");
-        }
-        removed
+        to_remove.len()
     }
 
     /// Send a message to all connected clients.
@@ -295,6 +308,24 @@ impl WebSocketManager {
             }
         })
     }
+
+    /// Start a loop that only closes connections whose token no longer validates.
+    ///
+    /// Every `HEARTBEAT_INTERVAL` (30s) it runs the token step of the heartbeat
+    /// (`realtime.error` `AUTH_EXPIRED`, close 1008) without pings or pong timeouts,
+    /// for hosts whose clients do not all answer pings.
+    ///
+    /// Returns a `JoinHandle` — abort it to stop the loop.
+    pub fn start_token_expiry_sweep(&self, token_validator: TokenValidator) -> JoinHandle<()> {
+        let connections = Arc::clone(&self.connections);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+            loop {
+                interval.tick().await;
+                token_expiry_tick(&connections, &token_validator);
+            }
+        })
+    }
 }
 
 impl Default for WebSocketManager {
@@ -343,23 +374,8 @@ fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validat
         }
 
         // 2. Token expiry
-        if !token_validator(&client.token) {
-            info!(%conn_id, "token expired, closing connection");
-            let outbound = terminal_realtime_error(conn_id, RealtimeError::AuthExpired, "token expired");
-
-            match client.tx.try_send(outbound) {
-                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
-                    to_remove.push(conn_id);
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!(
-                        %conn_id,
-                        code = RealtimeError::Backpressure.code(),
-                        "outbound channel full, terminal auth close dropped"
-                    );
-                    to_remove.push(conn_id);
-                }
-            }
+        if close_if_token_invalid(conn_id, client, token_validator) {
+            to_remove.push(conn_id);
             continue;
         }
 
@@ -385,6 +401,38 @@ fn heartbeat_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validat
         connections.remove(&conn_id);
         debug!(%conn_id, "connection removed by heartbeat");
     }
+}
+
+/// Single token-expiry sweep tick: close connections whose token no longer validates.
+fn token_expiry_tick(connections: &DashMap<ConnectionId, ClientInfo>, token_validator: &TokenValidator) {
+    let to_remove: Vec<ConnectionId> = connections
+        .iter()
+        .filter(|entry| close_if_token_invalid(*entry.key(), entry.value(), token_validator))
+        .map(|entry| *entry.key())
+        .collect();
+
+    for conn_id in to_remove {
+        connections.remove(&conn_id);
+        debug!(%conn_id, "connection removed by token expiry sweep");
+    }
+}
+
+/// If the connection's token no longer validates, queue a terminal `AUTH_EXPIRED`
+/// close and return `true` so the caller removes the connection.
+fn close_if_token_invalid(conn_id: ConnectionId, client: &ClientInfo, token_validator: &TokenValidator) -> bool {
+    if token_validator(&client.token) {
+        return false;
+    }
+    info!(%conn_id, "token expired, closing connection");
+    let outbound = terminal_realtime_error(conn_id, RealtimeError::AuthExpired, "token expired");
+    if let Err(mpsc::error::TrySendError::Full(_)) = client.tx.try_send(outbound) {
+        warn!(
+            %conn_id,
+            code = RealtimeError::Backpressure.code(),
+            "outbound channel full, terminal auth close dropped"
+        );
+    }
+    true
 }
 
 fn terminal_realtime_error(conn_id: ConnectionId, error: RealtimeError, reason: &str) -> WsOutbound {
@@ -919,5 +967,17 @@ mod tests {
     fn default_creates_empty_manager() {
         let mgr = WebSocketManager::default();
         assert_eq!(mgr.client_count(), 0);
+    }
+
+    #[test]
+    fn disconnect_tokens_closes_only_matching_connections() {
+        let mgr = WebSocketManager::new();
+        let (tx1, mut rx1) = mpsc::channel(4);
+        let (tx2, _rx2) = mpsc::channel(4);
+        mgr.add_client("revoked-device-token".into(), tx1);
+        mgr.add_client("other-token".into(), tx2);
+        assert_eq!(mgr.disconnect_tokens(|t| t.starts_with("revoked"), "device revoked"), 1);
+        assert_eq!(mgr.client_count(), 1);
+        assert!(rx1.try_recv().is_ok(), "the closed connection gets a terminal error");
     }
 }

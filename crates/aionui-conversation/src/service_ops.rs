@@ -24,6 +24,27 @@ use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 
 const MAX_DIR_DEPTH: usize = 10;
 
+/// Mode a LAN remote conversation is locked to. A LAN conversation whose extra
+/// lost its mode is locked to an impossible value, so every mode change fails.
+pub fn lan_locked_mode_from_extra(extra: &str) -> Option<String> {
+    let extra: serde_json::Value = serde_json::from_str(extra).ok()?;
+    if extra.get("lan_remote").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    Some(
+        extra
+            .get("session_mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+/// A LAN share fixes the permission mode; other options (model, effort) stay free.
+fn violates_lan_mode_lock(locked: &str, category: &str, value: &str) -> bool {
+    category == "mode" && value != locked
+}
+
 impl ConversationService {
     // ── Config Options ──────────────────────────────────────────────
 
@@ -164,13 +185,33 @@ impl ConversationService {
                 reason: "value must not be empty".into(),
             });
         }
-        self.ensure_owned_conversation(user_id, conversation_id).await?;
+        let locked_mode = self.lan_locked_mode(user_id, conversation_id).await?;
         if self.runtime_state().is_restarting(conversation_id) {
             return Err(ConversationError::RuntimeRestarting {
                 conversation_id: conversation_id.to_owned(),
             });
         }
         let agent = self.task(conversation_id)?;
+        if let Some(locked) = locked_mode.as_deref() {
+            // Resolve the option's category from the live catalog; ids differ per
+            // backend, so an unknown option is judged by its id (fail closed).
+            let options = agent.get_config_options().await.map_err(ConversationError::from)?;
+            let category = options
+                .config_options
+                .iter()
+                .find(|option| option.id == option_id)
+                .and_then(|option| option.category.as_deref())
+                .unwrap_or(option_id);
+            if violates_lan_mode_lock(locked, category, &req.value) {
+                warn!(
+                    conversation_id,
+                    option_id, "rejected mode change on a LAN remote conversation; the shared mode is fixed"
+                );
+                return Err(ConversationError::Forbidden {
+                    reason: "this conversation runs a LAN share and keeps the shared mode".into(),
+                });
+            }
+        }
         let response = match agent.set_config_option(option_id, &req.value).await {
             Ok(response) => response,
             Err(err @ AgentError::Acp(AcpError::NotConnected)) => {
@@ -313,6 +354,52 @@ impl ConversationService {
             .map_err(ConversationError::from)
     }
 
+    /// Before a peer's turn on a LAN share: the live agent must run in the
+    /// share's mode, whatever changed it since (audit run-2 SEC-F, Jev 031).
+    /// A conversation that is not a LAN share, or an agent that reports no mode
+    /// option, passes.
+    pub async fn ensure_lan_share_mode(&self, user_id: &str, conversation_id: &str) -> Result<(), ConversationError> {
+        let Some(locked) = self.lan_locked_mode(user_id, conversation_id).await? else {
+            return Ok(());
+        };
+        let options = self
+            .task(conversation_id)?
+            .get_config_options()
+            .await
+            .map_err(ConversationError::from)?;
+        let live = options
+            .config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("mode"))
+            .and_then(|option| option.current_value.as_deref());
+        match live {
+            Some(mode) if mode != locked => {
+                warn!(
+                    conversation_id,
+                    "LAN share agent is not in the shared mode; refusing the peer turn"
+                );
+                Err(ConversationError::Forbidden {
+                    reason: "this LAN share's agent is not in the shared mode".into(),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Ownership check that also returns the fixed mode of a LAN remote
+    /// conversation (`extra.lan_remote`), whose mode must stay what the share set.
+    async fn lan_locked_mode(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>, ConversationError> {
+        let row = self
+            .conversation_repo()
+            .get(user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        Ok(lan_locked_mode_from_extra(&row.extra))
+    }
+
     async fn ensure_owned_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), ConversationError> {
         let exists = self
             .conversation_repo()
@@ -452,5 +539,36 @@ impl ConversationService {
         });
 
         Ok(entries)
+    }
+}
+
+#[cfg(test)]
+mod lan_mode_lock_tests {
+    use super::{lan_locked_mode_from_extra, violates_lan_mode_lock};
+
+    #[test]
+    fn only_lan_remote_conversations_are_locked() {
+        assert_eq!(
+            lan_locked_mode_from_extra(r#"{"lan_remote":true,"session_mode":"read-only"}"#),
+            Some("read-only".to_owned())
+        );
+        assert_eq!(lan_locked_mode_from_extra(r#"{"session_mode":"read-only"}"#), None);
+        assert_eq!(lan_locked_mode_from_extra(r#"{"lan_remote":false}"#), None);
+        assert_eq!(lan_locked_mode_from_extra("not json"), None);
+    }
+
+    #[test]
+    fn lan_conversation_without_mode_rejects_every_mode_change() {
+        let locked = lan_locked_mode_from_extra(r#"{"lan_remote":true}"#).unwrap();
+        assert!(violates_lan_mode_lock(&locked, "mode", "read-only"));
+        assert!(violates_lan_mode_lock(&locked, "mode", "full-access"));
+    }
+
+    #[test]
+    fn mode_change_away_from_share_mode_is_rejected_but_other_options_pass() {
+        assert!(violates_lan_mode_lock("read-only", "mode", "full-access"));
+        assert!(!violates_lan_mode_lock("read-only", "mode", "read-only"));
+        assert!(!violates_lan_mode_lock("read-only", "model", "gpt-x"));
+        assert!(!violates_lan_mode_lock("read-only", "thought_level", "high"));
     }
 }

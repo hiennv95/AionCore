@@ -1625,6 +1625,16 @@ async fn create_assistant_backed_conversation(
 }
 
 async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agent_type: AgentType) -> ConversationRow {
+    let extra = json!({ "workspace": ensure_test_workspace_path() });
+    insert_conversation_with_extra(repo, user_id, agent_type, extra).await
+}
+
+async fn insert_conversation_with_extra(
+    repo: &Arc<MockRepo>,
+    user_id: &str,
+    agent_type: AgentType,
+    extra: serde_json::Value,
+) -> ConversationRow {
     let id = format!(
         "legacy-{}-{}",
         agent_type.serde_name(),
@@ -1635,10 +1645,7 @@ async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agen
         user_id: user_id.to_owned(),
         name: format!("legacy {}", agent_type.serde_name()),
         r#type: agent_type.serde_name().to_owned(),
-        extra: json!({
-            "workspace": ensure_test_workspace_path()
-        })
-        .to_string(),
+        extra: extra.to_string(),
         model: None,
         status: Some("finished".into()),
         source: Some("aionui".into()),
@@ -9974,4 +9981,91 @@ mod session_mentions_integration {
             );
         }
     }
+}
+
+// ── LAN share mode lock beyond set_config_option (audit run-2 SEC-F, Jev 031) ──
+
+fn lan_share_extra() -> serde_json::Value {
+    json!({
+        "workspace": ensure_test_workspace_path(),
+        "backend": "codex",
+        "lan_remote": true,
+        "session_mode": "read-only",
+        "current_mode_id": "read-only"
+    })
+}
+
+fn mode_option(current: &str) -> AcpConfigOptionDto {
+    AcpConfigOptionDto {
+        id: "mode".to_owned(),
+        name: Some("Mode".to_owned()),
+        label: None,
+        description: None,
+        category: Some("mode".to_owned()),
+        option_type: "select".to_owned(),
+        current_value: Some(current.to_owned()),
+        options: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn save_acp_runtime_mode_keeps_a_lan_share_in_its_mode() {
+    let acp_repo = Arc::new(StubAcpSessionRepo::with_runtime_state(PersistedSessionState::default()));
+    let (svc, _, repo, _) = make_service_with_resolver_and_acp_session_repo(
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        acp_repo.clone(),
+    );
+    let conv = insert_conversation_with_extra(&repo, "user_1", AgentType::Acp, lan_share_extra()).await;
+
+    let err = svc
+        .save_acp_runtime_mode("user_1", &conv.id, "agent-full-access")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
+    assert!(acp_repo.runtime_state_saves().is_empty());
+
+    svc.save_acp_runtime_mode("user_1", &conv.id, "read-only")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_required_runtime_mode_never_switches_a_lan_share() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = insert_conversation_with_extra(&repo, "user_1", AgentType::Acp, lan_share_extra()).await;
+    let agent = Arc::new(MockAgent::new(&conv.id).with_config_options(vec![mode_option("read-only")]));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+
+    let result = svc
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".to_owned(),
+            conversation_id: conv.id.clone(),
+            content: "run scheduled task".to_owned(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            required_runtime_mode: Some("agent-full-access".to_owned()),
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started: None,
+        })
+        .await;
+    assert!(matches!(result, Err(ConversationError::Forbidden { .. })));
+    assert!(agent.set_config_option_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_peer_turn_needs_the_live_agent_in_the_share_mode() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = insert_conversation_with_extra(&repo, "user_1", AgentType::Acp, lan_share_extra()).await;
+
+    let drifted = Arc::new(MockAgent::new(&conv.id).with_config_options(vec![mode_option("agent-full-access")]));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(drifted));
+    let err = svc.ensure_lan_share_mode("user_1", &conv.id).await.unwrap_err();
+    assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
+
+    let kept = Arc::new(MockAgent::new(&conv.id).with_config_options(vec![mode_option("read-only")]));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(kept));
+    svc.ensure_lan_share_mode("user_1", &conv.id).await.unwrap();
 }

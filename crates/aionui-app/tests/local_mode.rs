@@ -91,3 +91,75 @@ async fn test_local_mode_aionpro_requires_session_and_allows_bootstrap_provision
 
     services.database.close().await;
 }
+
+#[tokio::test]
+async fn test_local_mode_never_serves_the_device_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    // A listener left enabled by an earlier non-local launch must stay off.
+    std::fs::create_dir_all(dir.path().join("devices")).unwrap();
+    std::fs::write(
+        dir.path().join("devices").join("listener.json"),
+        r#"{"enabled":true,"port":0}"#,
+    )
+    .unwrap();
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = aionui_app::AppConfig {
+        local: true,
+        data_dir: dir.path().to_path_buf(),
+        work_dir: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let router = aionui_app::create_router(&services).await.expect("build router");
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/devices/listener")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["code"], "INVALID_REQUEST");
+
+    services.database.close().await;
+}
+
+#[tokio::test]
+async fn test_local_mode_refuses_pages_from_other_sites() {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = aionui_app::AppConfig {
+        local: true,
+        ..Default::default()
+    };
+    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let router = aionui_app::create_router(&services).await.expect("build router");
+    let get = |origin: Option<&str>| {
+        let mut request = Request::builder().uri("/api/settings");
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        router.clone().oneshot(request.body(Body::empty()).unwrap())
+    };
+
+    // No auth in local mode, so another site's page must not get in (null too:
+    // sandboxed iframes send it).
+    for origin in ["https://evil.example", "null"] {
+        assert_eq!(
+            get(Some(origin)).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "{origin}"
+        );
+    }
+    assert_ne!(
+        get(Some("http://localhost:5173")).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_ne!(get(None).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    services.database.close().await;
+}

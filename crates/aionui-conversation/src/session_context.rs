@@ -263,9 +263,14 @@ impl<'a> SessionContextBuilder<'a> {
         self.resolve_acp_identity(row, &mut config, &extra, session_row.as_ref())
             .await?;
         let session_id = session_row.as_ref().and_then(|row| row.session_id.clone());
-        let session_snapshot = self
+        let mut session_snapshot = self
             .load_acp_session_snapshot(&row.user_id, &row.id, &config, session_id.as_deref())
             .await?;
+        // A LAN share fixes the mode (ADR-009): whatever another path persisted,
+        // the rebuilt agent starts in the share's mode (audit run-2 SEC-F).
+        if let Some(locked) = crate::service_ops::lan_locked_mode_from_extra(&row.extra) {
+            clamp_to_lan_mode(&mut config, session_snapshot.as_mut(), &locked);
+        }
 
         Ok(AcpSessionBuildContext {
             config,
@@ -571,6 +576,23 @@ fn normalize_cron_alias(row: &ConversationRow, extra: &serde_json::Value, cron_j
             "session_context: normalized legacy cronJobId alias"
         );
         *cron_job_id = Some(legacy.to_owned());
+    }
+}
+
+/// Starts a LAN share's agent in its fixed mode: the seed and any persisted
+/// mode choice are replaced by `locked`.
+fn clamp_to_lan_mode(config: &mut AcpBuildExtra, snapshot: Option<&mut PersistedSessionState>, locked: &str) {
+    config.session_mode = Some(locked.to_owned());
+    if let Some(snapshot) = snapshot {
+        if snapshot
+            .current_mode_id
+            .as_ref()
+            .is_some_and(|mode| mode.as_str() != locked)
+        {
+            warn!(locked, "session_context: persisted mode ignored for a LAN share");
+        }
+        snapshot.current_mode_id = Some(ModeId::new(locked));
+        snapshot.config_selections.retain(|key, _| key.as_str() != "mode");
     }
 }
 
@@ -1015,6 +1037,71 @@ mod tests {
         assert_eq!(snapshot.current_model_id.unwrap().as_str(), "persisted-model");
         assert_eq!(acp.config.session_mode.as_deref(), Some("legacy-mode"));
         assert_eq!(acp.config.current_model_id.as_deref(), Some("legacy-model"));
+    }
+
+    /// A LAN share fixes the mode (ADR-009): a persisted snapshot written by
+    /// another path (cron, a backend-reported change) must not override it on
+    /// rebuild (audit run-2 SEC-F, Jev 031).
+    #[tokio::test]
+    async fn lan_share_rebuild_starts_in_the_share_mode_whatever_was_persisted() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "codex",
+                "lan_remote": true,
+                "session_mode": "read-only",
+                "current_mode_id": "read-only"
+            }),
+            None,
+        );
+        repos.insert_conversation(&row).await;
+        repos
+            .acp_session_repo
+            .create(&CreateAcpSessionParams {
+                user_id: "user-1",
+                conversation_id: "conv-1",
+                agent_source: "builtin",
+                agent_id: "builtin-codex-test",
+            })
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .update_session_id_for_user("user-1", "conv-1", "sess-1")
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .save_runtime_state_for_user(
+                "user-1",
+                "conv-1",
+                &SaveRuntimeStateParams {
+                    current_mode_id: Some(Some("agent-full-access")),
+                    current_model_id: None,
+                    config_selections_json: Some(Some(r#"{"mode":"agent-full-access"}"#)),
+                    context_usage_json: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let acp = acp_context(repos.builder().build(&row).await.unwrap());
+        assert_eq!(acp.config.session_mode.as_deref(), Some("read-only"));
+        if let Some(snapshot) = acp.session_snapshot {
+            assert_eq!(
+                snapshot.current_mode_id.map(|m| m.as_str().to_owned()).as_deref(),
+                Some("read-only")
+            );
+            assert!(
+                snapshot
+                    .config_selections
+                    .values()
+                    .all(|v| v.as_str() != "agent-full-access"),
+                "no persisted full-access selection survives"
+            );
+        }
     }
 
     #[tokio::test]

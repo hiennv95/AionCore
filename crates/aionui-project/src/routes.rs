@@ -22,11 +22,12 @@ use aionui_api_types::{
     ApiResponse, AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest,
     ResolveRefResponse,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, desktop_only};
 use aionui_common::ApiError;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
+use axum::middleware::from_fn;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Router};
 use serde_json::json;
@@ -47,7 +48,11 @@ pub struct ProjectRouterState {
 pub fn project_routes(state: ProjectRouterState) -> Router {
     Router::new()
         .route("/api/projects/{project_id}", get(get_project))
-        .route("/api/projects/{project_id}/folders", post(attach_folder))
+        // Attaching a folder makes a host path a root for fs/scm frames (ADR-013).
+        .route(
+            "/api/projects/{project_id}/folders",
+            post(attach_folder).route_layer(from_fn(desktop_only)),
+        )
         .route("/api/projects/{project_id}/folders/{pe_id}", delete(remove_folder))
         .route("/api/projects/{project_id}/resolve-ref", post(resolve_ref))
         .with_state(state)

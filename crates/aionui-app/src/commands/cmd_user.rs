@@ -202,9 +202,13 @@ async fn apply_user_status(
 }
 
 async fn open_database(cli: &Cli) -> Result<Database, CliBoundaryError> {
-    let db_path = cli.data_dir.join("aionui-backend.db");
+    // Same owner-only data dir and database as the server (audit run-2 SEC-D).
+    let data_dir = crate::bootstrap::secure_data_dir(&cli.data_dir).map_err(|_| database_error())?;
+    let db_path = data_dir.join("aionui-backend.db");
     maybe_copy_legacy_database(&db_path).map_err(|_| database_error())?;
-    init_database(&db_path).await.map_err(|_| database_error())
+    let database = init_database(&db_path).await.map_err(|_| database_error())?;
+    crate::bootstrap::secure_database_files(&db_path);
+    Ok(database)
 }
 
 /// Read a new password without echoing it to the terminal.

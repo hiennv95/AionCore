@@ -93,6 +93,8 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),
         None => {
             let mut env = bootstrap::init_environment(&cli, &merged_path)?;
+            // Owner-only before any secret is written into the database (SEC-D).
+            env.config.data_dir = bootstrap::secure_data_dir(&env.config.data_dir)?;
 
             // Acquire the data-dir process-level guard before binding a port or
             // touching the DB, so a second aioncore yields structurally rather
@@ -149,6 +151,7 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
 
             let listener = commands::bind_http_listener(&mut env.config).await?;
             let database = bootstrap::init_data_layer(&env.config).await?;
+            bootstrap::secure_database_files(&env.config.database_path());
             let services = AppServices::from_config(database, &env.config).await.map_err(|error| {
                 bootstrap::BootstrapError::new(
                     bootstrap::BootstrapErrorCode::ServiceInitFailed,

@@ -1295,3 +1295,60 @@ async fn auto_workspaces_of_two_users_live_under_distinct_user_roots() {
         assert!(std::path::Path::new(ws).is_dir(), "workspace dir missing: {ws}");
     }
 }
+
+// ── LAN remote conversations keep the share's scope ───────────────────
+
+#[tokio::test]
+async fn lan_remote_conversation_rejects_rescoping_through_extra_but_allows_rename() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let body = create_body_with_extra(
+        "Peer: Codex",
+        json!({"backend": "codex", "session_mode": "read-only", "lan_remote": true}),
+    );
+    let resp = app
+        .clone()
+        .oneshot(json_with_token("POST", "/api/conversations", body, &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id = body_json(resp).await["data"]["id"].as_str().unwrap().to_owned();
+
+    for extra in [
+        json!({"session_mode": "full-access"}),
+        json!({"lan_remote": false}),
+        json!({"workspace": "/"}),
+        json!({"backend": "claude"}),
+        // Swapping the agent would also void the mode lock (audit run-2 SEC-F review).
+        json!({"agent_id": "builtin-claude"}),
+        json!({"custom_agent_id": "x"}),
+        json!({"agent_source": "custom"}),
+        json!({"cli_path": "/bin/sh"}),
+    ] {
+        let req = json_with_token(
+            "PATCH",
+            &format!("/api/conversations/{id}"),
+            json!({ "extra": extra }),
+            &token,
+            &csrf,
+        );
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "extra={extra}");
+        assert_eq!(body_json(resp).await["code"], "FORBIDDEN", "extra={extra}");
+    }
+
+    let req = json_with_token(
+        "PATCH",
+        &format!("/api/conversations/{id}"),
+        json!({"name": "Renamed", "pinned": true}),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["data"]["name"], "Renamed");
+    assert_eq!(json["data"]["extra"]["session_mode"], "read-only");
+    assert_eq!(json["data"]["extra"]["lan_remote"], true);
+}

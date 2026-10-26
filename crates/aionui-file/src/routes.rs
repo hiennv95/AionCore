@@ -3,6 +3,7 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Query, Request, State};
+use axum::middleware::from_fn;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use aionui_api_types::{
     SnapshotInfoResponse, SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery, WorkspaceFlatFileResponse,
     WriteContentRequest, WriteFileRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, desktop_only};
 use aionui_common::ApiError;
 use aionui_common::constants::UPLOAD_MAX_SIZE;
 
@@ -155,8 +156,10 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/snapshot/branches", post(snapshot_branches))
         .route("/api/fs/snapshot/dispose", post(snapshot_dispose))
         .with_state(state)
-        .merge(upload_router)
         .merge(content_router)
+        // Paired devices and agent helpers may only upload attachments (ADR-013).
+        .route_layer(from_fn(desktop_only))
+        .merge(upload_router)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 use aionui_db::{
-    DatabaseInitOptions, init_database, init_database_memory, init_database_staged_with_options,
+    DatabaseInitOptions, init_database, init_database_memory, init_database_staged, init_database_staged_with_options,
     init_database_with_options, maybe_copy_legacy_database,
 };
 use sqlx::Row;
@@ -520,4 +520,81 @@ fn concurrent_init_database_does_not_panic_on_unique_conflict() {
     // Lock file is created next to the DB and is harmless to leave behind.
     let lock = path.with_file_name("aionui-backend.db.migrate.lock");
     assert!(lock.exists(), "advisory lock file should be present after migrate");
+}
+
+#[tokio::test]
+async fn backup_failure_fails_closed_without_applying_migrations() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let real_dir = dir.path().join("real");
+    let link_dir = dir.path().join("link");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::fs::create_dir_all(&link_dir).unwrap();
+
+    let real_db = real_dir.join("aionui-backend.db");
+
+    // Initialize database file in real_dir and migrate partially to version 1
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&real_db)
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let pool = sqlx::SqlitePool::connect_with(opts).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE _sqlx_migrations (
+            version BIGINT PRIMARY KEY,
+            description TEXT NOT NULL,
+            installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            success BOOLEAN NOT NULL,
+            checksum BLOB NOT NULL,
+            execution_time BIGINT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, installed_on, success, checksum, execution_time)
+         VALUES (1, 'initial', CURRENT_TIMESTAMP, TRUE, x'00', 10)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    // Create a symlink in link_dir pointing to real_db
+    let link_db = link_dir.join("aionui-backend.db");
+    std::os::unix::fs::symlink(&real_db, &link_db).unwrap();
+
+    // Make link_dir read-only so VACUUM INTO fails to create the backup file in link_dir,
+    // while SQLite WAL connection to real_db in real_dir succeeds.
+    let orig_perms = std::fs::metadata(&link_dir).unwrap().permissions();
+    std::fs::set_permissions(&link_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let res = init_database_staged(&link_db).await;
+
+    // Restore permissions so cleanup and verification queries can run
+    let _ = std::fs::set_permissions(&link_dir, orig_perms);
+
+    let err = res.expect_err("init must fail closed when pre-migration backup fails");
+    assert_eq!(err.stage(), "database.backup");
+
+    // Verify schema version is unchanged: still at version 1, no further migrations applied
+    let verify_pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&real_db)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
+    )
+    .await
+    .unwrap();
+    let (max_version,): (Option<i64>,) = sqlx::query_as("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&verify_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        max_version,
+        Some(1),
+        "schema version must remain at 1 after failed backup"
+    );
+    verify_pool.close().await;
 }

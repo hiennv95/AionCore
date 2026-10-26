@@ -282,6 +282,12 @@ async fn try_init_file_staged(path: &Path) -> Result<Database, DatabaseInitError
         .await
         .map_err(|e| DatabaseInitError::new("database.open", DbError::Query(e)))?;
 
+    // Migrations are forward-only: keep a copy of the data so an older binary
+    // can be restored with it. No copy, no migration.
+    crate::migration_backup::backup_before_migrations(&pool, path, latest_known_migration_version())
+        .await
+        .map_err(|e| DatabaseInitError::new("database.backup", e))?;
+
     run_migrations_staged(&pool).await?;
 
     // Discard the bootstrap pool and reconnect on a FRESH pool before any

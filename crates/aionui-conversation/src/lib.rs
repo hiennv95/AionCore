@@ -43,6 +43,7 @@ pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
 };
+pub use service_ops::lan_locked_mode_from_extra as lan_share_mode;
 pub use state::ConversationRouterState;
 
 #[cfg(test)]

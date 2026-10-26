@@ -31,6 +31,12 @@ const REFRESH_TOKEN_EXPIRY: Duration = Duration::from_secs(REFRESH_COOKIE_MAX_AG
 /// JWT issuer claim value.
 const JWT_ISSUER: &str = "aionui";
 
+/// Clock-skew allowance on `exp`/`nbf`. The host signs and verifies its own
+/// tokens on one clock, so the library's 60 s default only stretched every
+/// token's life (a revoked-but-unexpired session lived a minute longer); 5 s
+/// still covers a separate issuer's skew in AionPro mode.
+const JWT_LEEWAY_SECS: u64 = 5;
+
 /// JWT audience claim value.
 const JWT_AUDIENCE: &str = "aionui-webui";
 
@@ -73,6 +79,10 @@ pub struct TokenPayload {
     /// Credential role: access (default) vs refresh.
     #[serde(default)]
     pub token_type: TokenType,
+    /// Client device the session was issued to (ADR-011). Requests fail once
+    /// that device is revoked. `None` for legacy username/password sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
 }
 
 /// JWT service for signing, verification, and token blacklisting.
@@ -110,6 +120,11 @@ impl JwtService {
         self.access_ttl_secs.store(ttl.as_secs(), Ordering::Relaxed);
     }
 
+    /// Lifetime of access tokens signed from now on.
+    pub fn access_ttl(&self) -> Duration {
+        Duration::from_secs(self.access_ttl_secs.load(Ordering::Relaxed))
+    }
+
     /// Require refresh tokens on every refresh path. Intended to be called once at startup.
     pub fn set_strict_refresh(&self, strict: bool) {
         self.strict_refresh.store(strict, Ordering::Relaxed);
@@ -142,7 +157,8 @@ impl JwtService {
             username,
             session_generation,
             TokenType::Access,
-            Duration::from_secs(self.access_ttl_secs.load(Ordering::Relaxed)),
+            self.access_ttl(),
+            None,
         )
     }
 
@@ -158,7 +174,36 @@ impl JwtService {
             session_generation,
             TokenType::Refresh,
             REFRESH_TOKEN_EXPIRY,
+            None,
         )
+    }
+
+    /// Sign an access + refresh pair bound to a client device (ADR-011).
+    /// `device_id: None` gives the legacy unbound pair.
+    pub fn sign_session_pair(
+        &self,
+        user_id: &str,
+        username: &str,
+        session_generation: i64,
+        device_id: Option<&str>,
+    ) -> Result<(String, String), AuthError> {
+        let access = self.sign_claims(
+            user_id,
+            username,
+            session_generation,
+            TokenType::Access,
+            self.access_ttl(),
+            device_id,
+        )?;
+        let refresh = self.sign_claims(
+            user_id,
+            username,
+            session_generation,
+            TokenType::Refresh,
+            REFRESH_TOKEN_EXPIRY,
+            device_id,
+        )?;
+        Ok((access, refresh))
     }
 
     /// Encode a signed JWT for the given credential role and lifetime.
@@ -169,6 +214,7 @@ impl JwtService {
         session_generation: i64,
         token_type: TokenType,
         ttl: Duration,
+        device_id: Option<&str>,
     ) -> Result<String, AuthError> {
         let now = now_secs()?;
         let exp = now + ttl.as_secs();
@@ -182,6 +228,7 @@ impl JwtService {
             aud: JWT_AUDIENCE.to_owned(),
             session_generation,
             token_type,
+            device_id: device_id.map(str::to_owned),
         };
 
         let secret = self
@@ -212,6 +259,7 @@ impl JwtService {
             .map_err(|e| AuthError::TokenInvalid(format!("Secret lock poisoned: {e}")))?;
 
         let mut validation = Validation::default();
+        validation.leeway = JWT_LEEWAY_SECS;
         validation.set_issuer(&[JWT_ISSUER]);
         validation.set_audience(&[JWT_AUDIENCE]);
 
@@ -290,6 +338,14 @@ impl JwtService {
 
     /// Try to extract the expiry time from a token without rejecting expired tokens.
     fn extract_expiry(&self, token: &str) -> Option<u64> {
+        self.decode_ignoring_expiry(token).map(|payload| payload.exp)
+    }
+
+    /// Payload of a token this host signed, even if it has expired. Never use
+    /// it to authenticate: it exists to find what an old token belongs to,
+    /// e.g. the sockets of a revoked device whose access token ran out after
+    /// the socket opened.
+    pub fn decode_ignoring_expiry(&self, token: &str) -> Option<TokenPayload> {
         let secret = self.secret.read().ok()?;
         let mut validation = Validation::default();
         validation.validate_exp = false;
@@ -298,7 +354,7 @@ impl JwtService {
 
         decode::<TokenPayload>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
             .ok()
-            .map(|data| data.claims.exp)
+            .map(|data| data.claims)
     }
 }
 
@@ -468,6 +524,84 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_token_still_names_its_device_but_never_verifies() {
+        let service = test_service();
+        let secret = service.secret.read().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = TokenPayload {
+            user_id: "user_1".into(),
+            username: "admin".into(),
+            iat: now - 2000,
+            exp: now - 1000,
+            iss: JWT_ISSUER.into(),
+            aud: JWT_AUDIENCE.into(),
+            session_generation: 0,
+            token_type: TokenType::Access,
+            device_id: Some("dev_1".into()),
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        let forged = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"another-secret"),
+        )
+        .unwrap();
+        drop(secret);
+
+        assert!(service.verify(&token).is_err());
+        assert_eq!(
+            service
+                .decode_ignoring_expiry(&token)
+                .and_then(|p| p.device_id)
+                .as_deref(),
+            Some("dev_1")
+        );
+        assert!(
+            service.decode_ignoring_expiry(&forged).is_none(),
+            "signature is still checked"
+        );
+    }
+
+    #[test]
+    fn a_token_expired_beyond_the_small_leeway_is_rejected() {
+        let service = test_service();
+        let secret = service.secret.read().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = TokenPayload {
+            user_id: "user_1".into(),
+            username: "admin".into(),
+            iat: now - 100,
+            // Inside the library's old 60 s default leeway, outside ours.
+            exp: now - 30,
+            iss: JWT_ISSUER.into(),
+            aud: JWT_AUDIENCE.into(),
+            session_generation: 0,
+            token_type: TokenType::Access,
+            device_id: None,
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(secret.as_bytes()),
+        )
+        .unwrap();
+        drop(secret);
+
+        assert!(matches!(service.verify(&token), Err(AuthError::TokenExpired)));
+    }
+
+    #[test]
     fn verify_expired_token() {
         let service = test_service();
         let secret = service.secret.read().unwrap();
@@ -481,6 +615,7 @@ mod tests {
             aud: JWT_AUDIENCE.into(),
             session_generation: 0,
             token_type: TokenType::Access,
+            device_id: None,
         };
         let token = encode(
             &Header::default(),
@@ -564,6 +699,7 @@ mod tests {
             aud: JWT_AUDIENCE.into(),
             session_generation: 0,
             token_type: TokenType::Access,
+            device_id: None,
         };
         let token = encode(
             &Header::default(),
@@ -792,5 +928,24 @@ mod tests {
         assert_eq!(payload.token_type, TokenType::Access);
         // And it is therefore usable on the request-authentication path.
         assert!(service.verify_access(&token).is_ok());
+    }
+
+    #[test]
+    fn session_pair_carries_the_device_and_refresh_role() {
+        let service = test_service();
+        let (access, refresh) = service.sign_session_pair("user_1", "admin", 2, Some("dev_1")).unwrap();
+        let a = service.verify_access(&access).unwrap();
+        assert_eq!(a.device_id.as_deref(), Some("dev_1"));
+        assert_eq!(a.session_generation, 2);
+        let r = service.verify_refresh(&refresh).unwrap();
+        assert_eq!(r.device_id.as_deref(), Some("dev_1"));
+        assert!(service.verify_access(&refresh).is_err());
+    }
+
+    #[test]
+    fn legacy_tokens_have_no_device() {
+        let service = test_service();
+        let token = service.sign("user_1", "admin").unwrap();
+        assert_eq!(service.verify(&token).unwrap().device_id, None);
     }
 }

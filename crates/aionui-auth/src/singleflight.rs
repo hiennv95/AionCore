@@ -57,6 +57,10 @@ pub(crate) enum RefreshError {
     /// Refresh token missing, invalid, expired, wrong type, or its session was
     /// revoked. Maps to `401 Unauthorized`.
     Unauthorized(&'static str),
+    /// The token is bound to a revoked device (ADR-011). `401 DEVICE_REVOKED`,
+    /// the same code the auth middleware uses, so clients can tell revocation
+    /// from an expired session.
+    DeviceRevoked,
     /// aionpro mode but the authenticated subject is not an aionpro user.
     UserContextRequired,
     /// Backend failure — user lookup or token signing. Maps to `500`.

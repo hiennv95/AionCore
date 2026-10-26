@@ -12,6 +12,9 @@ members = [
     "crates/aionui-session-message",
     "crates/aionui-skill-runtime",
     "crates/aionui-auth",
+    "crates/aionui-peer",
+    "crates/aionui-device",
+    "crates/aionui-network",
     "crates/aionui-system",
     "crates/aionui-file",
     "crates/aionui-office",
@@ -38,6 +41,9 @@ license = "MIT"
 [workspace.dependencies]
 # Internal crates
 aionui-common = { path = "crates/aionui-common" }
+aionui-peer = { path = "crates/aionui-peer" }
+aionui-device = { path = "crates/aionui-device" }
+aionui-network = { path = "crates/aionui-network" }
 aionui-assets = { path = "crates/aionui-assets" }
 aionui-db = { path = "crates/aionui-db" }
 aionui-api-types = { path = "crates/aionui-api-types" }
@@ -177,6 +183,7 @@ calamine = "0.36"
 rust_xlsxwriter = "0.82"
 sha1 = "0.10"
 sha2 = "0.10"
+hmac = "0.12"
 
 # AWS
 aws-config = { version = "1", features = ["behavior-version-latest"] }
@@ -185,6 +192,10 @@ aws-sdk-bedrockruntime = { version = "1", default-features = false, features = [
 
 # TLS
 rustls = "0.23"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
 rustls-native-certs = "0.8"
 
 # Pin rustls-webpki to fix RUSTSEC-2026-{0098,0099,0104}

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use aionui_api_types::WebSocketMessage;
 use aionui_realtime::{
-    ConnectionId, MessageRouter, NoopMessageRouter, WebSocketManager, WsHandlerState, ws_upgrade_handler,
+    ConnectionId, MessageRouter, NoopMessageRouter, WebSocketManager, WsHandlerState, WsPrincipal, ws_upgrade_handler,
 };
 use axum::Router;
 use axum::routing::get;
@@ -38,7 +38,7 @@ fn default_state() -> (WsHandlerState, Arc<WebSocketManager>) {
         router: Arc::new(NoopMessageRouter),
         token_validator: Arc::new(|t| t == "valid-token"),
         token_user_resolver: Arc::new(|t| {
-            Box::pin(async move { (t == "valid-token").then(|| "test-user".to_owned()) })
+            Box::pin(async move { (t == "valid-token").then(|| WsPrincipal::unrestricted("test-user")) })
         }),
         token_extractor: Arc::new(|headers| {
             headers
@@ -400,7 +400,7 @@ async fn unknown_message_routed_to_message_router() {
         router: router.clone(),
         token_validator: Arc::new(|t| t == "valid-token"),
         token_user_resolver: Arc::new(|t| {
-            Box::pin(async move { (t == "valid-token").then(|| "test-user".to_owned()) })
+            Box::pin(async move { (t == "valid-token").then(|| WsPrincipal::unrestricted("test-user")) })
         }),
         token_extractor: Arc::new(|headers| {
             headers

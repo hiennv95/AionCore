@@ -66,6 +66,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub static_dir: Option<PathBuf>,
 
+    /// Serve an interim legacy built single-page web client from this directory mounted at
+    /// /legacy/ with trailing-slash redirect. Must contain index.html. Disabled when omitted.
+    #[arg(long)]
+    pub legacy_static_dir: Option<PathBuf>,
+
     /// Browser origin (scheme://host[:port]) allowed to call this server; repeatable.
     /// When given, any request whose Origin header is not listed is rejected with 403,
     /// including CORS preflights and WebSocket upgrades. Disabled when omitted.
@@ -81,6 +86,16 @@ pub(crate) struct Cli {
     /// Defaults to 30 days when omitted.
     #[arg(long, value_name = "SECS")]
     pub access_token_ttl_secs: Option<u64>,
+
+    /// Close WebSockets whose access token has expired (checked every 30 s).
+    /// By default a socket stays authenticated for its lifetime after the handshake.
+    #[arg(long)]
+    pub ws_token_expiry: bool,
+
+    /// Address of the mutual-TLS peer listener for private-LAN host peers (ADR-009),
+    /// e.g. 0.0.0.0:25820. Off when omitted.
+    #[arg(long, value_name = "ADDR")]
+    pub peer_listen: Option<std::net::SocketAddr>,
 
     /// Managed runtime resource source selection.
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]

@@ -13,5 +13,5 @@ pub use manager::{TokenValidator, WebSocketManager};
 pub use router::{MessageRouter, NoopMessageRouter};
 pub use types::{
     ClientInfo, ConnectionId, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, PER_CONNECTION_BUFFER, WebSocketCloseCode,
-    WsOutbound,
+    WsOutbound, WsPrincipal,
 };

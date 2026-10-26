@@ -17,9 +17,10 @@ use aionui_api_types::{
     ScannedSkillResponse, SkillImportLimitsResponse, SkillImportRecordResponse, SkillListItemResponse,
     SkillPathsResponse, SkillSourceResponse, WriteAssistantRuleRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, desktop_only, no_paired_devices};
 use aionui_common::ApiError;
 use aionui_db::ISkillRepository;
+use axum::middleware::from_fn;
 
 use crate::classifier::AssistantRuleDispatcher;
 use crate::error::ExtensionError;
@@ -69,14 +70,29 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
         .route("/api/skills", get(list_skills))
         .route("/api/skills/import-history", get(list_import_history))
         .route("/api/skills/import-limits", get(get_import_limits))
-        .route("/api/skills/info", post(read_skill_info))
+        // Host-path reads, imports and scans: the helper CLI uses them, paired
+        // devices may not (ADR-013).
+        .route(
+            "/api/skills/info",
+            post(read_skill_info).route_layer(from_fn(no_paired_devices)),
+        )
         .route("/api/skills/paths", get(get_skill_paths))
         // Import / export / delete
-        .route("/api/skills/import", post(import_skill))
-        .route("/api/skills/export-symlink", post(export_skill_symlink))
+        .route(
+            "/api/skills/import",
+            post(import_skill).route_layer(from_fn(no_paired_devices)),
+        )
+        // Deletes and links arbitrary host paths: a host file effect (ADR-013).
+        .route(
+            "/api/skills/export-symlink",
+            post(export_skill_symlink).route_layer(from_fn(desktop_only)),
+        )
         .route("/api/skills/{name}", delete(delete_skill))
         // Scanning & discovery
-        .route("/api/skills/scan", post(scan_for_skills))
+        .route(
+            "/api/skills/scan",
+            post(scan_for_skills).route_layer(from_fn(no_paired_devices)),
+        )
         .route("/api/skills/detect-paths", get(detect_paths))
         .route("/api/skills/detect-external", get(detect_external))
         // Built-in resources
@@ -97,7 +113,8 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
             "/api/skills/external-paths",
             get(get_external_paths)
                 .post(add_external_path)
-                .delete(remove_external_path),
+                .delete(remove_external_path)
+                .route_layer(from_fn(no_paired_devices)),
         )
         // Skills market
         .route("/api/skills/market/enable", post(enable_skills_market))

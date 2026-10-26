@@ -183,6 +183,7 @@ fn protected_auth_app_with_mode_and_verifier(
         user_repo,
         identity_mode,
         runtime_token_verifier,
+        device_repo: None,
     };
 
     Router::new()
@@ -203,6 +204,7 @@ fn identity_echo_app(
         user_repo,
         identity_mode,
         runtime_token_verifier,
+        device_repo: None,
     };
 
     Router::new()

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{Request, State};
+use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
 use dashmap::DashMap;
@@ -147,8 +148,9 @@ fn now_ms() -> u64 {
 
 /// Auth rate limit middleware: 5 failed attempts per 15 minutes per IP.
 ///
-/// Pre-checks the limit; records failures only for non-success responses
-/// (skips successful requests per API spec).
+/// Pre-checks the limit; records only rejected credentials (401/403). Malformed
+/// requests do not count: a cross-site page can send those to loopback without
+/// a preflight and would otherwise lock the desktop app out of its own host.
 pub async fn auth_rate_limit_middleware(
     State(limiter): State<Arc<RateLimiter>>,
     request: Request,
@@ -159,7 +161,7 @@ pub async fn auth_rate_limit_middleware(
 
     let response = next.run(request).await;
 
-    if !response.status().is_success() {
+    if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         limiter.record_attempt(&ip);
     }
 
@@ -198,6 +200,44 @@ pub async fn authenticated_action_rate_limit_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn statuses_after(failures: StatusCode) -> StatusCode {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::middleware::from_fn_with_state;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        let limiter = Arc::new(RateLimiter::new(2, Duration::from_secs(60)));
+        let app = Router::new()
+            .route("/fail", post(move || async move { failures }))
+            .route("/ok", post(|| async { StatusCode::OK }))
+            .route_layer(from_fn_with_state(limiter, auth_rate_limit_middleware));
+        let send = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let request = axum::http::Request::post(path).body(Body::empty()).unwrap();
+                app.oneshot(request).await.unwrap().status()
+            }
+        };
+        send("/fail").await;
+        send("/fail").await;
+        send("/ok").await
+    }
+
+    #[tokio::test]
+    async fn only_rejected_credentials_count_toward_the_auth_limit() {
+        assert_eq!(
+            statuses_after(StatusCode::UNAUTHORIZED).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            statuses_after(StatusCode::FORBIDDEN).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(statuses_after(StatusCode::UNSUPPORTED_MEDIA_TYPE).await, StatusCode::OK);
+        assert_eq!(statuses_after(StatusCode::BAD_REQUEST).await, StatusCode::OK);
+    }
 
     #[test]
     fn new_limiter_allows_requests() {

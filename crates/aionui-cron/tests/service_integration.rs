@@ -3609,3 +3609,41 @@ async fn cd4_on_conversation_delete_preserves_all_cron_jobs() {
     let removed_events: Vec<_> = events.iter().filter(|e| e.name == "cron.job-removed").collect();
     assert!(removed_events.is_empty());
 }
+
+/// Scheduled jobs force full-auto, so they never attach to a LAN share, which
+/// keeps its fixed mode (ADR-009, audit run-2 SEC-F, Jev 031).
+#[tokio::test]
+async fn jobs_never_attach_to_a_lan_share_conversation() {
+    let (svc, _repo, _bc, conv_repo) = setup_with_conv_repo().await;
+    conv_repo
+        .create(&aionui_db::models::ConversationRow {
+            id: "conv_lan_share".to_owned(),
+            user_id: "u1".to_owned(),
+            name: "LAN share".to_owned(),
+            r#type: "acp".to_owned(),
+            model: None,
+            status: Some("pending".to_owned()),
+            source: None,
+            channel_chat_id: None,
+            extra: r#"{"backend":"codex","lan_remote":true,"session_mode":"read-only"}"#.to_owned(),
+            pinned: false,
+            pinned_at: None,
+            created_at: 0,
+            updated_at: 0,
+            project_id: None,
+            folder_id: None,
+            name_source: None,
+        })
+        .await
+        .unwrap();
+
+    let mut req = make_create_req("Job on a LAN share", every_60s());
+    req.conversation_id = "conv_lan_share".into();
+
+    let err = svc.add_job("u1", req).await.unwrap_err();
+    assert!(matches!(
+        err,
+        aionui_cron::error::CronError::InvalidAgentConfig(message)
+            if message == "scheduled jobs cannot run in a LAN share conversation"
+    ));
+}

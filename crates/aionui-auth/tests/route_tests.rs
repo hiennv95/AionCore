@@ -68,6 +68,7 @@ async fn test_app_with_options_and_hook(
         session_revoked_hook,
         local,
         aionpro_mode,
+        device_repo: Some(Arc::new(aionui_db::SqliteDeviceRepository::new(db.pool().clone()))),
     };
 
     let app = auth_routes(state);
@@ -683,6 +684,36 @@ async fn t9_1_refresh_token_success() {
 }
 
 #[tokio::test]
+async fn t9_refresh_of_a_revoked_device_says_device_revoked() {
+    use aionui_db::IDeviceRepository;
+    let (app, ctx) = test_app().await;
+    let owner = ctx.user_repo.get_system_user().await.unwrap().unwrap();
+    let devices = aionui_db::SqliteDeviceRepository::new(ctx._db.pool().clone());
+    let device = devices.insert(&owner.id, "Pixel", "mobile").await.unwrap();
+    let (_, refresh) = ctx
+        .jwt_service
+        .sign_session_pair(&owner.id, "admin", owner.session_generation, Some(&device.id))
+        .unwrap();
+    let body = format!(r#"{{"token":"{refresh}"}}"#);
+
+    // A live device refreshes normally.
+    let resp = app
+        .clone()
+        .oneshot(json_post("/api/auth/refresh", &body))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Once revoked, the refresh names the reason, like the auth middleware does.
+    devices.revoke(&owner.id, &device.id, 1).await.unwrap();
+    let resp = app.oneshot(json_post("/api/auth/refresh", &body)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "DEVICE_REVOKED");
+    assert!(json.get("token").is_none());
+}
+
+#[tokio::test]
 async fn t9_strict_refresh_rejects_access_token_in_body() {
     let (mut app, ctx) = test_app().await;
     create_test_user(&ctx, "admin", "StrongP@ss1").await;
@@ -951,6 +982,25 @@ async fn t10_1_ws_token_success() {
     // expires_in should be 30 days in milliseconds
     let expires_in = json["expires_in"].as_u64().unwrap();
     assert_eq!(expires_in, 30 * 24 * 60 * 60 * 1000);
+}
+
+#[tokio::test]
+async fn t10_ws_token_expires_in_follows_access_ttl() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    ctx.jwt_service.set_access_ttl(std::time::Duration::from_secs(900));
+    let (token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+
+    let resp = app.oneshot(get_with_token("/api/ws-token", &token)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["expires_in"].as_u64().unwrap(), 900 * 1000);
+    let claims = ctx
+        .jwt_service
+        .verify_access(json["ws_token"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(claims.exp - claims.iat, 900);
 }
 
 #[tokio::test]
@@ -1355,4 +1405,34 @@ async fn t12_2_internal_user_routes_work_in_local_mode() {
     let renamed_json = body_json(renamed_resp).await;
     assert_eq!(renamed_json["data"]["id"], user_id);
     assert_eq!(renamed_json["data"]["username"], "renamed-admin");
+}
+
+// ---------------------------------------------------------------------------
+// No unauthenticated owner claim (audit run-2 SEC-B, Jev 029)
+// ---------------------------------------------------------------------------
+
+/// The removed first-run setup route can no longer claim a fresh host's owner
+/// account: the desktop app uses the bootstrap secret, and a legacy password is
+/// set only with the local `aioncore user` CLI.
+#[tokio::test]
+async fn setup_route_no_longer_claims_the_owner() {
+    let (app, ctx) = test_app().await;
+    let resp = app
+        .clone()
+        .oneshot(json_post(
+            "/api/auth/setup",
+            r#"{"username":"intruder","password":"correct-horse-9"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(!ctx.user_repo.has_users().await.unwrap(), "owner stays unclaimed");
+    let resp = app
+        .oneshot(json_post(
+            "/login",
+            r#"{"username":"intruder","password":"correct-horse-9"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

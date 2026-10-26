@@ -9,11 +9,11 @@ use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::manager::{TokenValidator, WebSocketManager};
 use crate::router::MessageRouter;
-use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocketCloseCode, WsOutbound};
+use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocketCloseCode, WsOutbound, WsPrincipal};
 
 /// Extracts a JWT token from WebSocket upgrade request headers.
 ///
@@ -21,8 +21,9 @@ use crate::types::{ConnectionId, PER_CONNECTION_BUFFER, RealtimeError, WebSocket
 /// so that `aionui-realtime` does not depend on `aionui-auth` directly.
 pub type TokenExtractor = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>;
 
-/// Resolves a verified JWT token to the active internal user ID it represents.
-pub type TokenUserResolver = Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
+/// Resolves a verified JWT token to the active principal it represents.
+pub type TokenUserResolver =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<WsPrincipal>> + Send>> + Send + Sync>;
 
 /// Shared state required by the WebSocket upgrade handler.
 #[derive(Clone)]
@@ -80,12 +81,13 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
         return;
     }
 
-    let Some(user_id) = (state.token_user_resolver)(token.clone()).await else {
+    let Some(principal) = (state.token_user_resolver)(token.clone()).await else {
         send_realtime_error_and_close(socket, RealtimeError::AuthExpired, "authentication failed").await;
         return;
     };
 
     let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
+    let user_id = principal.user_id.clone();
     let conn_id = state.manager.add_client_for_user(user_id.clone(), token, tx);
 
     info!(%conn_id, user_id = %user_id, "websocket connection established");
@@ -93,7 +95,7 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
     let (ws_sender, ws_receiver) = socket.split();
 
     let send_handle = tokio::spawn(send_loop(conn_id, rx, ws_sender));
-    recv_loop(conn_id, &user_id, ws_receiver, &state).await;
+    recv_loop(conn_id, &principal, ws_receiver, &state).await;
 
     // Recv loop exited — client disconnected or errored.
     send_handle.abort();
@@ -158,7 +160,7 @@ async fn send_loop(
 /// Reads messages from the WebSocket stream, parses JSON, routes.
 async fn recv_loop(
     conn_id: ConnectionId,
-    user_id: &str,
+    principal: &WsPrincipal,
     mut receiver: futures_util::stream::SplitStream<WebSocket>,
     state: &WsHandlerState,
 ) {
@@ -173,7 +175,7 @@ async fn recv_loop(
 
         match msg {
             Message::Text(text) => {
-                handle_text_message(conn_id, user_id, &text, state);
+                handle_text_message(conn_id, principal, &text, state);
             }
             Message::Close(_) => {
                 debug!(%conn_id, "received close frame");
@@ -187,7 +189,7 @@ async fn recv_loop(
 }
 
 /// Process a text message: parse JSON, dispatch to built-in or router.
-fn handle_text_message(conn_id: ConnectionId, user_id: &str, text: &str, state: &WsHandlerState) {
+fn handle_text_message(conn_id: ConnectionId, principal: &WsPrincipal, text: &str, state: &WsHandlerState) {
     let parsed: Result<WebSocketMessage<Value>, _> = serde_json::from_str(text);
 
     let msg = match parsed {
@@ -210,8 +212,12 @@ fn handle_text_message(conn_id: ConnectionId, user_id: &str, text: &str, state: 
         "subscribe-show-open" => {
             handle_subscribe_show_open(state, conn_id, msg.data);
         }
+        name if principal.denied_frames.contains(&name) => {
+            warn!(%conn_id, frame = name, "realtime message refused for this connection's principal");
+            send_realtime_error(state, conn_id, RealtimeError::Forbidden);
+        }
         name => {
-            if !state.router.route(conn_id, user_id, name, msg.data) {
+            if !state.router.route(conn_id, &principal.user_id, name, msg.data) {
                 send_realtime_error(state, conn_id, RealtimeError::UnsupportedMessage);
             }
         }
@@ -273,7 +279,9 @@ mod tests {
             manager,
             router: Arc::new(crate::router::NoopMessageRouter),
             token_validator: Arc::new(|_| true),
-            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".into()) })),
+            token_user_resolver: Arc::new(|_| {
+                Box::pin(async { Some(WsPrincipal::unrestricted("system_default_user")) })
+            }),
             token_extractor: Arc::new(|_| None),
         }
     }
@@ -436,7 +444,12 @@ mod tests {
 
         std::thread::sleep(std::time::Duration::from_millis(5));
 
-        handle_text_message(conn_id, "user-1", r#"{"name":"pong","data":{}}"#, &state);
+        handle_text_message(
+            conn_id,
+            &WsPrincipal::unrestricted("user-1"),
+            r#"{"name":"pong","data":{}}"#,
+            &state,
+        );
         // No panic = success (update_last_ping was called)
     }
 
@@ -447,7 +460,7 @@ mod tests {
         let conn_id = manager.add_client("tok".into(), tx);
         let state = test_state(manager);
 
-        handle_text_message(conn_id, "user-1", "not json", &state);
+        handle_text_message(conn_id, &WsPrincipal::unrestricted("user-1"), "not json", &state);
 
         let msg = rx.try_recv().unwrap();
         match msg {
@@ -465,7 +478,12 @@ mod tests {
         let conn_id = manager.add_client("tok".into(), tx);
         let state = test_state(manager);
 
-        handle_text_message(conn_id, "user-1", r#"{"foo":"bar"}"#, &state);
+        handle_text_message(
+            conn_id,
+            &WsPrincipal::unrestricted("user-1"),
+            r#"{"foo":"bar"}"#,
+            &state,
+        );
 
         let msg = rx.try_recv().unwrap();
         match msg {
@@ -483,7 +501,12 @@ mod tests {
         let conn_id = manager.add_client("tok".into(), tx);
         let state = test_state(manager);
 
-        handle_text_message(conn_id, "user-1", r#"{"name":"","data":{}}"#, &state);
+        handle_text_message(
+            conn_id,
+            &WsPrincipal::unrestricted("user-1"),
+            r#"{"name":"","data":{}}"#,
+            &state,
+        );
 
         let msg = rx.try_recv().unwrap();
         match msg {
@@ -519,18 +542,69 @@ mod tests {
             manager,
             router: router.clone(),
             token_validator: Arc::new(|_| true),
-            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".into()) })),
+            token_user_resolver: Arc::new(|_| {
+                Box::pin(async { Some(WsPrincipal::unrestricted("system_default_user")) })
+            }),
             token_extractor: Arc::new(|_| None),
         };
 
         handle_text_message(
             conn_id,
-            "user-1",
+            &WsPrincipal::unrestricted("user-1"),
             r#"{"name":"conversation.send-message","data":{"text":"hi"}}"#,
             &state,
         );
 
         assert!(router.called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn denied_frame_is_refused_without_reaching_the_router() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct TestRouter {
+            called: AtomicBool,
+        }
+        impl MessageRouter for TestRouter {
+            fn route(&self, _conn_id: ConnectionId, _user_id: &str, _name: &str, _data: Value) -> bool {
+                self.called.store(true, Ordering::Relaxed);
+                true
+            }
+        }
+
+        let manager = Arc::new(WebSocketManager::new());
+        let (tx, mut rx) = mpsc::channel(PER_CONNECTION_BUFFER);
+        let conn_id = manager.add_client("tok".into(), tx);
+        let router = Arc::new(TestRouter {
+            called: AtomicBool::new(false),
+        });
+        let state = WsHandlerState {
+            manager,
+            router: router.clone(),
+            token_validator: Arc::new(|_| true),
+            token_user_resolver: Arc::new(|_| Box::pin(async { None })),
+            token_extractor: Arc::new(|_| None),
+        };
+        let phone = WsPrincipal {
+            user_id: "user-1".into(),
+            denied_frames: &["fs"],
+        };
+
+        handle_text_message(
+            conn_id,
+            &phone,
+            r#"{"name":"fs","data":{"method":"fs/remove"}}"#,
+            &state,
+        );
+
+        assert!(
+            !router.called.load(Ordering::Relaxed),
+            "denied frame must not be routed"
+        );
+        match rx.try_recv().unwrap() {
+            WsOutbound::Text(text) => assert!(text.contains("REALTIME_FORBIDDEN"), "{text}"),
+            _ => panic!("expected a forbidden error"),
+        }
     }
 
     #[test]
@@ -542,7 +616,7 @@ mod tests {
 
         handle_text_message(
             conn_id,
-            "user-1",
+            &WsPrincipal::unrestricted("user-1"),
             r#"{"name":"conversation.send-message","data":{"text":"hi"}}"#,
             &state,
         );

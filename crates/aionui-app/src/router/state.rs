@@ -36,7 +36,7 @@ use aionui_mcp::{
 };
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
 use aionui_project::{ProjectRouterState, ProjectService};
-use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState};
+use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState, WsPrincipal};
 use aionui_session_message::drainer::Drainer;
 use aionui_session_message::state::SessionMessageRouterState;
 use aionui_session_message::targets::MentionableTargets;
@@ -149,6 +149,10 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    /// Private-LAN network (ADR-009); `None` when its identity cannot be loaded.
+    pub network: Option<aionui_network::NetworkRouterState>,
+    /// Client devices (ADR-011); `None` when the bootstrap file cannot be written.
+    pub device: Option<aionui_device::DeviceRouterState>,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -297,7 +301,11 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module states bundle started"
     );
+    let network = super::network_state::build_network_state(services).await;
+    let device = super::device_state::build_device_state(services);
     let states = ModuleStates {
+        network,
+        device,
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
             build_conversation_state(
@@ -1144,13 +1152,18 @@ pub async fn build_extension_states(
 /// Build the `WsHandlerState` from application services with an explicit inbound
 /// `router`. Callers supply the filesystem-monitor router in production and a
 /// no-op router for router-only/test assembly.
+/// Realtime frames that act on host files (Project Explorer `fs`, `scm`).
+const HOST_FILE_FRAMES: &[&str] = &["fs", "scm"];
+
 pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) -> WsHandlerState {
     if services.local {
         return WsHandlerState {
             manager: services.ws_manager.clone(),
             router,
             token_validator: Arc::new(|_| true),
-            token_user_resolver: Arc::new(|_| Box::pin(async { Some("system_default_user".to_owned()) })),
+            token_user_resolver: Arc::new(|_| {
+                Box::pin(async { Some(WsPrincipal::unrestricted("system_default_user")) })
+            }),
             token_extractor: Arc::new(|_| Some("local".into())),
         };
     }
@@ -1159,17 +1172,34 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
     let token_validator = Arc::new(move |token: &str| jwt_service.verify(token).is_ok());
     let jwt_service = services.jwt_service.clone();
     let user_repo = services.user_repo.clone();
+    let device_repo = super::device_state::device_repo(services);
     let identity_mode = services.identity_mode;
     let token_user_resolver: TokenUserResolver = Arc::new(move |token: String| {
         let jwt_service = jwt_service.clone();
         let user_repo = user_repo.clone();
+        let device_repo = device_repo.clone();
         Box::pin(async move {
             let payload = jwt_service.verify(&token).ok()?;
             let user = user_repo.find_active_by_id(&payload.user_id).await.ok()??;
             if identity_mode == IdentityMode::AionPro && user.user_type != aionui_db::UserType::Aionpro {
                 return None;
             }
-            (payload.session_generation == user.session_generation).then_some(user.id)
+            // A device-bound token (ADR-011) needs a live device of this user.
+            // Devices other than the desktop app may not send host file frames (ADR-013).
+            let mut denied_frames: &'static [&'static str] = &[];
+            if let Some(device_id) = payload.device_id.as_deref() {
+                let device = device_repo.find(device_id).await.ok()??;
+                if device.user_id != user.id || device.revoked_at.is_some() {
+                    return None;
+                }
+                if device.kind != aionui_api_types::DeviceKind::DesktopApp.as_str() {
+                    denied_frames = HOST_FILE_FRAMES;
+                }
+            }
+            (payload.session_generation == user.session_generation).then_some(WsPrincipal {
+                user_id: user.id,
+                denied_frames,
+            })
         })
     });
 
@@ -1349,6 +1379,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_ws_state_rejects_tokens_of_revoked_devices() {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+        let ws_state = build_ws_state(&services, std::sync::Arc::new(aionui_realtime::NoopMessageRouter));
+        let devices = super::super::device_state::device_repo(&services);
+        let device = devices.insert("system_default_user", "Phone", "mobile").await.unwrap();
+        let (token, _) = services
+            .jwt_service
+            .sign_session_pair("system_default_user", "system_default_user", 0, Some(&device.id))
+            .unwrap();
+
+        let resolved = (ws_state.token_user_resolver)(token.clone()).await;
+        assert_eq!(
+            resolved,
+            Some(WsPrincipal {
+                user_id: "system_default_user".into(),
+                denied_frames: HOST_FILE_FRAMES,
+            }),
+            "a paired phone may not send host file frames"
+        );
+
+        let desktop = devices
+            .insert("system_default_user", "Mac", "desktop_app")
+            .await
+            .unwrap();
+        let (desktop_token, _) = services
+            .jwt_service
+            .sign_session_pair("system_default_user", "system_default_user", 0, Some(&desktop.id))
+            .unwrap();
+        assert_eq!(
+            (ws_state.token_user_resolver)(desktop_token).await,
+            Some(WsPrincipal::unrestricted("system_default_user"))
+        );
+
+        devices.revoke("system_default_user", &device.id, 1).await.unwrap();
+        assert_eq!((ws_state.token_user_resolver)(token).await, None);
+
+        services.database.close().await;
+    }
+
+    #[tokio::test]
     async fn build_ws_state_rejects_stale_session_generation() {
         let db = aionui_db::init_database_memory().await.unwrap();
         let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
@@ -1359,7 +1430,7 @@ mod tests {
             .unwrap();
 
         let resolved = (ws_state.token_user_resolver)(token.clone()).await;
-        assert_eq!(resolved.as_deref(), Some("system_default_user"));
+        assert_eq!(resolved, Some(WsPrincipal::unrestricted("system_default_user")));
 
         services
             .user_repo

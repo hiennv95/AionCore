@@ -1,0 +1,23 @@
+[package]
+name = "aionui-peer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum.workspace = true
+hex.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tower.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

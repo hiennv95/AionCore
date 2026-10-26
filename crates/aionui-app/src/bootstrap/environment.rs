@@ -27,12 +27,18 @@ pub struct ServerEnvironment {
     pub config: AppConfig,
     /// Built web client to serve alongside the API (`--static-dir`).
     pub static_dir: Option<PathBuf>,
+    /// Interim legacy built web client to serve at /legacy/ (`--legacy-static-dir`).
+    pub legacy_static_dir: Option<PathBuf>,
     /// Browser origins allowed to call the server (`--allowed-origin`).
     pub allowed_origins: Option<AllowedOrigins>,
     /// Accept only refresh tokens on every refresh path (`--strict-refresh`).
     pub strict_refresh: bool,
     /// Lifetime of newly issued access tokens (`--access-token-ttl-secs`).
     pub access_token_ttl: Option<Duration>,
+    /// Close WebSockets whose token expired (`--ws-token-expiry`).
+    pub ws_token_expiry: bool,
+    /// Mutual-TLS peer listener address (`--peer-listen`).
+    pub peer_listen: Option<std::net::SocketAddr>,
 }
 
 /// Layer 1: Logging + config resolution.
@@ -136,6 +142,31 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         info!(static_dir = %dir.display(), "startup: static web client enabled");
     }
 
+    let legacy_static_dir = cli
+        .legacy_static_dir
+        .as_deref()
+        .map(std::path::absolute)
+        .transpose()
+        .map_err(|error| {
+            BootstrapError::new(
+                BootstrapErrorCode::ConfigInvalid,
+                "config.legacy_static_dir",
+                "invalid startup configuration",
+            )
+            .with_source(error)
+        })?;
+    if let Some(dir) = &legacy_static_dir {
+        aionui_app::validate_static_dir(dir).map_err(|error| {
+            BootstrapError::new(
+                BootstrapErrorCode::ConfigInvalid,
+                "config.legacy_static_dir",
+                "invalid startup configuration",
+            )
+            .with_source(error)
+        })?;
+        info!(legacy_static_dir = %dir.display(), "startup: legacy static web client enabled at /legacy/");
+    }
+
     let allowed_origins = if cli.allowed_origins.is_empty() {
         None
     } else {
@@ -166,10 +197,11 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
             }
         })
         .transpose()?;
-    if cli.strict_refresh || access_token_ttl.is_some() {
+    if cli.strict_refresh || access_token_ttl.is_some() || cli.ws_token_expiry {
         info!(
             strict_refresh = cli.strict_refresh,
             access_token_ttl_secs = access_token_ttl.map(|ttl| ttl.as_secs()),
+            ws_token_expiry = cli.ws_token_expiry,
             "startup: token policy overrides enabled"
         );
     }
@@ -178,9 +210,12 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         _log_guard: log_guard,
         config,
         static_dir,
+        legacy_static_dir,
         allowed_origins,
         strict_refresh: cli.strict_refresh,
         access_token_ttl,
+        ws_token_expiry: cli.ws_token_expiry,
+        peer_listen: cli.peer_listen,
     })
 }
 

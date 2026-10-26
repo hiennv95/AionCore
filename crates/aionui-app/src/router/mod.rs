@@ -2,9 +2,12 @@
 
 mod antigravity_hook;
 mod clipboard_writer;
+mod device_state;
 mod fs_monitor;
 mod health;
 mod item_revealer;
+mod network_runner;
+mod network_state;
 mod origin_guard;
 mod routes;
 mod runtime_team_tools;
@@ -24,4 +27,4 @@ pub use state::{
     ChannelOrchestratorComponents, ModuleStates, RouterBuildError, build_assistant_state, build_conversation_state,
     build_extension_states, build_module_states, build_ws_state,
 };
-pub use static_web::{StaticDirError, validate_static_dir, with_static_web};
+pub use static_web::{StaticDirError, validate_static_dir, with_static_web, with_static_web_clients};

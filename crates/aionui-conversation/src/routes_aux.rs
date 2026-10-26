@@ -5,11 +5,12 @@ use aionui_api_types::{
     ApiResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse,
     SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, desktop_only};
 use aionui_common::ApiError;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
+use axum::middleware::from_fn;
 use axum::routing::{get, post, put};
 
 /// Build the conversation-ops router (no auth layer applied — the caller is
@@ -23,7 +24,11 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
             "/api/conversations/{id}/config-options/{option_id}",
             put(set_config_option),
         )
-        .route("/api/conversations/{id}/workspace", get(browse_workspace))
+        // Lists any folder chosen as a workspace: desktop only (ADR-013).
+        .route(
+            "/api/conversations/{id}/workspace",
+            get(browse_workspace).route_layer(from_fn(desktop_only)),
+        )
         .with_state(state)
 }
 

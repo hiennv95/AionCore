@@ -9,10 +9,10 @@ use axum::middleware::Next;
 use axum::response::Response;
 
 use aionui_common::ApiError;
-use aionui_common::constants::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME};
+use aionui_common::constants::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME, REFRESH_COOKIE_NAME};
 
 use crate::cookie::CookieConfig;
-use crate::extract::extract_cookie_value;
+use crate::extract::{extract_cookie_value, extract_token_from_headers};
 
 /// CSRF protection middleware using the Double Submit Cookie pattern.
 ///
@@ -39,8 +39,14 @@ pub async fn csrf_middleware(
     // cookie-bearing cross-site requests, while the helper CLI authenticates
     // via an explicit custom header (never ambient cookies) that browsers
     // cannot attach cross-site without a CORS preflight. The token itself is
-    // still fully validated by the auth middleware behind this layer.
-    let is_runtime_token_request = request.headers().contains_key(crate::middleware::RUNTIME_TOKEN_HEADER);
+    // still fully validated by the auth middleware behind this layer. The
+    // exemption holds only without other credentials: a JWT or session cookie
+    // is what auth would select, and the refresh endpoint reads the refresh
+    // cookie on its own, so such requests keep CSRF.
+    let carries_credentials = extract_token_from_headers(request.headers()).is_some()
+        || extract_cookie_value(request.headers(), REFRESH_COOKIE_NAME).is_some();
+    let is_runtime_token_request =
+        request.headers().contains_key(crate::middleware::RUNTIME_TOKEN_HEADER) && !carries_credentials;
     // agy's PreToolUse callback. A local `aioncore antigravity-hook` process
     // posts here for every tool the agent wants to run; it has no user session
     // and no CSRF token to present. The route is already deliberately outside
@@ -57,7 +63,15 @@ pub async fn csrf_middleware(
     // hook reads that as "no answer" and denies (measured 2026-08-14: 9/9 then
     // 12/12 calls rejected across two live runs).
     let is_antigravity_hook = path.starts_with("/internal/antigravity-hook/");
+    // Device bootstrap and pairing (ADR-011) carry their proof in the body (a
+    // per-launch secret, a single-use pairing secret or claim token) and read no
+    // ambient cookie, like /login.
+    let is_device_handshake = path == "/api/devices/app-session"
+        || path == "/api/devices/host-proof"
+        || path == "/api/devices/pair"
+        || path == "/api/devices/pair/claim";
     let is_exempt = path == "/login"
+        || is_device_handshake
         || path == "/api/auth/qr-login"
         || path.starts_with("/api/auth/internal/external-users/")
         || path.starts_with("/api/auth/internal/external-sessions")

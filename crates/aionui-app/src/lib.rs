@@ -14,6 +14,6 @@ pub use router::{
     AllowedOrigins, ChannelOrchestratorComponents, InvalidOriginError, ModuleStates, RouterBuildError, RouterRuntime,
     StaticDirError, build_assistant_state, build_conversation_state, build_extension_states, build_module_states,
     build_ws_state, create_router, create_router_with_all_state, create_router_with_runtime, create_router_with_states,
-    validate_static_dir, with_origin_guard, with_static_web,
+    validate_static_dir, with_origin_guard, with_static_web, with_static_web_clients,
 };
 pub use services::AppServices;

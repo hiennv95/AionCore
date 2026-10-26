@@ -13,9 +13,10 @@ use aionui_api_types::{
     ApiResponse, CheckToolInstalledRequest, CheckToolInstalledResponse, OpenExternalRequest, OpenFileRequest,
     OpenFolderWithRequest, ShowItemInFolderRequest, SpeechToTextConfig, SttStreamServerMessage,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, desktop_only};
 use aionui_common::ApiError;
 use aionui_system::ClientPrefService;
+use axum::middleware::from_fn;
 
 use crate::error::{ShellError, SttError};
 use crate::state::ShellRouterState;
@@ -54,14 +55,18 @@ impl From<SttError> for ApiError {
 }
 
 pub fn shell_routes(state: ShellRouterState) -> Router {
-    Router::new()
+    // Opening or revealing host paths is a host file effect (ADR-013).
+    let host_file_effects = Router::new()
         .route("/api/shell/open-file", post(open_file))
         .route("/api/shell/show-item-in-folder", post(show_item_in_folder))
+        .route("/api/shell/open-folder-with", post(open_folder_with))
+        .route_layer(from_fn(desktop_only));
+    Router::new()
         .route("/api/shell/open-external", post(open_external))
         .route("/api/shell/check-tool-installed", post(check_tool_installed))
-        .route("/api/shell/open-folder-with", post(open_folder_with))
         .route("/api/stt", post(speech_to_text))
         .route("/api/stt/stream", get(speech_to_text_stream))
+        .merge(host_file_effects)
         .with_state(state)
 }
 
