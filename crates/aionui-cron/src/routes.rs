@@ -2,16 +2,18 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, Query, State};
+use axum::extract::{Extension, Json, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::{get, post, put};
+use axum::middleware::{Next, from_fn};
+use axum::response::Response;
+use axum::routing::{MethodRouter, delete, get, post, put};
 
 use aionui_api_types::{
     ApiResponse, ConversationResponse, CreateConversationCronRequest, CreateConversationCronResponse,
     CreateCronJobRequest, CronJobResponse, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
     UpdateConversationCronRequest, UpdateCronJobRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentDevice, CurrentUser, is_paired_device};
 use aionui_common::ApiError;
 use aionui_db::DbError;
 
@@ -54,22 +56,81 @@ impl From<CronError> for ApiError {
     }
 }
 
+/// Paired phones and browsers may list, inspect and pause jobs (ADR-019).
+/// A job runs its agent unattended in full-auto mode, so arming, changing,
+/// running or deleting one is for the desktop app; the agent helper keeps
+/// its owner-equivalent access.
+fn cron_desktop_only_error() -> ApiError {
+    ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "CRON_DESKTOP_ONLY",
+        "Scheduled jobs are created and changed in the desktop app; this device can view and pause them.",
+        None,
+    )
+}
+
+async fn cron_desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
+    if is_paired_device(request.extensions().get::<CurrentDevice>()) {
+        return Err(cron_desktop_only_error());
+    }
+    Ok(next.run(request).await)
+}
+
+fn desktop<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> MethodRouter<S> {
+    route.route_layer(from_fn(cron_desktop_only))
+}
+
+/// The one change a paired device may make: `{enabled: false}` and nothing else.
+fn is_pause_only(req: &UpdateCronJobRequest) -> bool {
+    let UpdateCronJobRequest {
+        name,
+        description,
+        enabled,
+        schedule,
+        message,
+        execution_mode,
+        agent_config,
+        conversation_title,
+        max_retries,
+        queue_enabled,
+    } = req;
+    *enabled == Some(false)
+        && name.is_none()
+        && description.is_none()
+        && schedule.is_none()
+        && message.is_none()
+        && execution_mode.is_none()
+        && agent_config.is_none()
+        && conversation_title.is_none()
+        && max_retries.is_none()
+        && queue_enabled.is_none()
+}
+
 pub fn cron_routes(state: CronRouterState) -> Router {
     Router::new()
-        .route("/api/cron/jobs", get(list_jobs).post(create_job))
-        .route("/api/cron/jobs/{id}", get(get_job).put(update_job).delete(delete_job))
-        .route("/api/cron/jobs/{id}/run", post(run_now))
-        .route("/api/internal/conversation-cron/create", post(create_conversation_cron))
-        .route("/api/internal/conversation-cron/list", get(list_conversation_cron))
+        .route("/api/cron/jobs", get(list_jobs).merge(desktop(post(create_job))))
+        .route(
+            "/api/cron/jobs/{id}",
+            get(get_job).put(update_job).merge(desktop(delete(delete_job))),
+        )
+        .route("/api/cron/jobs/{id}/run", desktop(post(run_now)))
+        .route(
+            "/api/internal/conversation-cron/create",
+            desktop(post(create_conversation_cron)),
+        )
+        .route(
+            "/api/internal/conversation-cron/list",
+            desktop(get(list_conversation_cron)),
+        )
         .route(
             "/api/internal/conversation-cron/jobs/{id}",
-            put(update_conversation_cron),
+            desktop(put(update_conversation_cron)),
         )
-        .route("/api/cron/internal/system-resume", post(system_resume))
+        .route("/api/cron/internal/system-resume", desktop(post(system_resume)))
         .route("/api/cron/jobs/{id}/conversations", get(list_conversations_by_cron_job))
         .route(
             "/api/cron/jobs/{id}/skill",
-            get(has_skill).post(save_skill).delete(delete_skill),
+            get(has_skill).merge(desktop(post(save_skill).delete(delete_skill))),
         )
         .with_state(state)
 }
@@ -107,10 +168,14 @@ async fn get_job(
 async fn update_job(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateCronJobRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CronJobResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if is_paired_device(device.as_ref().map(|Extension(device)| device)) && !is_pause_only(&req) {
+        return Err(cron_desktop_only_error());
+    }
     let job = state.cron_service.update_job(&user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(CronService::to_response(&job))))
 }

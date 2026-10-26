@@ -271,7 +271,7 @@ impl CronService {
         runtime_agent_type: Option<String>,
         assistant_backend_override: Option<String>,
     ) -> Result<CronJob, CronError> {
-        let schedule = schedule_from_dto(&req.schedule);
+        let schedule = with_host_timezone(schedule_from_dto(&req.schedule));
         validate_schedule(&schedule)?;
         let resolved_agent_type = match runtime_agent_type {
             Some(agent_type) => agent_type,
@@ -374,7 +374,7 @@ impl CronService {
             job.enabled = enabled;
         }
         if let Some(schedule_dto) = &req.schedule {
-            let schedule = schedule_from_dto_with_existing_timezone(schedule_dto, &job.schedule);
+            let schedule = with_host_timezone(schedule_from_dto_with_existing_timezone(schedule_dto, &job.schedule));
             validate_schedule(&schedule)?;
             job.schedule = schedule;
         }
@@ -392,6 +392,16 @@ impl CronService {
             if requested_mode != original_execution_mode && matches!(requested_mode, ExecutionMode::NewConversation) {
                 clear_conversation_binding = true;
             }
+        }
+        // Same scope rule as create when a job starts running in a named
+        // conversation: the caller owns it and it is not a LAN share. An
+        // empty id stays allowed; the run then materializes its own.
+        if matches!(job.execution_mode, ExecutionMode::Existing)
+            && !matches!(original_execution_mode, ExecutionMode::Existing)
+            && !job.conversation_id.trim().is_empty()
+        {
+            self.require_existing_conversation_scope(user_id, job.conversation_id.trim())
+                .await?;
         }
         if req.agent_config.is_some()
             && (matches!(original_execution_mode, ExecutionMode::Existing)
@@ -468,6 +478,12 @@ impl CronService {
     }
 
     pub async fn remove_job(&self, user_id: &str, job_id: &str) -> Result<(), CronError> {
+        // Ownership first: the timer and the instruction folder are keyed by
+        // job id alone, so another user's delete must not reach them.
+        self.repo
+            .get_by_id_for_user(user_id, job_id)
+            .await?
+            .ok_or_else(|| CronError::Database(DbError::NotFound(format!("cron job '{job_id}'"))))?;
         self.scheduler.cancel_job(job_id);
         if let Err(err) = delete_skill_file(&self.data_dir, job_id).await {
             warn!(job_id, error = %err, "Failed to delete cron skill file during job removal");
@@ -2351,15 +2367,33 @@ fn local_timezone_name() -> Option<String> {
     let tz = match iana_time_zone::get_timezone() {
         Ok(tz) => tz,
         Err(err) => {
-            warn!(error = %err, "Failed to detect local timezone; conversation cron will use UTC");
+            warn!(error = %err, "Failed to detect local timezone; cron will use UTC");
             return None;
         }
     };
     if validate_timezone(&tz).is_err() {
-        warn!(timezone = %tz, "Local timezone not recognized by tz database; conversation cron will use UTC");
+        warn!(timezone = %tz, "Local timezone not recognized by tz database; cron will use UTC");
         return None;
     }
     Some(tz)
+}
+
+/// A cron expression without a zone means the host's wall clock (ADR-019),
+/// as for jobs the agent helper creates; otherwise the scheduler would read
+/// it as UTC. Other schedule kinds and explicit zones are left alone.
+fn with_host_timezone(schedule: CronSchedule) -> CronSchedule {
+    match schedule {
+        CronSchedule::Cron {
+            expr,
+            tz: None,
+            description,
+        } if !expr.trim().is_empty() => CronSchedule::Cron {
+            expr,
+            tz: local_timezone_name(),
+            description,
+        },
+        other => other,
+    }
 }
 
 /// Build the schedule for a conversation cron created via `cron current create`.

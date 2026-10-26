@@ -10,7 +10,7 @@ use tower::ServiceExt;
 
 use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 
-use common::{body_json, build_app_with_skill_paths, get_with_token, json_with_token};
+use common::{body_json, build_app_with_skill_paths, delete_with_token, get_with_token, json_with_token};
 
 fn public_post(uri: &str, body: serde_json::Value) -> Request<Body> {
     // No cookie, no CSRF header: native clients and first contact have neither.
@@ -679,4 +679,150 @@ async fn only_the_desktop_app_uses_filesystem_routes_beyond_upload() {
         .unwrap();
     let (status, _) = send(upload).await;
     assert_eq!(status, StatusCode::OK, "phone attachment upload");
+}
+
+/// ADR-019: a scheduled job runs its agent in full-auto mode, unattended, so
+/// arming one is a host effect. Paired phones and browsers may list, inspect
+/// and pause jobs; everything else is for the desktop app (and the helper).
+#[tokio::test]
+async fn a_paired_device_may_inspect_and_pause_cron_jobs_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let (app, services, _paths) = build_app_with_skill_paths(dir.path()).await;
+    let bootstrap = std::fs::read_to_string(dir.path().join("app-bootstrap.token")).unwrap();
+    let send = |req: Request<Body>| {
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(req).await.unwrap();
+            (resp.status(), body_json(resp).await)
+        }
+    };
+    let (_, desktop) = send(public_post(
+        "/api/devices/app-session",
+        json!({"bootstrap_token": bootstrap, "device_name": "Test Mac"}),
+    ))
+    .await;
+    let desktop = desktop["data"]["access_token"].as_str().unwrap().to_owned();
+    let (_, pairing) = send(json_with_token(
+        "POST",
+        "/api/devices/pairings",
+        json!({}),
+        &desktop,
+        "c",
+    ))
+    .await;
+    let (_, paired) = send(public_post(
+        "/api/devices/pair",
+        json!({"secret": pairing["data"]["secret"], "device_name": "Phone", "device_kind": "mobile"}),
+    ))
+    .await;
+    let pairing_id = paired["data"]["pairing_id"].as_str().unwrap();
+    send(json_with_token(
+        "POST",
+        &format!("/api/devices/pairings/{pairing_id}/approve"),
+        json!({}),
+        &desktop,
+        "c",
+    ))
+    .await;
+    let (_, claimed) = send(public_post(
+        "/api/devices/pair/claim",
+        json!({"pairing_id": pairing_id, "claim_token": paired["data"]["claim_token"]}),
+    ))
+    .await;
+    let device = claimed["data"]["session"]["access_token"].as_str().unwrap().to_owned();
+    let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
+    let issue = services.runtime_token_service.issue(
+        owner.as_str(),
+        "conv-agent-helper",
+        TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+        [RuntimeTokenScope::ConversationHelper],
+    );
+    let helper = [
+        ("x-aionui-runtime-token", issue.token.as_str()),
+        ("x-aionui-user-id", owner.as_str()),
+        ("x-aionui-conversation-id", "conv-agent-helper"),
+    ];
+
+    let (status, _) = send(json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({"id": "cron-device-assistant", "name": "Cron Assistant", "agent_id": "2d23ff1c"}),
+        &desktop,
+        "c",
+    ))
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let job_body = json!({
+        "name": "Hourly note",
+        "schedule": {"kind": "every", "every_ms": 3_600_000, "description": "hourly"},
+        "message": "Reply with OK.",
+        "conversation_id": "",
+        "created_by": "user",
+        "execution_mode": "new_conversation",
+        "agent_config": {"name": "Cron Assistant", "assistant_id": "cron-device-assistant"}
+    });
+    let desktop_only = (StatusCode::FORBIDDEN, json!("CRON_DESKTOP_ONLY"));
+
+    // Arming a job: refused for the device, allowed for the desktop app.
+    let (status, body) = send(json_with_token(
+        "POST",
+        "/api/cron/jobs",
+        job_body.clone(),
+        &device,
+        "c",
+    ))
+    .await;
+    assert_eq!((status, body["code"].clone()), desktop_only, "device create");
+    let (status, created) = send(json_with_token(
+        "POST",
+        "/api/cron/jobs",
+        job_body.clone(),
+        &desktop,
+        "c",
+    ))
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "desktop create: {created}");
+    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let job = format!("/api/cron/jobs/{id}");
+
+    // Reading and pausing work for the device.
+    for uri in ["/api/cron/jobs".to_owned(), job.clone(), format!("{job}/conversations")] {
+        let (status, _) = send(get_with_token(&uri, &device)).await;
+        assert_eq!(status, StatusCode::OK, "device read {uri}");
+    }
+    let (status, paused) = send(json_with_token("PUT", &job, json!({"enabled": false}), &device, "c")).await;
+    assert_eq!(status, StatusCode::OK, "device pause");
+    assert_eq!(paused["data"]["enabled"], false);
+
+    // Everything else is refused for the device.
+    let refused = [
+        ("PUT", job.clone(), json!({"enabled": true})),
+        ("PUT", job.clone(), json!({"enabled": false, "message": "Do more."})),
+        ("PUT", job.clone(), json!({"name": "Renamed"})),
+        ("POST", format!("{job}/run"), json!({})),
+        ("POST", format!("{job}/skill"), json!({"content": "Do something"})),
+        (
+            "POST",
+            "/api/internal/conversation-cron/create".to_owned(),
+            json!({"name": "x", "schedule": "0 9 * * *", "message": "x"}),
+        ),
+        ("POST", "/api/cron/internal/system-resume".to_owned(), json!({})),
+    ];
+    for (method, uri, body) in refused {
+        let (status, code) = send(json_with_token(method, &uri, body, &device, "c")).await;
+        assert_eq!((status, code["code"].clone()), desktop_only, "device {method} {uri}");
+    }
+    let (status, code) = send(delete_with_token(&format!("{job}/skill"), &device, "c")).await;
+    assert_eq!((status, code["code"].clone()), desktop_only, "device delete skill");
+    let (status, code) = send(delete_with_token(&job, &device, "c")).await;
+    assert_eq!((status, code["code"].clone()), desktop_only, "device delete");
+
+    // The helper keeps its owner-equivalent access; the desktop resumes and deletes.
+    let (status, _) = send(helper_request("GET", "/api/cron/jobs", json!(null), &helper)).await;
+    assert_eq!(status, StatusCode::OK, "helper list");
+    let (status, resumed) = send(json_with_token("PUT", &job, json!({"enabled": true}), &desktop, "c")).await;
+    assert_eq!(status, StatusCode::OK, "desktop resume");
+    assert_eq!(resumed["data"]["enabled"], true);
+    let (status, _) = send(delete_with_token(&job, &desktop, "c")).await;
+    assert_eq!(status, StatusCode::OK, "desktop delete");
 }

@@ -65,7 +65,7 @@ pub use csrf::csrf_middleware;
 // Auth middleware
 pub use middleware::{
     AuthIdentityMode, AuthState, CurrentDevice, CurrentUser, IRuntimeTokenVerifier, RUNTIME_CONVERSATION_ID_HEADER,
-    RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, RuntimeHelperCaller, auth_middleware, desktop_only,
+    RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, RuntimeHelperCaller, auth_middleware, desktop_only, is_paired_device,
     local_auth_middleware, no_paired_devices,
 };
 

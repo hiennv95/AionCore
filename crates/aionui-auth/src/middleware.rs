@@ -280,9 +280,13 @@ pub async fn local_auth_middleware(mut request: Request, next: Next) -> Response
 /// Whether the request comes from a paired phone or browser (a device other
 /// than the desktop app).
 fn from_paired_device(extensions: &axum::http::Extensions) -> bool {
-    extensions
-        .get::<CurrentDevice>()
-        .is_some_and(|device| device.kind != aionui_api_types::DeviceKind::DesktopApp.as_str())
+    is_paired_device(extensions.get::<CurrentDevice>())
+}
+
+/// Whether this session's device is a paired phone or browser. Desktop-app
+/// and device-less sessions (and the agent helper) are not.
+pub fn is_paired_device(device: Option<&CurrentDevice>) -> bool {
+    device.is_some_and(|device| device.kind != aionui_api_types::DeviceKind::DesktopApp.as_str())
 }
 
 fn fs_owner_only() -> ApiError {

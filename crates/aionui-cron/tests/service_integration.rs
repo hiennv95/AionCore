@@ -3647,3 +3647,172 @@ async fn jobs_never_attach_to_a_lan_share_conversation() {
             if message == "scheduled jobs cannot run in a LAN share conversation"
     ));
 }
+
+fn conversation_row(id: &str, user_id: &str, extra: &str) -> aionui_db::models::ConversationRow {
+    aionui_db::models::ConversationRow {
+        id: id.to_owned(),
+        user_id: user_id.to_owned(),
+        name: id.to_owned(),
+        r#type: "acp".to_owned(),
+        model: None,
+        status: Some("pending".to_owned()),
+        source: None,
+        channel_chat_id: None,
+        extra: extra.to_owned(),
+        pinned: false,
+        pinned_at: None,
+        created_at: 0,
+        updated_at: 0,
+        project_id: None,
+        folder_id: None,
+        name_source: None,
+    }
+}
+
+fn switch_to_existing() -> UpdateCronJobRequest {
+    UpdateCronJobRequest {
+        name: None,
+        description: None,
+        enabled: None,
+        schedule: None,
+        message: None,
+        execution_mode: Some("existing".into()),
+        agent_config: None,
+        conversation_title: None,
+        max_retries: None,
+        queue_enabled: None,
+    }
+}
+
+/// B06 audit: create checks the conversation scope of an `existing` job, so
+/// update must too, or a job can be moved onto a LAN share afterwards.
+#[tokio::test]
+async fn update_cannot_move_a_job_onto_a_lan_share_conversation() {
+    let (svc, _repo, _bc, conv_repo) = setup_with_conv_repo().await;
+    conv_repo
+        .create(&conversation_row(
+            "conv_lan_share",
+            "u1",
+            r#"{"backend":"codex","lan_remote":true,"session_mode":"read-only"}"#,
+        ))
+        .await
+        .unwrap();
+    let mut req = make_create_req("Fresh runs", every_60s());
+    req.conversation_id = "conv_lan_share".into();
+    req.execution_mode = Some("new_conversation".into());
+    let job = svc.add_job("u1", req).await.unwrap();
+
+    let err = svc.update_job("u1", &job.id, switch_to_existing()).await.unwrap_err();
+    assert!(matches!(
+        err,
+        aionui_cron::error::CronError::InvalidAgentConfig(message)
+            if message == "scheduled jobs cannot run in a LAN share conversation"
+    ));
+}
+
+#[tokio::test]
+async fn update_cannot_move_a_job_onto_another_users_conversation() {
+    let (svc, _repo, _bc, conv_repo) = setup_with_conv_repo().await;
+    sqlx::query(
+        "INSERT OR IGNORE INTO users (id, username, password_hash, created_at, updated_at) \
+         VALUES ('u2', 'u2', 'hash', 0, 0)",
+    )
+    .execute(&conv_repo.sqlite_pool)
+    .await
+    .unwrap();
+    conv_repo
+        .create(&conversation_row("conv_of_u2", "u2", "{}"))
+        .await
+        .unwrap();
+    let mut req = make_create_req("Fresh runs", every_60s());
+    req.conversation_id = "conv_of_u2".into();
+    req.execution_mode = Some("new_conversation".into());
+    let job = svc.add_job("u1", req).await.unwrap();
+
+    let err = svc.update_job("u1", &job.id, switch_to_existing()).await.unwrap_err();
+    assert!(matches!(err, aionui_cron::error::CronError::CrossAccountReference(_)));
+}
+
+/// B06 audit: a delete by someone who does not own the job must not touch it.
+#[tokio::test]
+async fn remove_by_another_user_leaves_the_owners_job_untouched() {
+    let (svc, skill_repo) = setup_with_skill_repo().await;
+    let job = svc.add_job("u1", make_create_req("Owned", every_60s())).await.unwrap();
+    svc.save_skill(
+        "u1",
+        &job.id,
+        SaveCronSkillRequest {
+            content: "---\nname: owned\ndescription: owned skill\n---\nDo something".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let skill = skill_repo
+        .find_by_name_for_user("u1", &format!("cron-{}", job.id))
+        .await
+        .unwrap()
+        .expect("owner skill row");
+    assert!(std::path::Path::new(&skill.path).exists());
+
+    let err = svc.remove_job("u2", &job.id).await.unwrap_err();
+    assert!(matches!(
+        err,
+        aionui_cron::error::CronError::Database(aionui_db::DbError::NotFound(_))
+    ));
+    assert!(
+        std::path::Path::new(&skill.path).exists(),
+        "another user's delete removed the owner's saved instructions"
+    );
+    assert!(svc.get_job("u1", &job.id).await.is_ok());
+}
+
+/// B06 audit: a cron expression without a zone means the host's wall clock,
+/// as for jobs the agent helper creates (ADR-019).
+#[tokio::test]
+async fn cron_schedule_without_timezone_gets_the_host_zone() {
+    let (svc, _, _) = setup().await;
+    let host_zone = iana_time_zone::get_timezone()
+        .ok()
+        .filter(|tz| tz.parse::<chrono_tz::Tz>().is_ok());
+
+    let job = svc
+        .add_job("u1", make_create_req("Local time", cron_every_5min()))
+        .await
+        .unwrap();
+    let aionui_cron::types::CronSchedule::Cron { tz, .. } = &job.schedule else {
+        panic!("cron schedule expected");
+    };
+    assert_eq!(tz, &host_zone);
+
+    let mut update = switch_to_existing();
+    update.execution_mode = None;
+    update.schedule = Some(CronScheduleDto::Cron {
+        expr: "0 0 9 * * *".into(),
+        tz: None,
+        description: None,
+    });
+    let updated = svc.update_job("u1", &job.id, update).await.unwrap();
+    let aionui_cron::types::CronSchedule::Cron { tz, .. } = &updated.schedule else {
+        panic!("cron schedule expected");
+    };
+    assert_eq!(tz, &host_zone);
+
+    let explicit = svc
+        .add_job(
+            "u1",
+            make_create_req(
+                "Explicit zone",
+                CronScheduleDto::Cron {
+                    expr: "0 0 9 * * *".into(),
+                    tz: Some("UTC".into()),
+                    description: None,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    let aionui_cron::types::CronSchedule::Cron { tz, .. } = &explicit.schedule else {
+        panic!("cron schedule expected");
+    };
+    assert_eq!(tz.as_deref(), Some("UTC"));
+}
