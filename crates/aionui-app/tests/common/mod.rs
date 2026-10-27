@@ -366,3 +366,70 @@ pub async fn login_existing(app: &mut axum::Router, username: &str, password: &s
     let token = json["token"].as_str().unwrap().to_owned();
     (token, csrf)
 }
+
+async fn send_json(app: &axum::Router, req: Request<Body>) -> serde_json::Value {
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+}
+
+/// A desktop app session (bootstrap token under `root`, as `build_app_with_skill_paths`
+/// writes it) and a phone paired and approved from it. Returns their access tokens; both
+/// requests and the CSRF pair use `"c"` with `json_with_token`.
+pub async fn desktop_and_phone(app: &axum::Router, root: &std::path::Path) -> (String, String) {
+    let public = |uri: &str, body: serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let bootstrap = std::fs::read_to_string(root.join("app-bootstrap.token")).unwrap();
+    let desktop = send_json(
+        app,
+        public(
+            "/api/devices/app-session",
+            serde_json::json!({"bootstrap_token": bootstrap, "device_name": "Test Mac"}),
+        ),
+    )
+    .await["data"]["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let pairing = send_json(
+        app,
+        json_with_token("POST", "/api/devices/pairings", serde_json::json!({}), &desktop, "c"),
+    )
+    .await;
+    let paired = send_json(
+        app,
+        public(
+            "/api/devices/pair",
+            serde_json::json!({"secret": pairing["data"]["secret"], "device_name": "Phone", "device_kind": "mobile"}),
+        ),
+    )
+    .await;
+    let pairing_id = paired["data"]["pairing_id"].as_str().unwrap();
+    send_json(
+        app,
+        json_with_token(
+            "POST",
+            &format!("/api/devices/pairings/{pairing_id}/approve"),
+            serde_json::json!({}),
+            &desktop,
+            "c",
+        ),
+    )
+    .await;
+    let claimed = send_json(
+        app,
+        public(
+            "/api/devices/pair/claim",
+            serde_json::json!({"pairing_id": pairing_id, "claim_token": paired["data"]["claim_token"]}),
+        ),
+    )
+    .await;
+    let phone = claimed["data"]["session"]["access_token"].as_str().unwrap().to_owned();
+    (desktop, phone)
+}

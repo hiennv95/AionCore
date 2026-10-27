@@ -13,18 +13,9 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use common::{build_app_with_skill_paths, json_with_token};
+use common::{build_app_with_skill_paths, desktop_and_phone, json_with_token};
 
 const ENV_SECRET: &str = "custom-agent-env-secret-789";
-
-fn public_post(uri: &str, body: Value) -> Request<Body> {
-    Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
 
 fn get(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
@@ -41,7 +32,6 @@ async fn phones_cannot_choose_host_commands_or_change_remote_agents_and_read_env
     unsafe { std::env::set_var("AIONUI_BYPASS_PROBE", "1") };
     let tmp = tempfile::tempdir().unwrap();
     let (app, services, _) = build_app_with_skill_paths(tmp.path()).await;
-    let bootstrap = std::fs::read_to_string(tmp.path().join("app-bootstrap.token")).unwrap();
     let send = |req: Request<Body>| {
         let app = app.clone();
         async move {
@@ -52,40 +42,7 @@ async fn phones_cannot_choose_host_commands_or_change_remote_agents_and_read_env
         }
     };
 
-    let (_, desktop) = send(public_post(
-        "/api/devices/app-session",
-        json!({"bootstrap_token": bootstrap, "device_name": "Test Mac"}),
-    ))
-    .await;
-    let desktop = desktop["data"]["access_token"].as_str().unwrap().to_owned();
-    let (_, pairing) = send(json_with_token(
-        "POST",
-        "/api/devices/pairings",
-        json!({}),
-        &desktop,
-        "c",
-    ))
-    .await;
-    let (_, paired) = send(public_post(
-        "/api/devices/pair",
-        json!({"secret": pairing["data"]["secret"], "device_name": "Phone", "device_kind": "mobile"}),
-    ))
-    .await;
-    let pairing_id = paired["data"]["pairing_id"].as_str().unwrap();
-    send(json_with_token(
-        "POST",
-        &format!("/api/devices/pairings/{pairing_id}/approve"),
-        json!({}),
-        &desktop,
-        "c",
-    ))
-    .await;
-    let (_, claimed) = send(public_post(
-        "/api/devices/pair/claim",
-        json!({"pairing_id": pairing_id, "claim_token": paired["data"]["claim_token"]}),
-    ))
-    .await;
-    let phone = claimed["data"]["session"]["access_token"].as_str().unwrap().to_owned();
+    let (desktop, phone) = desktop_and_phone(&app, tmp.path()).await;
 
     // The desktop sets up a custom agent with a secret env override, and a remote agent.
     let (status, created) = send(json_with_token(
