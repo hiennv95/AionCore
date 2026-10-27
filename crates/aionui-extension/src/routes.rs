@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::from_fn;
 use axum::response::Response;
 use axum::routing::{get, post};
 
@@ -15,7 +16,7 @@ use aionui_api_types::{
     ApiResponse, DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest,
     GetPermissionsRequest, GetRiskLevelRequest, PermissionDetailResponse, PermissionSummaryResponse,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, desktop_only};
 use aionui_common::{ApiError, now_ms};
 use serde_json::json;
 
@@ -147,6 +148,8 @@ pub struct ExtensionRouterState {
 ///
 /// Includes query routes and management routes.
 /// All routes require authentication (applied by the caller).
+/// Enabling or disabling an extension runs its activation hooks on the host, so those two
+/// are desktop-only (ADR-013); the queries stay open.
 pub fn extension_routes(state: ExtensionRouterState) -> Router {
     Router::new()
         // Query routes
@@ -170,8 +173,14 @@ pub fn extension_routes(state: ExtensionRouterState) -> Router {
         .route("/api/extensions/permissions", post(get_permissions))
         .route("/api/extensions/risk-level", post(get_risk_level))
         // Management routes
-        .route("/api/extensions/enable", post(enable_extension))
-        .route("/api/extensions/disable", post(disable_extension))
+        .route(
+            "/api/extensions/enable",
+            post(enable_extension).route_layer(from_fn(desktop_only)),
+        )
+        .route(
+            "/api/extensions/disable",
+            post(disable_extension).route_layer(from_fn(desktop_only)),
+        )
         .with_state(state)
 }
 

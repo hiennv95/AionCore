@@ -3,11 +3,13 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, State};
+use axum::middleware::from_fn;
 use axum::routing::{get, post};
 
 use aionui_api_types::{
     ApiResponse, HubExtensionListItem, HubOperationResponse, HubUpdateInfo as ApiHubUpdateInfo, InstallExtensionRequest,
 };
+use aionui_auth::desktop_only;
 use aionui_common::ApiError;
 
 use crate::hub::index_manager::HubIndexManager;
@@ -30,15 +32,29 @@ pub struct HubRouterState {
 
 /// Build the Hub router with all `/api/hub/*` routes.
 ///
-/// All routes require authentication (applied by the caller).
+/// All routes require authentication (applied by the caller). Installing, retrying,
+/// updating and uninstalling put code on the host whose lifecycle hooks run on activation
+/// (`registry.rs` `run_activation_hooks`), so they are desktop-only (ADR-013).
 pub fn hub_routes(state: HubRouterState) -> Router {
     Router::new()
         .route("/api/hub/extensions", get(get_hub_extensions))
-        .route("/api/hub/install", post(install_extension))
-        .route("/api/hub/retry-install", post(retry_install))
+        .route(
+            "/api/hub/install",
+            post(install_extension).route_layer(from_fn(desktop_only)),
+        )
+        .route(
+            "/api/hub/retry-install",
+            post(retry_install).route_layer(from_fn(desktop_only)),
+        )
         .route("/api/hub/check-updates", post(check_updates))
-        .route("/api/hub/update", post(update_extension))
-        .route("/api/hub/uninstall", post(uninstall_extension))
+        .route(
+            "/api/hub/update",
+            post(update_extension).route_layer(from_fn(desktop_only)),
+        )
+        .route(
+            "/api/hub/uninstall",
+            post(uninstall_extension).route_layer(from_fn(desktop_only)),
+        )
         .with_state(state)
 }
 
