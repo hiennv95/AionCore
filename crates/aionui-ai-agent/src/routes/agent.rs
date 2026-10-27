@@ -18,7 +18,7 @@ use aionui_api_types::{
     CustomAgentUpsertRequest, DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
     SetAgentOverridesRequest, SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, is_paired_device, no_paired_devices};
+use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device, no_paired_devices};
 use aionui_common::ApiError;
 
 use crate::routes::error_mapping::agent_error_to_api_error;
@@ -53,7 +53,8 @@ fn host_only<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> Method
 
 const MASK: &str = "***";
 
-/// Paired devices read env override values masked (Jev 047, as for MCP and providers).
+/// Paired devices and the agent helper read env override values masked (Jev 047, as for
+/// MCP and providers); the config CLI already redacts them in its output.
 fn mask_env(env: &mut [AgentEnvEntry]) {
     for entry in env {
         entry.value = MASK.to_owned();
@@ -194,6 +195,7 @@ async fn get_agent_overrides(
     State(state): State<AgentRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AgentOverridesResponse>>, ApiError> {
     let mut overrides = state
@@ -201,7 +203,7 @@ async fn get_agent_overrides(
         .get_agent_overrides(&user.id, &id)
         .await
         .map_err(agent_error_to_api_error)?;
-    if is_paired_device(device.as_ref().map(|Extension(d)| d)) {
+    if helper.is_some() || is_paired_device(device.as_ref().map(|Extension(d)| d)) {
         mask_env(&mut overrides.env_override);
     }
     Ok(Json(ApiResponse::ok(overrides)))

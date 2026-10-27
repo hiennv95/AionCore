@@ -165,6 +165,20 @@ async fn phones_cannot_choose_host_commands_or_change_remote_agents_and_read_env
             "helper {method} {uri}: {resp}"
         );
     }
+    let req = Request::builder()
+        .uri(format!("/api/agents/{agent}/overrides"))
+        .header("x-aionui-runtime-token", helper.token.as_str())
+        .header("x-aionui-user-id", owner.as_str())
+        .header("x-aionui-conversation-id", "conv-helper-agents")
+        .body(Body::empty())
+        .unwrap();
+    let (status, resp) = send(req).await;
+    assert_eq!(status, StatusCode::OK, "helper reads overrides: {resp}");
+    assert_eq!(resp["data"]["env_override"][0]["value"], "***", "{resp}");
+    assert!(
+        !resp.to_string().contains(ENV_SECRET),
+        "helper reads the secret: {resp}"
+    );
     let (status, resp) = send(helper_call(
         "PUT",
         &format!("/api/agents/{agent}/overrides"),
