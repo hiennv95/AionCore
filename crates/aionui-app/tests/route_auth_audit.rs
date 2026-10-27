@@ -172,3 +172,64 @@ fn every_public_entry_matches_a_route() {
         assert!(hit, "PUBLIC entry {entry} matches no route");
     }
 }
+
+/// Cross-user isolation: bob calls every conversation-scoped route with the owner's chat id,
+/// with every method. None may succeed (2xx) or redirect.
+#[tokio::test]
+async fn another_user_cannot_use_any_conversation_route_of_the_owner() {
+    let (mut app, services) = common::build_app().await;
+    let (owner, owner_csrf) = common::setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let workspace = tempfile::tempdir().unwrap();
+    let created = app
+        .clone()
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/conversations",
+            serde_json::json!({"type": "acp", "name": "owner chat", "extra": {"workspace": workspace.path()}}),
+            &owner,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    let id = common::body_json(created).await["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (bob, bob_csrf) = common::setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+
+    let scoped: Vec<String> = all_routes()
+        .into_iter()
+        .filter(|r| r.starts_with("/api/conversations/{id}") || r.starts_with("/api/sidebar/conversation/{id}"))
+        .collect();
+    assert!(scoped.len() > 20, "too few conversation routes found: {}", scoped.len());
+
+    let mut leaks = Vec::new();
+    for path in &scoped {
+        let uri = concrete(&path.replacen("{id}", &id, 1));
+        for method in [Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            let request = Request::builder()
+                .method(method.clone())
+                .uri(&uri)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {bob}"))
+                .header("x-csrf-token", &bob_csrf)
+                .header("cookie", format!("aionui-csrf-token={bob_csrf}"))
+                .body(Body::from("{}"))
+                .unwrap();
+            let status = app.clone().oneshot(request).await.unwrap().status();
+            if status.is_success() || status.is_redirection() {
+                leaks.push(format!("{method} {path} -> {status}"));
+            }
+        }
+    }
+    assert!(leaks.is_empty(), "bob reached the owner's chat:\n{}", leaks.join("\n"));
+
+    // The owner's chat is untouched.
+    let resp = app
+        .clone()
+        .oneshot(common::get_with_token(&format!("/api/conversations/{id}"), &owner))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(common::body_json(resp).await["data"]["name"], "owner chat");
+}
