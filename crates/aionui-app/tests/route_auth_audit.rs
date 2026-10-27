@@ -351,3 +351,73 @@ async fn another_user_cannot_see_or_touch_the_owners_providers_and_mcp_servers()
     .await;
     assert!(body.to_string().contains("owner-mcp"), "{body}");
 }
+
+/// The feedback diagnostics report takes ids from the caller: bob naming the owner's chat,
+/// provider and MCP server with every profile must get nothing of theirs back.
+#[tokio::test]
+async fn the_diagnostics_report_never_returns_another_users_rows() {
+    let (mut app, services) = common::build_app().await;
+    let (owner, oc) = common::setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let workspace = tempfile::tempdir().unwrap();
+    let (_, body) = call(
+        &app,
+        Method::POST,
+        "/api/conversations",
+        &owner,
+        &oc,
+        serde_json::json!({"type": "acp", "name": "owner-secret-chat", "extra": {"workspace": workspace.path()}}),
+    )
+    .await;
+    let chat = body["data"]["id"].as_str().unwrap().to_owned();
+    let (_, body) = call(
+        &app,
+        Method::POST,
+        "/api/providers",
+        &owner,
+        &oc,
+        serde_json::json!({"platform": "openai", "name": "owner-secret-provider", "base_url": "https://owner-host.invalid", "api_key": "sk-owner-diag"}),
+    )
+    .await;
+    let provider = body["data"]["id"].as_str().unwrap().to_owned();
+    let (_, body) = call(
+        &app,
+        Method::POST,
+        "/api/mcp/servers",
+        &owner,
+        &oc,
+        serde_json::json!({"name": "owner-secret-mcp", "transport": {"type": "stdio", "command": "echo"}}),
+    )
+    .await;
+    let mcp = body["data"]["id"].as_str().unwrap().to_owned();
+
+    let profiles =
+        "conversation-session,model-auth,agent-team,mcp-tools,client-ui-settings,workspace-summary,global-summary";
+    let uri = format!(
+        "/api/system/diagnostics/feedback-report?profiles={profiles}&conversation_id={chat}&provider_id={provider}&mcp_server_id={mcp}"
+    );
+    // The owner's own report does name them (so the probe can see a leak).
+    let (status, report) = call(&app, Method::GET, &uri, &owner, &oc, serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let text = report.to_string();
+    assert!(
+        text.contains("owner-secret-chat")
+            && text.contains("owner-secret-provider")
+            && text.contains("owner-secret-mcp"),
+        "the owner's report should name the owner's rows: {text}"
+    );
+    assert!(!text.contains("sk-owner-diag"), "the report carries an API key");
+
+    let (bob, bc) = common::setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+    let (status, report) = call(&app, Method::GET, &uri, &bob, &bc, serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{report}");
+    let text = report.to_string();
+    for leak in [
+        "owner-secret-chat",
+        "owner-secret-provider",
+        "owner-host.invalid",
+        "owner-secret-mcp",
+        "sk-owner-diag",
+    ] {
+        assert!(!text.contains(leak), "bob's report contains {leak}: {text}");
+    }
+}
