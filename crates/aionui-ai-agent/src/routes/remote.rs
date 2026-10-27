@@ -16,13 +16,14 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::middleware::from_fn;
+use axum::routing::{MethodRouter, get, post};
 
 use aionui_api_types::{
     ApiResponse, CreateRemoteAgentRequest, HandshakeResponse, RemoteAgentListItem, RemoteAgentResponse,
     TestRemoteAgentConnectionRequest, UpdateRemoteAgentRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, desktop_only};
 use aionui_common::ApiError;
 
 use super::error_mapping::agent_error_to_api_error;
@@ -33,11 +34,20 @@ use super::state::RemoteAgentRouterState;
 /// All routes require authentication (applied by the caller).
 pub fn remote_agent_routes(state: RemoteAgentRouterState) -> Router {
     Router::new()
-        .route("/api/remote-agents", get(list).post(create))
-        .route("/api/remote-agents/test-connection", post(test_connection))
-        .route("/api/remote-agents/{id}", get(get_one).put(update).delete(delete_one))
-        .route("/api/remote-agents/{id}/handshake", post(handshake))
+        .route("/api/remote-agents", get(list).merge(desktop(post(create))))
+        .route("/api/remote-agents/test-connection", desktop(post(test_connection)))
+        .route(
+            "/api/remote-agents/{id}",
+            get(get_one).merge(desktop(axum::routing::put(update).delete(delete_one))),
+        )
+        .route("/api/remote-agents/{id}/handshake", desktop(post(handshake)))
         .with_state(state)
+}
+
+/// Changing a remote agent, or making the host connect to a URL to test or handshake with
+/// it, stays with the desktop app; phones, browsers and the agent helper only list them.
+fn desktop<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> MethodRouter<S> {
+    route.route_layer(from_fn(desktop_only))
 }
 
 async fn list(

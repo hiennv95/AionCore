@@ -10,14 +10,15 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, State};
-use axum::routing::{get, patch, post, put};
+use axum::middleware::from_fn;
+use axum::routing::{MethodRouter, get, patch, post, put};
 
 use aionui_api_types::{
-    AgentLogoEntry, AgentManagementRow, AgentMetadata, AgentOverridesResponse, ApiResponse, CustomAgentUpsertRequest,
-    DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse, SetAgentOverridesRequest,
-    SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
+    AgentEnvEntry, AgentLogoEntry, AgentManagementRow, AgentMetadata, AgentOverridesResponse, ApiResponse,
+    CustomAgentUpsertRequest, DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
+    SetAgentOverridesRequest, SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentDevice, CurrentUser, is_paired_device, no_paired_devices};
 use aionui_common::ApiError;
 
 use crate::routes::error_mapping::agent_error_to_api_error;
@@ -32,12 +33,31 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
         .route("/api/agents/{id}/enabled", patch(set_agent_enabled))
         .route(
             "/api/agents/{id}/overrides",
-            get(get_agent_overrides).put(set_agent_overrides),
+            get(get_agent_overrides).merge(host_only(put(set_agent_overrides))),
         )
-        .route("/api/agents/custom", post(create_custom))
-        .route("/api/agents/custom/{id}", put(update_custom).delete(delete_custom))
-        .route("/api/agents/custom/try-connect", post(try_connect_custom))
+        .route("/api/agents/custom", host_only(post(create_custom)))
+        .route(
+            "/api/agents/custom/{id}",
+            host_only(put(update_custom).delete(delete_custom)),
+        )
+        .route("/api/agents/custom/try-connect", host_only(post(try_connect_custom)))
         .with_state(state)
+}
+
+/// Routes that choose a command the host runs (custom agents, command overrides, the
+/// connection probe) are refused to paired phones and browsers (ADR-013). The agent
+/// helper keeps them: the config CLI advertises them to agents.
+fn host_only<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> MethodRouter<S> {
+    route.route_layer(from_fn(no_paired_devices))
+}
+
+const MASK: &str = "***";
+
+/// Paired devices read env override values masked (Jev 047, as for MCP and providers).
+fn mask_env(env: &mut [AgentEnvEntry]) {
+    for entry in env {
+        entry.value = MASK.to_owned();
+    }
 }
 
 async fn list_agent_logos(
@@ -173,15 +193,18 @@ async fn set_agent_enabled(
 async fn get_agent_overrides(
     State(state): State<AgentRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AgentOverridesResponse>>, ApiError> {
-    Ok(Json(ApiResponse::ok(
-        state
-            .service
-            .get_agent_overrides(&user.id, &id)
-            .await
-            .map_err(agent_error_to_api_error)?,
-    )))
+    let mut overrides = state
+        .service
+        .get_agent_overrides(&user.id, &id)
+        .await
+        .map_err(agent_error_to_api_error)?;
+    if is_paired_device(device.as_ref().map(|Extension(d)| d)) {
+        mask_env(&mut overrides.env_override);
+    }
+    Ok(Json(ApiResponse::ok(overrides)))
 }
 
 async fn set_agent_overrides(
