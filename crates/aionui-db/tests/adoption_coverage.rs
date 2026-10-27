@@ -28,6 +28,9 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ("mailbox", "team_id", "teams"),
     ("messages", "conversation_id", "conversations"),
     ("team_tasks", "team_id", "teams"),
+    // Result receipts (B05.R1) belong to a turn of a conversation; `turn_outcomes`
+    // has its own `user_id` and is adopted as an ownership root.
+    ("turn_receipts", "conversation_id", "conversations"),
 ];
 
 /// Deliberately machine-global tables — adoption must NOT touch them.

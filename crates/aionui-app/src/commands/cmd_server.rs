@@ -15,8 +15,8 @@ use tracing::{info, warn};
 
 use aionui_api_types::{RuntimeStatusScope, RuntimeStatusScopeKind};
 use aionui_app::{
-    AllowedOrigins, AppConfig, AppServices, RouterBuildError, create_router_with_runtime, with_origin_guard,
-    with_static_web_clients,
+    AllowedHosts, AllowedOrigins, AppConfig, AppServices, RouterBuildError, create_router_with_runtime,
+    with_host_guard, with_origin_guard, with_static_web_clients,
 };
 use aionui_system::RuntimePrepareService;
 use aionui_team::TeamIdleCleanupCoordinator;
@@ -281,6 +281,7 @@ pub(crate) async fn run_server(
         services.jwt_service.set_access_ttl(ttl);
     }
     services.jwt_service.set_strict_refresh(env.strict_refresh);
+    aionui_auth::set_trust_forwarded_headers(env.trusted_proxy);
 
     let (router, router_runtime) = create_router_with_runtime(&services)
         .await
@@ -311,7 +312,13 @@ pub(crate) async fn run_server(
     // and other-machine browsers, behind its own same-origin guard. A bind
     // failure is reported in its status, not fatal: local use must keep working.
     if let Some(listener) = router_runtime.device_listener.as_ref()
-        && let Err(error) = listener.attach(router.clone()).await
+        && let Err(error) = listener
+            .attach(
+                router
+                    .clone()
+                    .layer(axum::Extension(aionui_realtime::ViaDeviceListener)),
+            )
+            .await
     {
         warn!(%error, "device listener did not start");
     }
@@ -326,6 +333,15 @@ pub(crate) async fn run_server(
             with_origin_guard(router, allowed)
         }
         None => router,
+    };
+    // DNS rebinding (C5, ADR-010): a loopback listener answers only to this machine's
+    // loopback names on its port and to the hosts of `--allowed-origin`, in every mode.
+    let router = if bound.addr.ip().is_loopback() {
+        let allowed = AllowedHosts::loopback(bound.addr.port(), env.allowed_origins.as_ref());
+        info!(allowed_hosts = ?allowed.sorted(), "startup: Host allowlist (loopback listener)");
+        with_host_guard(router, allowed)
+    } else {
+        router
     };
     info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -410,7 +426,7 @@ pub(crate) async fn run_server(
     let drain_started = shutdown_tx.subscribe();
 
     // The peer address keys rate limits (`aionui_auth::extract_client_ip`), so it
-    // must come from the socket, not from client-supplied forwarding headers.
+    // must come from the socket; forwarding headers count only with --trusted-proxy.
     let serve_future = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),

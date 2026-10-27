@@ -9,7 +9,10 @@ pub mod trust;
 
 pub use error::PeerError;
 pub use identity::{Fingerprint, PeerIdentity};
-pub use server::{HEADER_READ_TIMEOUT, MAX_TLS_CONNECTIONS, PeerCaller, serve_device_listener, serve_peer_listener};
+pub use server::{
+    BODY_READ_TIMEOUT, HEADER_READ_TIMEOUT, MAX_TLS_CONNECTIONS, MAX_TLS_CONNECTIONS_PER_IP, PeerCaller,
+    serve_device_listener, serve_peer_listener,
+};
 pub use tls::{ServerPin, client_config, device_server_config, server_config};
 pub use trust::{InMemoryTrustStore, TrustStore};
 

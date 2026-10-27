@@ -50,6 +50,8 @@ pub struct DeviceListener {
     settings: Mutex<Settings>,
     running: Mutex<Running>,
     router: OnceLock<Router>,
+    /// Run after the accept loop is stopped: upgraded WebSockets live outside it (C6).
+    on_stopped: OnceLock<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Best-effort primary LAN address: the source address the OS would use to
@@ -115,7 +117,13 @@ impl DeviceListener {
             settings: Mutex::new(settings),
             running: Mutex::new(Running::default()),
             router: OnceLock::new(),
+            on_stopped: OnceLock::new(),
         }
+    }
+
+    /// Set once: called whenever the listener stops, to close what its accept loop does not own.
+    pub fn set_on_stopped(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        let _ = self.on_stopped.set(hook);
     }
 
     fn settings(&self) -> Settings {
@@ -165,6 +173,9 @@ impl DeviceListener {
         if let Some(task) = self.running.lock().unwrap_or_else(|e| e.into_inner()).task.take() {
             task.abort();
             info!("device: listener stopped");
+            if let Some(hook) = self.on_stopped.get() {
+                hook();
+            }
         }
     }
 

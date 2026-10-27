@@ -6,7 +6,8 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
+use axum::middleware::from_fn;
+use axum::routing::{MethodRouter, get, post, put};
 use tracing::warn;
 
 use aionui_api_types::{
@@ -15,7 +16,7 @@ use aionui_api_types::{
     EnablePluginRequest, PairingRequestResponse, PluginStatusResponse, RejectPairingRequest, RevokeUserRequest,
     SyncChannelSettingsRequest, TestPluginRequest, TestPluginResponse,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentUser, desktop_only};
 use aionui_common::ApiError;
 use aionui_db::{DbError, IChannelRepository};
 use aionui_extension::{ExtensionRegistry, ResolvedChannelPlugin};
@@ -87,6 +88,14 @@ impl From<ChannelError> for ApiError {
 // Router builder
 // ---------------------------------------------------------------------------
 
+/// Connecting a bot (its credentials) and approving a chat user, who then reaches the
+/// owner's agents, grant access the way approving a device does, so they stay with the
+/// desktop app (ADR-013). Disabling, rejecting and revoking only take access away and
+/// stay open to the owner's other devices.
+fn desktop<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> MethodRouter<S> {
+    route.route_layer(from_fn(desktop_only))
+}
+
 /// Build the channel router with all `/api/channel/*` routes.
 ///
 /// All routes require authentication (applied by the caller).
@@ -94,12 +103,12 @@ pub fn channel_routes(state: ChannelRouterState) -> Router {
     Router::new()
         // Plugin management
         .route("/api/channel/plugins", get(get_plugin_status))
-        .route("/api/channel/plugins/enable", post(enable_plugin))
+        .route("/api/channel/plugins/enable", desktop(post(enable_plugin)))
         .route("/api/channel/plugins/disable", post(disable_plugin))
-        .route("/api/channel/plugins/test", post(test_plugin))
+        .route("/api/channel/plugins/test", desktop(post(test_plugin)))
         // Pairing management
         .route("/api/channel/pairings", get(get_pending_pairings))
-        .route("/api/channel/pairings/approve", post(approve_pairing))
+        .route("/api/channel/pairings/approve", desktop(post(approve_pairing)))
         .route("/api/channel/pairings/reject", post(reject_pairing))
         // User management
         .route("/api/channel/users", get(get_authorized_users))

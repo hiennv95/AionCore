@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use aionui_auth::security_headers_middleware;
 use axum::Router;
 use axum::extract::Request;
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware;
 use axum::response::IntoResponse;
 use tower::ServiceExt;
@@ -37,6 +37,25 @@ impl std::error::Error for StaticDirError {}
 /// Path prefixes owned by the backend; they must never resolve to the SPA.
 fn is_backend_path(path: &str) -> bool {
     path == "/api" || path.starts_with("/api/") || path == "/ws" || path == "/login" || path == "/logout"
+}
+
+/// A request for a file (its last segment has an extension) that is not in the build, e.g. a
+/// hashed chunk of a previous release. It gets 404, not the SPA's index.html: a stale page
+/// must not receive HTML where it asked for JavaScript or CSS (P3/P5 upgrades).
+fn is_missing_asset(base: &Path, subpath: &str) -> bool {
+    let last = subpath.rsplit('/').next().unwrap_or_default();
+    !last.is_empty() && last.contains('.') && !base.join(subpath).is_file()
+}
+
+/// Cache policy for a static response. SvelteKit's `/_app/immutable/` files carry a content
+/// hash in their name and never change; everything else (index.html, client routes,
+/// `_app/version.json`, the legacy client) is revalidated so an upgrade is picked up at once.
+fn cache_control(immutable: bool) -> HeaderValue {
+    HeaderValue::from_static(if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    })
 }
 
 /// Helper to decode percent-encoded byte sequences (e.g. `%2e%2e` -> `..`).
@@ -174,6 +193,9 @@ pub fn with_static_web_clients(router: Router, root_dir: Option<&Path>, legacy_d
                             if !is_path_contained_in(canonical_legacy, &target) {
                                 return StatusCode::NOT_FOUND.into_response();
                             }
+                            if is_missing_asset(legacy_path, subpath) {
+                                return StatusCode::NOT_FOUND.into_response();
+                            }
                         }
 
                         // Rewrite URI to relative path for ServeDir.
@@ -193,9 +215,11 @@ pub fn with_static_web_clients(router: Router, root_dir: Option<&Path>, legacy_d
                         }
 
                         let response: Result<_, Infallible> = legacy_spa.clone().oneshot(request).await;
-                        return match response {
+                        let mut res = match response {
                             Ok(res) => res.into_response(),
                         };
+                        res.headers_mut().insert(header::CACHE_CONTROL, cache_control(false));
+                        return res;
                     }
                 }
 
@@ -212,12 +236,21 @@ pub fn with_static_web_clients(router: Router, root_dir: Option<&Path>, legacy_d
                         if !is_path_contained_in(canonical_root, &target) {
                             return StatusCode::NOT_FOUND.into_response();
                         }
+                        if is_missing_asset(root_path, subpath) {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
                     }
 
+                    let immutable = path.starts_with("/_app/immutable/");
                     let response: Result<_, Infallible> = root_spa.clone().oneshot(request).await;
-                    match response {
+                    let mut res = match response {
                         Ok(res) => res.into_response(),
+                    };
+                    if res.status().is_success() {
+                        res.headers_mut()
+                            .insert(header::CACHE_CONTROL, cache_control(immutable));
                     }
+                    res
                 } else {
                     StatusCode::NOT_FOUND.into_response()
                 }
@@ -342,6 +375,46 @@ mod tests {
         let dir = web_dir();
         let (_, body, _) = get_path(app(dir.path()), "/../../../../etc/passwd").await;
         assert!(!body.contains("root:"));
+    }
+
+    /// P3/P5: after an upgrade a stale page asks for chunks that no longer exist. They must
+    /// 404, not come back as index.html; client routes still fall back to the SPA.
+    #[tokio::test]
+    async fn a_missing_asset_is_404_but_a_client_route_is_the_spa() {
+        let dir = web_dir();
+        let (status, _, _) = get_path(app(dir.path()), "/_app/immutable/chunks/old.abc123.js").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = get_path(app(dir.path()), "/assets/gone.css").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, body, _) = get_path(app(dir.path()), "/c/8f2a91c0").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "<html>spa</html>"));
+        let (status, body, _) = get_path(app(dir.path()), "/assets/app.js").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "console.log(1)"));
+    }
+
+    /// Hashed SvelteKit files are cached for good; the entry page and the rest are revalidated,
+    /// so a new release is picked up on the next load.
+    #[tokio::test]
+    async fn only_hashed_files_are_cached_for_good() {
+        let dir = web_dir();
+        std::fs::create_dir_all(dir.path().join("_app/immutable/entry")).unwrap();
+        std::fs::write(dir.path().join("_app/immutable/entry/start.Ab12.js"), "x").unwrap();
+        std::fs::write(dir.path().join("_app/version.json"), "{}").unwrap();
+        let cache = |r: &Response| r.headers()[header::CACHE_CONTROL].to_str().unwrap().to_owned();
+
+        let (status, _, r) = get_path(app(dir.path()), "/_app/immutable/entry/start.Ab12.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cache(&r), "public, max-age=31536000, immutable");
+        for path in ["/", "/c/8f2a91c0", "/_app/version.json", "/assets/app.js"] {
+            let (status, _, r) = get_path(app(dir.path()), path).await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(cache(&r), "no-cache", "{path}");
+        }
+        let (_, _, r) = get_path(app(dir.path()), "/api/ping").await;
+        assert!(
+            !r.headers().contains_key(header::CACHE_CONTROL),
+            "API responses are untouched"
+        );
     }
 
     #[test]
@@ -481,6 +554,18 @@ mod tests {
             assert_eq!(status, StatusCode::NOT_FOUND);
             assert!(!body.contains("OUTSIDE_SECRET"));
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_missing_assets_404_and_pages_are_revalidated() {
+        let root = web_dir();
+        let legacy = legacy_dir();
+        let app = dual_app(root.path(), legacy.path());
+        let (status, _, _) = get_path(app.clone(), "/legacy/assets/old.123.js").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, r) = get_path(app.clone(), "/legacy/some/deep/link").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(r.headers()[header::CACHE_CONTROL], "no-cache");
     }
 
     #[tokio::test]

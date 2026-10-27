@@ -33,6 +33,8 @@ pub struct ServerEnvironment {
     pub allowed_origins: Option<AllowedOrigins>,
     /// Accept only refresh tokens on every refresh path (`--strict-refresh`).
     pub strict_refresh: bool,
+    /// Honour forwarding headers from loopback peers (`--trusted-proxy`).
+    pub trusted_proxy: bool,
     /// Lifetime of newly issued access tokens (`--access-token-ttl-secs`).
     pub access_token_ttl: Option<Duration>,
     /// Close WebSockets whose token expired (`--ws-token-expiry`).
@@ -205,6 +207,9 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
             "startup: token policy overrides enabled"
         );
     }
+    if cli.trusted_proxy {
+        info!("startup: trusting forwarding headers from loopback peers (--trusted-proxy)");
+    }
 
     Ok(ServerEnvironment {
         _log_guard: log_guard,
@@ -213,6 +218,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         legacy_static_dir,
         allowed_origins,
         strict_refresh: cli.strict_refresh,
+        trusted_proxy: cli.trusted_proxy,
         access_token_ttl,
         ws_token_expiry: cli.ws_token_expiry,
         peer_listen: cli.peer_listen,

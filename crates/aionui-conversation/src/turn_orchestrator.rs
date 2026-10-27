@@ -4,7 +4,7 @@ use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{
     AgentError, AgentInstance, AgentSendError, AgentSessionKind, IWorkerTaskManager, RequiredFullAutoApplication,
 };
-use aionui_common::{AgentType, ConversationStatus, ErrorChain, now_ms};
+use aionui_common::{AgentType, ConversationStatus, ErrorChain, TurnEnd, now_ms};
 use aionui_db::models::ConversationRow;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
@@ -15,7 +15,7 @@ use crate::runtime_state::TurnClaim;
 use crate::service::{
     ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
 };
-use crate::stream_relay::{RelayOutcome, StreamRelay, SupersedingTipTotals, TurnAttemptSummary};
+use crate::stream_relay::{RelayOutcome, RelayTerminal, StreamRelay, SupersedingTipTotals, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
 use crate::turn_recovery_policy::{TurnRecoveryDecision, TurnRecoveryPolicy};
 use aionui_api_types::AgentErrorCode;
@@ -478,6 +478,10 @@ impl ConversationTurnOrchestrator {
         let mut replay_started_at = None;
         let mut final_error_message;
         let mut auth_failure = false;
+        // The last attempt's terminal, or the early-exit source when no relay ran (B05).
+        let mut last_terminal: Option<RelayTerminal> = None;
+        let turn_started_at = now_ms();
+        let mut early_exit_source: Option<&'static str> = None;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
@@ -503,9 +507,17 @@ impl ConversationTurnOrchestrator {
                 Ok(result) => result,
                 Err(result) => {
                     final_error_message = result.error_message;
-                    break result.status == ConversationTurnStatus::Failed;
+                    let failed = result.status == ConversationTurnStatus::Failed;
+                    // Takes precedence over an earlier attempt's terminal in `turn_end`.
+                    early_exit_source = Some(if failed {
+                        "start_failed"
+                    } else {
+                        "settled_without_relay"
+                    });
+                    break failed;
                 }
             };
+            last_terminal = Some(attempt_result.outcome.terminal.clone());
 
             // Track the final attempt's auth signal so the post-loop availability
             // write-back can reflect "needs sign-in" (last iteration wins).
@@ -646,6 +658,12 @@ impl ConversationTurnOrchestrator {
         self.service
             .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
             .await;
+        if !was_deleting {
+            let end = turn_end(final_failed, last_terminal.as_ref(), early_exit_source, turn_started_at);
+            self.service
+                .notify_turn_ended(&input.user_id, &conv_id, &turn_id, &end)
+                .await;
+        }
 
         ConversationTurnResult {
             status: if final_failed {
@@ -655,6 +673,31 @@ impl ConversationTurnOrchestrator {
             },
             error_message: if final_failed { final_error_message } else { None },
         }
+    }
+}
+
+/// The host-observed end of a turn: which signal ended its last attempt (B05).
+fn turn_end(
+    failed: bool,
+    terminal: Option<&RelayTerminal>,
+    early_exit_source: Option<&'static str>,
+    started_at: i64,
+) -> TurnEnd {
+    let (source, error_code) = match (terminal, early_exit_source) {
+        (_, Some(source)) => (source, None),
+        (Some(RelayTerminal::Error { code, .. }), None) => (
+            "relay_error",
+            code.and_then(|code| serde_json::to_value(code).ok())
+                .and_then(|value| value.as_str().map(str::to_owned)),
+        ),
+        (Some(RelayTerminal::ChannelClosed), None) => ("channel_closed", None),
+        (Some(RelayTerminal::Finish) | None, None) => ("relay_finish", None),
+    };
+    TurnEnd {
+        failed,
+        source,
+        error_code,
+        started_at,
     }
 }
 
@@ -862,6 +905,51 @@ async fn record_agent_session_success(service: &ConversationService, user_id: &s
 mod tests {
     use super::*;
     use crate::stream_relay::RelayTerminal;
+
+    /// B05: the inbox gets the signal that really ended the turn, never a guessed success.
+    #[test]
+    fn turn_end_names_the_terminal_signal() {
+        let error = RelayTerminal::Error {
+            code: Some(AgentErrorCode::AionuiStreamBroken),
+            retryable: Some(false),
+        };
+        assert_eq!(
+            turn_end(true, Some(&error), None, 7),
+            TurnEnd {
+                failed: true,
+                source: "relay_error",
+                error_code: Some("AIONUI_STREAM_BROKEN".into()),
+                started_at: 7,
+            }
+        );
+        let codeless = RelayTerminal::Error {
+            code: None,
+            retryable: None,
+        };
+        assert_eq!(turn_end(true, Some(&codeless), None, 0).error_code, None);
+        assert_eq!(
+            turn_end(false, Some(&RelayTerminal::Finish), None, 0).source,
+            "relay_finish"
+        );
+        assert_eq!(
+            turn_end(false, Some(&RelayTerminal::ChannelClosed), None, 0).source,
+            "channel_closed"
+        );
+        // An early exit wins over an earlier attempt's terminal (replay that failed to start).
+        assert_eq!(
+            turn_end(true, Some(&RelayTerminal::Finish), Some("start_failed"), 0),
+            TurnEnd {
+                failed: true,
+                source: "start_failed",
+                error_code: None,
+                started_at: 0,
+            }
+        );
+        assert_eq!(
+            turn_end(false, None, Some("settled_without_relay"), 0).source,
+            "settled_without_relay"
+        );
+    }
 
     fn finish_outcome(needs_auth: bool) -> RelayOutcome {
         RelayOutcome {

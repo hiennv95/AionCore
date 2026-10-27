@@ -412,6 +412,7 @@ dependencies = [
  "aionui-device",
  "aionui-extension",
  "aionui-file",
+ "aionui-inbox",
  "aionui-mcp",
  "aionui-network",
  "aionui-office",
@@ -745,6 +746,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "aionui-inbox"
+version = "0.2.2"
+dependencies = [
+ "aionui-ai-agent",
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "aionui-realtime",
+ "async-trait",
+ "axum",
+ "git2",
+ "hex",
+ "http-body-util",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "aionui-mcp"
 version = "0.2.2"
 dependencies = [
@@ -843,6 +868,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
+ "tower-http",
  "tracing",
 ]
 

@@ -1,20 +1,39 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Request, header};
 
 use aionui_common::constants::COOKIE_NAME;
 
+/// Whether a loopback peer is a reverse proxy whose forwarding headers name
+/// the real client (`--trusted-proxy`). Off by default: any local process can
+/// set those headers, so honouring them lets it dodge or aim rate limits (C7).
+static TRUST_FORWARDED_HEADERS: AtomicBool = AtomicBool::new(false);
+
+/// Honour `X-Forwarded-For` / `X-Real-IP` from loopback peers. Intended to be
+/// called once at startup, before serving requests.
+pub fn set_trust_forwarded_headers(trust: bool) {
+    TRUST_FORWARDED_HEADERS.store(trust, Ordering::Relaxed);
+}
+
+/// Whether forwarding headers from loopback peers are honoured.
+pub fn trust_forwarded_headers() -> bool {
+    TRUST_FORWARDED_HEADERS.load(Ordering::Relaxed)
+}
+
 /// The client IP used to key rate limits.
 ///
 /// The socket peer address (`ConnectInfo`, attached by every listener) is the
 /// truth: `X-Forwarded-For` / `X-Real-IP` are client-supplied and would let any
-/// LAN caller rotate them to dodge a limit. They are honoured only when the
-/// connection itself comes from loopback, i.e. a reverse proxy on this machine.
-/// Without a peer address (in-process tests), the headers are all there is.
+/// caller rotate them to dodge a limit. They are honoured only when the host
+/// trusts a local reverse proxy (`--trusted-proxy`) and the connection itself
+/// comes from loopback. Without a peer address (in-process tests), the headers
+/// are used under the same flag, else the key is `unknown`.
 pub fn extract_client_ip<B>(request: &Request<B>) -> String {
+    let trust = trust_forwarded_headers();
     match request.extensions().get::<ConnectInfo<SocketAddr>>() {
-        Some(ConnectInfo(peer)) if !peer.ip().is_loopback() => peer.ip().to_string(),
+        Some(ConnectInfo(peer)) if !trust || !peer.ip().is_loopback() => peer.ip().to_string(),
         Some(ConnectInfo(peer)) => {
             let forwarded = extract_client_ip_from_headers(request.headers());
             if forwarded == "unknown" {
@@ -23,8 +42,17 @@ pub fn extract_client_ip<B>(request: &Request<B>) -> String {
                 forwarded
             }
         }
-        None => extract_client_ip_from_headers(request.headers()),
+        None if trust => extract_client_ip_from_headers(request.headers()),
+        None => "unknown".to_owned(),
     }
+}
+
+/// Whether the request's effective client (see [`extract_client_ip`]) is this
+/// machine. A proxied remote client is not, even though its socket is loopback.
+pub fn is_loopback_client<B>(request: &Request<B>) -> bool {
+    extract_client_ip(request)
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Extract client IP from a `HeaderMap` directly.
@@ -159,6 +187,7 @@ mod tests {
 
     #[test]
     fn a_lan_caller_cannot_choose_its_rate_limit_key() {
+        let _guard = TRUST_FLAG.lock().unwrap();
         let spoofed = request_from(
             "192.168.1.50:40000",
             &[("x-forwarded-for", "9.9.9.9"), ("x-real-ip", "8.8.8.8")],
@@ -166,12 +195,42 @@ mod tests {
         assert_eq!(extract_client_ip(&spoofed), "192.168.1.50");
     }
 
+    /// The trust flag is process-wide; serialise the tests that read or flip it.
+    static TRUST_FLAG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
-    fn a_local_reverse_proxy_may_forward_the_client_address() {
+    fn a_local_caller_cannot_choose_its_rate_limit_key_by_default() {
+        let _guard = TRUST_FLAG.lock().unwrap();
+        set_trust_forwarded_headers(false);
+        let spoofed = request_from(
+            "127.0.0.1:40000",
+            &[("x-forwarded-for", "192.168.1.20"), ("x-real-ip", "8.8.8.8")],
+        );
+        assert_eq!(extract_client_ip(&spoofed), "127.0.0.1");
+        assert!(is_loopback_client(&spoofed));
+        let mut no_peer = Request::new(());
+        *no_peer.headers_mut() = headers_with(&[("x-forwarded-for", "9.9.9.9")]);
+        assert_eq!(extract_client_ip(&no_peer), "unknown");
+    }
+
+    #[test]
+    fn a_trusted_local_reverse_proxy_may_forward_the_client_address() {
+        let _guard = TRUST_FLAG.lock().unwrap();
+        set_trust_forwarded_headers(true);
         let proxied = request_from("127.0.0.1:40000", &[("x-forwarded-for", "203.0.113.7")]);
-        assert_eq!(extract_client_ip(&proxied), "203.0.113.7");
         let direct = request_from("127.0.0.1:40000", &[]);
-        assert_eq!(extract_client_ip(&direct), "127.0.0.1");
+        let lan = request_from("192.168.1.50:40000", &[("x-forwarded-for", "9.9.9.9")]);
+        let results = (
+            extract_client_ip(&proxied),
+            is_loopback_client(&proxied),
+            extract_client_ip(&direct),
+            extract_client_ip(&lan),
+        );
+        set_trust_forwarded_headers(false);
+        assert_eq!(
+            results,
+            ("203.0.113.7".into(), false, "127.0.0.1".into(), "192.168.1.50".into())
+        );
     }
 
     // --- extract_token_from_headers ---

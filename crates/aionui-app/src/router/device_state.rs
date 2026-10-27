@@ -54,6 +54,15 @@ pub(crate) fn build_device_state(services: &AppServices) -> Option<DeviceRouterS
             }
         }
     };
+    // Turning the listener off must cut what it let in, upgraded WebSockets included:
+    // they leave its accept loop (C6). Loopback sockets (desktop app, local web) stay.
+    if let Some(listener) = listener.as_ref() {
+        let ws_manager = services.ws_manager.clone();
+        listener.set_on_stopped(Arc::new(move || {
+            let closed = ws_manager.disconnect_device_listener("device listener stopped");
+            tracing::info!(closed, "device: listener stopped; its sockets closed");
+        }));
+    }
     let service = Arc::new(DeviceService::new(
         device_repo(services),
         services.user_repo.clone(),

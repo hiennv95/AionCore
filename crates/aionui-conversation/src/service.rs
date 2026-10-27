@@ -30,8 +30,8 @@ use aionui_api_types::{
 use aionui_api_types::{ChatFileRef, SessionRef};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    OnConversationTurnCancelled, OnFilesReported, PaginatedResult, TurnCancelCause, WorkspacePathValidationError,
-    generate_short_id, now_ms, validate_workspace_path_availability,
+    OnConversationTurnCancelled, OnConversationTurnEnded, OnFilesReported, PaginatedResult, TurnCancelCause, TurnEnd,
+    WorkspacePathValidationError, generate_short_id, now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{
     AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
@@ -325,6 +325,7 @@ pub struct ConversationService {
     /// services can drop work aimed at this conversation. See
     /// `OnConversationTurnCancelled` for why only some branches fire.
     turn_cancelled_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnCancelled>>>>,
+    turn_ended_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnEnded>>>>,
     /// Hooks told about files a finished tool call reported writing (preview
     /// refs, ADR-017). Shared with every relay, so late registration still applies.
     files_reported_hooks: crate::stream_relay::FilesReportedHooks,
@@ -416,6 +417,7 @@ impl ConversationService {
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
+            turn_ended_hooks: Arc::new(RwLock::new(Vec::new())),
             files_reported_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
@@ -649,6 +651,25 @@ impl ConversationService {
     pub fn with_turn_cancelled_hook(&self, hook: Arc<dyn OnConversationTurnCancelled>) {
         if let Ok(mut guard) = self.turn_cancelled_hooks.write() {
             guard.push(hook);
+        }
+    }
+
+    /// Register a hook notified once per user turn after its last attempt ended (B05).
+    pub fn with_turn_ended_hook(&self, hook: Arc<dyn OnConversationTurnEnded>) {
+        if let Ok(mut guard) = self.turn_ended_hooks.write() {
+            guard.push(hook);
+        }
+    }
+
+    /// Same snapshot-then-await pattern as `notify_turn_cancelled`.
+    pub(crate) async fn notify_turn_ended(&self, user_id: &str, conversation_id: &str, turn_id: &str, end: &TurnEnd) {
+        let hooks: Vec<Arc<dyn OnConversationTurnEnded>> = self
+            .turn_ended_hooks
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
+        for hook in hooks {
+            hook.on_turn_ended(user_id, conversation_id, turn_id, end).await;
         }
     }
 

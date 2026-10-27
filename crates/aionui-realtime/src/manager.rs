@@ -22,6 +22,9 @@ pub type TokenValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// and provides broadcast/unicast messaging.
 pub struct WebSocketManager {
     connections: Arc<DashMap<ConnectionId, ClientInfo>>,
+    /// Connections that came in through the LAN device listener (ADR-011); cut when the
+    /// owner turns that listener off, since upgraded sockets outlive its accept loop (C6).
+    via_device_listener: Arc<dashmap::DashSet<ConnectionId>>,
     next_id: AtomicU64,
 }
 
@@ -29,6 +32,7 @@ impl WebSocketManager {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(DashMap::new()),
+            via_device_listener: Arc::new(dashmap::DashSet::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -52,8 +56,27 @@ impl WebSocketManager {
         id
     }
 
+    /// Mark a connection as opened through the LAN device listener.
+    pub fn mark_via_device_listener(&self, conn_id: ConnectionId) {
+        if self.connections.contains_key(&conn_id) {
+            self.via_device_listener.insert(conn_id);
+        }
+    }
+
+    /// Close and remove every connection opened through the LAN device listener, e.g.
+    /// when the owner turns it off. Loopback connections (desktop app, local web) stay.
+    pub fn disconnect_device_listener(&self, reason: &str) -> usize {
+        let ids: std::collections::HashSet<ConnectionId> = self.via_device_listener.iter().map(|id| *id).collect();
+        let removed = self.disconnect_where_id(|id| ids.contains(&id), reason);
+        if removed > 0 {
+            info!(removed, "websocket connections of the device listener disconnected");
+        }
+        removed
+    }
+
     /// Remove a client connection by ID.
     pub fn remove_client(&self, conn_id: ConnectionId) {
+        self.via_device_listener.remove(&conn_id);
         if self.connections.remove(&conn_id).is_some() {
             debug!(%conn_id, "client removed");
         }
@@ -104,12 +127,20 @@ impl WebSocketManager {
     }
 
     fn disconnect_where(&self, matches: impl Fn(&ClientInfo) -> bool, reason: &str) -> usize {
+        self.disconnect_matching(|_, client| matches(client), reason)
+    }
+
+    fn disconnect_where_id(&self, matches: impl Fn(ConnectionId) -> bool, reason: &str) -> usize {
+        self.disconnect_matching(|id, _| matches(id), reason)
+    }
+
+    fn disconnect_matching(&self, matches: impl Fn(ConnectionId, &ClientInfo) -> bool, reason: &str) -> usize {
         let mut to_remove = Vec::new();
 
         for entry in self.connections.iter() {
             let conn_id = *entry.key();
             let client = entry.value();
-            if !matches(client) {
+            if !matches(conn_id, client) {
                 continue;
             }
 
@@ -558,6 +589,19 @@ mod tests {
             }
             _ => panic!("expected Text messages"),
         }
+    }
+
+    #[test]
+    fn a_removed_connection_leaves_the_device_listener_set() {
+        let mgr = WebSocketManager::new();
+        let (tx, _rx) = new_client_tx();
+        let id = mgr.add_client("t".into(), tx);
+        mgr.mark_via_device_listener(id);
+        mgr.remove_client(id);
+        assert_eq!(mgr.disconnect_device_listener("stopped"), 0);
+        // Marking an unknown connection does nothing.
+        mgr.mark_via_device_listener(id);
+        assert_eq!(mgr.disconnect_device_listener("stopped"), 0);
     }
 
     #[test]

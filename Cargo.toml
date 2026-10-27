@@ -30,6 +30,7 @@ members = [
     "crates/aionui-sidebar",
     "crates/aionui-cron",
     "crates/aionui-preview",
+    "crates/aionui-inbox",
     "crates/aionui-assistant",
     "crates/aionui-app",
 ]
@@ -70,6 +71,7 @@ aionui-project = { path = "crates/aionui-project" }
 aionui-sidebar = { path = "crates/aionui-sidebar" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-preview = { path = "crates/aionui-preview" }
+aionui-inbox = { path = "crates/aionui-inbox" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
@@ -84,7 +86,7 @@ aion-mcp = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.11" }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["multipart", "ws"] }
 tower = { version = "0.5" }
-tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "fs", "timeout"] }
 http = "1"
 
 # Serialization

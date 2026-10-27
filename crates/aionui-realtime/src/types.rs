@@ -174,6 +174,11 @@ pub struct ClientInfo {
     pub tx: mpsc::Sender<WsOutbound>,
 }
 
+/// Request extension set on the router served by the LAN device listener, so
+/// WebSockets upgraded there can be cut when the owner turns the listener off (C6).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ViaDeviceListener;
+
 /// Server sends ping every 30 seconds.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 

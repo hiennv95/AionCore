@@ -29,7 +29,9 @@ fn host(name: &str) -> Host {
 
 /// Start a peer listener for `server` whose /peer/v1/hello reports the caller and its trust.
 async fn start_listener(server: &PeerIdentity, trust: Arc<InMemoryTrustStore>) -> std::net::SocketAddr {
-    let router = Router::new().route(
+    let router = Router::new()
+        .route("/peer/v1/echo", axum::routing::post(|Json(body): Json<Value>| async move { Json(body) }))
+        .route(
         "/peer/v1/hello",
         get(
             move |Extension(caller): Extension<PeerCaller>,
@@ -244,16 +246,27 @@ async fn a_silent_connection_is_closed_after_the_header_timeout() {
     );
 }
 
+/// Linux only: the connections come from several 127.0.0.x source addresses (all
+/// loopback there, but not configured on macOS) so the per-address cap is not hit first.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn connections_beyond_the_cap_are_closed_at_once() {
     let server = host("b");
     let addr = start_listener(&server.identity, Arc::new(InMemoryTrustStore::default())).await;
+    let from = |n: usize| async move {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket
+            .bind(std::net::SocketAddr::from(([127, 0, 0, 2 + n as u8], 0)))
+            .unwrap();
+        socket.connect(addr).await.unwrap()
+    };
     let mut idle = Vec::new();
-    for _ in 0..aionui_peer::MAX_TLS_CONNECTIONS {
-        idle.push(TcpStream::connect(addr).await.unwrap());
+    for i in 0..aionui_peer::MAX_TLS_CONNECTIONS {
+        idle.push(from(i / aionui_peer::MAX_TLS_CONNECTIONS_PER_IP).await);
     }
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let mut extra = TcpStream::connect(addr).await.unwrap();
+    // A fresh address, below its own per-address cap: only the listener limit can close it.
+    let mut extra = from(aionui_peer::MAX_TLS_CONNECTIONS / aionui_peer::MAX_TLS_CONNECTIONS_PER_IP + 1).await;
     let mut byte = [0u8; 1];
     let closed = tokio::time::timeout(std::time::Duration::from_secs(2), extra.read(&mut byte)).await;
     assert!(
@@ -261,4 +274,100 @@ async fn connections_beyond_the_cap_are_closed_at_once() {
         "connection over the cap still open: {closed:?}"
     );
     drop(idle);
+}
+
+async fn connect_tls(
+    addr: std::net::SocketAddr,
+    config: Arc<ClientConfig>,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    TlsConnector::from(config)
+        .connect(ServerName::try_from("peer.invalid").unwrap(), tcp)
+        .await
+        .unwrap()
+}
+
+/// C6: a request that declares a body and never sends it must not hold its
+/// connection slot past the body deadline (hyper's header timer stops once
+/// headers parse).
+#[tokio::test]
+async fn a_stalled_request_body_is_cut_after_the_body_timeout() {
+    let (server, client) = (host("b"), host("a"));
+    let addr = start_listener(&server.identity, Arc::new(InMemoryTrustStore::default())).await;
+    let config = client_config(
+        &client.identity,
+        ServerPin::Expect(server.identity.fingerprint().clone()),
+    )
+    .unwrap();
+    let mut tls = connect_tls(addr, config).await;
+    tls.write_all(
+        b"POST /peer/v1/echo HTTP/1.1\r\nHost: peer\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut raw = Vec::new();
+    let finished = tokio::time::timeout(
+        aionui_peer::BODY_READ_TIMEOUT + std::time::Duration::from_secs(5),
+        tls.read_to_end(&mut raw),
+    )
+    .await;
+    assert!(finished.is_ok(), "stalled body still holds the connection");
+    let text = String::from_utf8_lossy(&raw);
+    assert!(
+        !text.starts_with("HTTP/1.1 200"),
+        "a stalled body must not succeed: {text}"
+    );
+}
+
+/// A complete body inside the deadline still works.
+#[tokio::test]
+async fn a_prompt_request_body_is_served() {
+    let (server, client) = (host("b"), host("a"));
+    let addr = start_listener(&server.identity, Arc::new(InMemoryTrustStore::default())).await;
+    let config = client_config(
+        &client.identity,
+        ServerPin::Expect(server.identity.fingerprint().clone()),
+    )
+    .unwrap();
+    let mut tls = connect_tls(addr, config).await;
+    let body = r#"{"ping":1}"#;
+    let request = format!(
+        "POST /peer/v1/echo HTTP/1.1\r\nHost: peer\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    tls.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    tls.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.contains(body), "{text}");
+}
+
+/// C6: one LAN address cannot take every connection slot.
+#[tokio::test]
+async fn one_address_is_capped_below_the_listener_limit() {
+    let server = host("b");
+    let addr = start_listener(&server.identity, Arc::new(InMemoryTrustStore::default())).await;
+    let mut held = Vec::new();
+    for _ in 0..aionui_peer::MAX_TLS_CONNECTIONS_PER_IP {
+        held.push(TcpStream::connect(addr).await.unwrap());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut extra = TcpStream::connect(addr).await.unwrap();
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(2), extra.read(&mut byte)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "connection over the per-address cap still open: {closed:?}"
+    );
+    // Freed slots are given back: after the held connections close, a new one is served.
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let client = host("a");
+    let config = client_config(
+        &client.identity,
+        ServerPin::Expect(server.identity.fingerprint().clone()),
+    )
+    .unwrap();
+    assert_eq!(get_json(addr, config, "/peer/v1/hello").await.unwrap().0, 200);
 }

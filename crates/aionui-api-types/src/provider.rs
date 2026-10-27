@@ -144,9 +144,9 @@ pub struct BedrockConfig {
 
 /// Provider response for `GET /api/providers` and single-provider endpoints.
 ///
-/// The `api_key` field is returned in plaintext (decrypted on read). Storage
-/// remains encrypted at rest. Pre-launch convention for the frontend
-/// local-store → backend migration; no masking applied.
+/// The desktop app reads `api_key` (and Bedrock keys) in plaintext, decrypted on read;
+/// storage remains encrypted at rest. Paired devices and the agent helper read them
+/// masked as `"***"` (Jev 047).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderResponse {
     pub id: String,

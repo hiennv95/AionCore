@@ -69,3 +69,30 @@ pub trait OnConversationTurnCancelled: Send + Sync {
 pub trait OnFilesReported: Send + Sync {
     async fn on_files_reported(&self, user_id: &str, conversation_id: &str, call_id: &str, paths: &[String]);
 }
+
+/// How a turn ended, from the host's own terminal signal (B05 attention inbox).
+///
+/// `failed: false` only means no error signal ended the turn. It is NOT proof
+/// that the agent's work succeeded. A user stop is reported separately through
+/// [`OnConversationTurnCancelled`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnEnd {
+    /// The final attempt ended with an error terminal, or the turn could not start.
+    pub failed: bool,
+    /// The signal: `relay_finish`, `relay_error`, `channel_closed`, `start_failed`
+    /// or `settled_without_relay`.
+    pub source: &'static str,
+    /// The agent error code of an error terminal, when the agent sent one.
+    pub error_code: Option<String>,
+    /// When the host started the turn (Unix ms): with the end time it bounds the
+    /// turn's messages and files for its result receipt (B05.R1).
+    pub started_at: i64,
+}
+
+/// Notified once per user turn after its last attempt ended, so `aionui-inbox` can
+/// record the outcome without `aionui-conversation` depending on it. Hooks run in
+/// registration order; failures must be logged inside the hook and not propagated.
+#[async_trait]
+pub trait OnConversationTurnEnded: Send + Sync {
+    async fn on_turn_ended(&self, user_id: &str, conversation_id: &str, turn_id: &str, end: &TurnEnd);
+}

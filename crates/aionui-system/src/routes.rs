@@ -2,9 +2,11 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, Query, State};
+use axum::extract::{Extension, Json, Path, Query, Request, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
+use axum::middleware::{Next, from_fn};
+use axum::response::Response;
+use axum::routing::{MethodRouter, delete, get, post};
 
 use aionui_api_types::{
     ApiResponse, ClientPreferencesResponse, CreateProviderRequest, CurrentUserResponse, DetectProtocolRequest,
@@ -13,7 +15,7 @@ use aionui_api_types::{
     SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
     UpdateProviderRequest, UpdateSettingsRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device};
 use aionui_common::ApiError;
 
 use crate::client_pref::ClientPrefService;
@@ -81,20 +83,63 @@ pub fn system_routes(state: SystemRouterState) -> Router {
             "/api/settings/client",
             get(get_client_preferences).put(update_client_preferences),
         )
-        .route("/api/providers", get(list_providers).post(create_provider))
+        .route(
+            "/api/providers",
+            get(list_providers).merge(desktop(post(create_provider))),
+        )
         // Literal-segment routes must register BEFORE the `/{id}` routes so
         // axum matches the literals instead of treating "detect-protocol" /
         // "fetch-models" as a provider id.
-        .route("/api/providers/detect-protocol", post(detect_protocol))
-        .route("/api/providers/fetch-models", post(fetch_models_anonymous))
-        .route("/api/providers/{id}", delete(delete_provider).put(update_provider))
-        .route("/api/providers/{id}/models", post(fetch_models))
+        .route("/api/providers/detect-protocol", desktop(post(detect_protocol)))
+        .route("/api/providers/fetch-models", desktop(post(fetch_models_anonymous)))
+        .route(
+            "/api/providers/{id}",
+            desktop(delete(delete_provider).put(update_provider)),
+        )
+        .route("/api/providers/{id}/models", desktop(post(fetch_models)))
         .route("/api/system/current-user", get(get_current_user))
         .route("/api/system/info", get(get_system_info))
         .route("/api/system/check-update", post(check_update))
-        .route("/api/system/ensure-node-runtime", post(ensure_node_runtime))
+        .route("/api/system/ensure-node-runtime", desktop(post(ensure_node_runtime)))
         .route("/api/system/diagnostics/feedback-report", get(get_feedback_diagnostics))
         .with_state(state)
+}
+
+/// Paired phones and browsers and the agent helper may list providers (keys masked) but
+/// not change them, nor make the host call out to a caller-chosen URL or install a
+/// runtime; those stay with the desktop app (same rule as MCP servers, Jev 047).
+async fn providers_desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
+    let extensions = request.extensions();
+    if is_paired_device(extensions.get::<CurrentDevice>()) || extensions.get::<RuntimeHelperCaller>().is_some() {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "PROVIDERS_DESKTOP_ONLY",
+            "Model providers are managed from the desktop app; this device can view them.",
+            None,
+        ));
+    }
+    Ok(next.run(request).await)
+}
+
+fn desktop<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> MethodRouter<S> {
+    route.route_layer(from_fn(providers_desktop_only))
+}
+
+const MASK: &str = "***";
+
+/// Secrets are masked for paired devices and the agent helper; the desktop keeps them to edit.
+fn mask_secrets(mut provider: ProviderResponse) -> ProviderResponse {
+    if !provider.api_key.is_empty() {
+        provider.api_key = MASK.to_owned();
+    }
+    if let Some(bedrock) = provider.bedrock_config.as_mut() {
+        for field in [&mut bedrock.access_key_id, &mut bedrock.secret_access_key] {
+            if field.is_some() {
+                *field = Some(MASK.to_owned());
+            }
+        }
+    }
+    provider
 }
 
 /// Backwards-compatible alias — delegates to `system_routes`.
@@ -197,8 +242,14 @@ async fn update_client_preferences(
 async fn list_providers(
     State(state): State<SystemRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
 ) -> Result<Json<ApiResponse<Vec<ProviderResponse>>>, ApiError> {
     let providers = state.provider_service.list(&user.id).await.map_err(ApiError::from)?;
+    let masked = helper.is_some() || is_paired_device(device.as_ref().map(|Extension(d)| d));
+    if masked {
+        return Ok(Json(ApiResponse::ok(providers.into_iter().map(mask_secrets).collect())));
+    }
     Ok(Json(ApiResponse::ok(providers)))
 }
 

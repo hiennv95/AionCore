@@ -87,6 +87,13 @@ impl AllowedOrigins {
             .is_some_and(|origin| self.origins.contains(&origin) || (self.any_loopback && is_loopback_origin(&origin)))
     }
 
+    /// `host[:port]` of each listed origin (default port dropped), for the Host guard.
+    pub fn authorities(&self) -> impl Iterator<Item = String> + '_ {
+        self.origins
+            .iter()
+            .filter_map(|origin| origin.split_once("://").map(|(_, authority)| authority.to_owned()))
+    }
+
     /// Normalized origins, sorted, for startup logging.
     pub fn sorted(&self) -> Vec<String> {
         let mut origins: Vec<String> = self.origins.iter().cloned().collect();

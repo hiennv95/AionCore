@@ -119,3 +119,34 @@ async fn listener_serves_tls_guards_origin_and_persists_settings() {
         .unwrap_err();
     assert_eq!(err.code(), "INVALID_REQUEST");
 }
+
+/// C6: turning the listener off runs the stop hook, which the app uses to cut the
+/// upgraded WebSockets its accept loop no longer owns. Not run while it was never on.
+#[tokio::test]
+async fn turning_the_listener_off_runs_the_stop_hook() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let dir = tempfile::tempdir().unwrap();
+    let identity = Arc::new(PeerIdentity::load_or_create(&dir.path().join("peer"), "host").unwrap());
+    let listener = DeviceListener::new(identity, dir.path().join("devices/listener.json"));
+    let stops = Arc::new(AtomicUsize::new(0));
+    let counter = stops.clone();
+    listener.set_on_stopped(Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
+    listener
+        .attach(Router::new().route("/api/ping", get(|| async { "pong" })))
+        .await
+        .unwrap();
+    listener.stop();
+    assert_eq!(stops.load(Ordering::SeqCst), 0, "nothing was running");
+
+    let port = free_port();
+    let on = |enabled| UpdateDeviceListenerRequest {
+        enabled: Some(enabled),
+        port: Some(port),
+    };
+    assert!(listener.update(on(true)).await.unwrap().running);
+    assert!(!listener.update(on(false)).await.unwrap().running);
+    assert_eq!(stops.load(Ordering::SeqCst), 1);
+}

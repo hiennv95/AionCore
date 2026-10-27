@@ -179,6 +179,76 @@ pub async fn api_rate_limit_middleware(
     Ok(next.run(request).await)
 }
 
+/// API rate limit for the public `/api/auth/status` probe, except from this
+/// machine. Every loopback socket shares one key, so another local process
+/// could otherwise fill it and make the desktop launcher read the host as down
+/// (C7, Jev 048). The probe is cheap and public; remote callers stay limited.
+pub async fn status_rate_limit_middleware(
+    State(limiter): State<Arc<RateLimiter>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    if !crate::extract::is_loopback_client(&request) {
+        let ip = extract_client_ip(&request);
+        limiter.check_and_increment(&ip).map_err(ApiError::from)?;
+    }
+    Ok(next.run(request).await)
+}
+
+/// Limits for `/api/auth/refresh` (C7, Jev 048).
+///
+/// A request whose token verifies is counted against its own grant (or user,
+/// for legacy tokens without one), so other callers on the same IP cannot use
+/// up the owner's refreshes. Only requests whose token does not verify are
+/// counted per client IP.
+pub struct RefreshLimiter {
+    by_grant: RateLimiter,
+    invalid_by_ip: RateLimiter,
+}
+
+impl RefreshLimiter {
+    /// 20 refreshes per minute per grant, 20 invalid tokens per minute per IP.
+    pub fn new() -> Self {
+        Self {
+            by_grant: RateLimiter::authenticated_action(),
+            invalid_by_ip: RateLimiter::authenticated_action(),
+        }
+    }
+
+    /// Count a refresh by a token that verified.
+    pub fn check_verified(&self, user_id: &str, grant_id: Option<&str>) -> Result<(), AuthError> {
+        let key = match grant_id {
+            Some(grant) => format!("grant:{grant}"),
+            None => format!("user:{user_id}"),
+        };
+        self.by_grant.check_and_increment(&key)
+    }
+
+    /// Count a refresh by a token that did not verify.
+    pub fn check_invalid(&self, client_ip: &str) -> Result<(), AuthError> {
+        self.invalid_by_ip.check_and_increment(&format!("ip:{client_ip}"))
+    }
+
+    /// Start periodic cleanup of both buckets.
+    pub fn start_cleanup_task(self: &Arc<Self>, interval: Duration) {
+        let limiter = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                limiter.by_grant.cleanup();
+                limiter.invalid_by_ip.cleanup();
+            }
+        });
+    }
+}
+
+impl Default for RefreshLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Authenticated action rate limit middleware: 20 requests per minute.
 ///
 /// Prefers user ID from [`CurrentUser`] extension (set by auth middleware),
