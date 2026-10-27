@@ -205,3 +205,96 @@ async fn phones_cannot_choose_host_commands_or_change_remote_agents_and_read_env
     .await;
     assert!(status.is_success(), "{status} {resp}");
 }
+
+/// Cross-user isolation: bob neither lists nor reaches by id the owner's custom agent, its
+/// overrides, or the owner's remote agent.
+#[tokio::test]
+async fn another_user_cannot_see_or_touch_the_owners_custom_and_remote_agents() {
+    unsafe { std::env::set_var("AIONUI_BYPASS_PROBE", "1") };
+    let (mut app, services) = common::build_app().await;
+    let (owner, oc) = common::setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (bob, bc) = common::setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+    let send = |method: &str, uri: &str, body: Value, token: &str, csrf: &str| {
+        let req = json_with_token(method, uri, body, token, csrf);
+        let app = app.clone();
+        async move {
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            (status, common::body_json(resp).await)
+        }
+    };
+    let (_, body) = send(
+        "POST",
+        "/api/agents/custom",
+        json!({"name": "owner-custom-agent", "command": "true"}),
+        &owner,
+        &oc,
+    )
+    .await;
+    let agent = body["data"]["id"].as_str().unwrap().to_owned();
+    let (status, body) = send(
+        "PUT",
+        &format!("/api/agents/{agent}/overrides"),
+        json!({"env_override": [{"name": "K", "value": ENV_SECRET}]}),
+        &owner,
+        &oc,
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let (_, body) = send(
+        "POST",
+        "/api/remote-agents",
+        json!({"name": "owner-remote", "protocol": "acp", "url": "wss://owner-remote.invalid", "auth_type": "bearer", "auth_token": "owner-remote-token-9999"}),
+        &owner,
+        &oc,
+    )
+    .await;
+    let remote = body["data"]["id"].as_str().unwrap().to_owned();
+
+    for list in ["/api/agents/management", "/api/remote-agents"] {
+        let (status, body) = send("GET", list, Value::Null, &bob, &bc).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let text = body.to_string();
+        assert!(
+            !text.contains("owner-custom-agent") && !text.contains("owner-remote"),
+            "{list} leaks the owner's agents: {text}"
+        );
+    }
+    let mut leaks = Vec::new();
+    let probes = [
+        format!("/api/agents/{agent}/overrides"),
+        format!("/api/agents/{agent}/enabled"),
+        format!("/api/agents/{agent}/health-check"),
+        format!("/api/agents/custom/{agent}"),
+        format!("/api/remote-agents/{remote}"),
+        format!("/api/remote-agents/{remote}/handshake"),
+    ];
+    for uri in &probes {
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+            let body = json!({"name": "bob", "command": "true", "enabled": false, "env_override": [], "url": "ws://127.0.0.1:9"});
+            let (status, resp) = send(method, uri, body, &bob, &bc).await;
+            let text = resp.to_string();
+            if status.is_success() || text.contains(ENV_SECRET) || text.contains("owner-remote") {
+                leaks.push(format!("{method} {uri} -> {status} {text}"));
+            }
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "bob reached the owner's agents:\n{}",
+        leaks.join("\n")
+    );
+
+    // Still the owner's, unchanged.
+    let (_, body) = send(
+        "GET",
+        &format!("/api/agents/{agent}/overrides"),
+        Value::Null,
+        &owner,
+        &oc,
+    )
+    .await;
+    assert_eq!(body["data"]["env_override"][0]["value"], ENV_SECRET);
+    let (_, body) = send("GET", &format!("/api/remote-agents/{remote}"), Value::Null, &owner, &oc).await;
+    assert_eq!(body["data"]["url"], "wss://owner-remote.invalid");
+}
