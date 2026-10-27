@@ -233,3 +233,121 @@ async fn another_user_cannot_use_any_conversation_route_of_the_owner() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(common::body_json(resp).await["data"]["name"], "owner chat");
 }
+
+async fn call(
+    app: &axum::Router,
+    method: Method,
+    uri: &str,
+    token: &str,
+    csrf: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-csrf-token", csrf)
+        .header("cookie", format!("aionui-csrf-token={csrf}"))
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    let status = resp.status();
+    (status, common::body_json(resp).await)
+}
+
+/// Cross-user isolation for the owner's model providers (they hold API keys) and MCP
+/// servers: bob neither sees them in his lists nor reaches them by id.
+#[tokio::test]
+async fn another_user_cannot_see_or_touch_the_owners_providers_and_mcp_servers() {
+    let (mut app, services) = common::build_app().await;
+    let (owner, oc) = common::setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let secret = "sk-owner-secret-key-123";
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/providers",
+        &owner,
+        &oc,
+        serde_json::json!({"platform": "openai", "name": "owner provider", "base_url": "https://api.example.invalid", "api_key": secret}),
+    )
+    .await;
+    assert!(status.is_success(), "create provider: {status} {body}");
+    let provider = body["data"]["id"].as_str().unwrap().to_owned();
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/mcp/servers",
+        &owner,
+        &oc,
+        serde_json::json!({"name": "owner-mcp", "transport": {"type": "stdio", "command": "echo", "env": {"TOKEN": "mcp-secret-456"}}}),
+    )
+    .await;
+    assert!(status.is_success(), "create mcp: {status} {body}");
+    let mcp = body["data"]["id"].as_str().unwrap().to_owned();
+
+    let (bob, bc) = common::setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+    for list in ["/api/providers", "/api/mcp/servers"] {
+        let (status, body) = call(&app, Method::GET, list, &bob, &bc, serde_json::Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let text = body.to_string();
+        assert!(
+            !text.contains(&provider) && !text.contains(&mcp),
+            "{list} leaks the owner's rows: {text}"
+        );
+        assert!(
+            !text.contains(secret) && !text.contains("mcp-secret-456"),
+            "{list} leaks a secret"
+        );
+    }
+    let mut leaks = Vec::new();
+    for (path, id) in [
+        ("/api/providers/{id}", &provider),
+        ("/api/providers/{id}/models", &provider),
+        ("/api/mcp/servers/{id}", &mcp),
+        ("/api/mcp/servers/{id}/toggle", &mcp),
+    ] {
+        let uri = path.replace("{id}", id);
+        for method in [Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            let (status, body) = call(
+                &app,
+                method.clone(),
+                &uri,
+                &bob,
+                &bc,
+                serde_json::json!({"name": "bob was here", "enabled": false}),
+            )
+            .await;
+            if status.is_success() || body.to_string().contains(secret) {
+                leaks.push(format!("{method} {path} -> {status}"));
+            }
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "bob reached the owner's resources:\n{}",
+        leaks.join("\n")
+    );
+
+    // Still the owner's, unchanged.
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/providers",
+        &owner,
+        &oc,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert!(body.to_string().contains("owner provider"), "{body}");
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/mcp/servers",
+        &owner,
+        &oc,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert!(body.to_string().contains("owner-mcp"), "{body}");
+}
