@@ -74,6 +74,8 @@ pub(crate) struct BackgroundStreamWatcher {
     /// Expiry for a pending `MessageLifecycle{Started}` (see
     /// [`PENDING_STARTED_TTL`]); injectable so tests can use a short bound.
     pub pending_started_ttl: std::time::Duration,
+    /// Preview-ref hooks (ADR-017) for files an agent-started turn reports.
+    pub files_reported_hooks: crate::stream_relay::FilesReportedHooks,
 }
 
 impl BackgroundStreamWatcher {
@@ -420,7 +422,8 @@ impl BackgroundStreamWatcher {
             self.broadcaster.clone(),
         )
         .with_runtime_state(Arc::clone(&self.runtime_state))
-        .with_persistence(self.persistence.clone());
+        .with_persistence(self.persistence.clone())
+        .with_files_reported_hooks(Arc::clone(&self.files_reported_hooks));
 
         let (feed_tx, feed_rx) = broadcast::channel::<AgentStreamEvent>(256);
         let mut relay_task = tokio::spawn(relay.consume(feed_rx));
@@ -572,6 +575,7 @@ mod tests {
             runtime_state: Arc::clone(&runtime_state),
             title_only,
             pending_started_ttl,
+            files_reported_hooks: Default::default(),
         };
         let handle = tokio::spawn(watcher.run(tx.subscribe()));
         Rig {

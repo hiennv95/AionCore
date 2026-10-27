@@ -182,12 +182,13 @@ impl DeviceService {
         };
         let (access_token, refresh_token) = self
             .jwt
-            .sign_session_pair(
+            .issue_session_pair(
                 &owner.id,
                 owner.username.as_deref().unwrap_or("owner"),
                 owner.session_generation,
                 Some(&device.id),
             )
+            .await
             .map_err(|e| DeviceError::Internal(format!("token signing failed: {e}")))?;
         info!(device_id = %device.id, kind = kind.as_str(), "device: session issued");
         Ok(DeviceSession {
@@ -222,6 +223,7 @@ impl DeviceService {
 
     pub async fn create_pairing(&self, user_id: &str, caller: &Caller) -> Result<CreatePairingResponse, DeviceError> {
         self.ensure_manager(user_id, caller).await?;
+        let _ = self.prune_unclaimed_devices().await;
         let opened = self.book().open(now_ms())?;
         let listener = self.listener.as_ref().and_then(|listener| listener.info());
         let mut qr_uri = format!("aionx://pair?v=1&secret={}", opened.secret);
@@ -337,6 +339,7 @@ impl DeviceService {
 
     pub async fn list(&self, user_id: &str, caller: &Caller) -> Result<Vec<DeviceView>, DeviceError> {
         let owner = self.ensure_owner(user_id).await?;
+        let _ = self.prune_unclaimed_devices().await;
         Ok(self
             .devices
             .list(&owner.id)
@@ -344,6 +347,52 @@ impl DeviceService {
             .into_iter()
             .map(|row| view(row, caller.device()))
             .collect())
+    }
+
+    /// Prunes expired unclaimed pairings from memory and revokes their associated
+    /// device rows in the database, preventing ghost active device rows.
+    /// Retries any previously failed database revocations.
+    pub async fn prune_unclaimed_devices_at(&self, now: i64) -> Result<Vec<String>, DeviceError> {
+        let orphans = self.book().prune_unclaimed_approved(now);
+        if orphans.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owner = match self.owner().await {
+            Ok(owner) => owner,
+            Err(e) => {
+                tracing::warn!(error = %e, pending = orphans.len(), "device: orphan revocation deferred, owner unavailable");
+                self.book().queue_failed_revocations(orphans);
+                return Err(e);
+            }
+        };
+        let mut revoked = Vec::new();
+        let mut failed = Vec::new();
+        for device_id in orphans {
+            match self.devices.revoke(&owner.id, &device_id, now).await {
+                Ok(true) => {
+                    info!(%device_id, "device: revoked orphan approved device from expired pairing");
+                    if let Some(hook) = &self.on_revoked {
+                        hook(&device_id);
+                    }
+                    revoked.push(device_id);
+                }
+                Ok(false) => {
+                    revoked.push(device_id);
+                }
+                Err(e) => {
+                    tracing::warn!(%device_id, error = %e, "device: failed to revoke orphan device, queued for retry");
+                    failed.push(device_id);
+                }
+            }
+        }
+        if !failed.is_empty() {
+            self.book().queue_failed_revocations(failed);
+        }
+        Ok(revoked)
+    }
+
+    pub async fn prune_unclaimed_devices(&self) -> Result<Vec<String>, DeviceError> {
+        self.prune_unclaimed_devices_at(now_ms()).await
     }
 
     pub async fn revoke(&self, user_id: &str, caller: &Caller, device_id: &str) -> Result<(), DeviceError> {

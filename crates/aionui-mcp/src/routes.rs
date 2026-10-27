@@ -2,17 +2,18 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, State};
+use axum::extract::{Extension, Json, Path, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{Next, from_fn};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{MethodRouter, get, post, put};
 
 use aionui_api_types::{
     ApiResponse, BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerResponse, ErrorResponse,
-    McpConnectionTestErrorCode, McpServerResponse, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse,
-    OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
+    McpConnectionTestErrorCode, McpServerResponse, McpTransport, OAuthCheckStatusRequest, OAuthLoginRequest,
+    OAuthLoginResponse, OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device};
 use aionui_common::ApiError;
 
 use crate::connection_test::McpConnectionTestService;
@@ -53,6 +54,36 @@ pub struct McpRouterState {
 }
 
 // ---------------------------------------------------------------------------
+// Route gates
+// ---------------------------------------------------------------------------
+
+/// Paired phones and browsers, as well as runtime helper CLIs, may inspect
+/// MCP server definitions and passive OAuth status, but creating, editing,
+/// deleting, toggling, running connection tests, discovering host configs, or
+/// initiating OAuth flows are reserved for the desktop host session (ADR-013,
+/// ADR-038).
+fn mcp_desktop_only_error() -> ApiError {
+    ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "MCP_DESKTOP_ONLY",
+        "MCP servers are managed and tested from the desktop app; this device can view them.",
+        None,
+    )
+}
+
+async fn mcp_desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
+    let extensions = request.extensions();
+    if is_paired_device(extensions.get::<CurrentDevice>()) || extensions.get::<RuntimeHelperCaller>().is_some() {
+        return Err(mcp_desktop_only_error());
+    }
+    Ok(next.run(request).await)
+}
+
+fn desktop<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> MethodRouter<S> {
+    route.route_layer(from_fn(mcp_desktop_only))
+}
+
+// ---------------------------------------------------------------------------
 // Router builder
 // ---------------------------------------------------------------------------
 
@@ -62,21 +93,21 @@ pub struct McpRouterState {
 /// All routes require authentication (applied by the caller).
 pub fn mcp_routes(state: McpRouterState) -> Router {
     Router::new()
-        .route("/api/mcp/servers", get(list_servers).post(add_server))
-        .route("/api/mcp/servers/import", post(batch_import))
+        .route("/api/mcp/servers", get(list_servers).merge(desktop(post(add_server))))
+        .route("/api/mcp/servers/import", desktop(post(batch_import)))
         .route(
             "/api/mcp/servers/{id}",
-            get(get_server).put(edit_server).delete(delete_server),
+            get(get_server).merge(desktop(put(edit_server).delete(delete_server))),
         )
-        .route("/api/mcp/servers/{id}/toggle", post(toggle_server))
+        .route("/api/mcp/servers/{id}/toggle", desktop(post(toggle_server)))
         // Connection test route
-        .route("/api/mcp/test-connection", post(test_connection))
+        .route("/api/mcp/test-connection", desktop(post(test_connection)))
         // Agent config discovery route
-        .route("/api/mcp/agent-configs", get(get_agent_configs))
+        .route("/api/mcp/agent-configs", desktop(get(get_agent_configs)))
         // OAuth routes
         .route("/api/mcp/oauth/check-status", post(oauth_check_status))
-        .route("/api/mcp/oauth/login", post(oauth_login))
-        .route("/api/mcp/oauth/logout", post(oauth_logout))
+        .route("/api/mcp/oauth/login", desktop(post(oauth_login)))
+        .route("/api/mcp/oauth/logout", desktop(post(oauth_logout)))
         .route("/api/mcp/oauth/authenticated", get(oauth_authenticated))
         .with_state(state)
 }
@@ -89,19 +120,26 @@ pub fn mcp_routes(state: McpRouterState) -> Router {
 async fn list_servers(
     State(state): State<McpRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
 ) -> Result<Json<ApiResponse<Vec<McpServerResponse>>>, ApiError> {
     let servers = state
         .config_service
         .list_servers(&user.id)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(ApiResponse::ok(servers)))
+    let masked = masks_secrets(device.as_ref().map(|Extension(d)| d), helper.is_some());
+    Ok(Json(ApiResponse::ok(
+        servers.into_iter().map(|s| project(s, masked)).collect(),
+    )))
 }
 
 /// `GET /api/mcp/servers/:id` — get a single MCP server.
 async fn get_server(
     State(state): State<McpRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, ApiError> {
     let server = state
@@ -109,7 +147,52 @@ async fn get_server(
         .get_server(&user.id, &id)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(ApiResponse::ok(server)))
+    let masked = masks_secrets(device.as_ref().map(|Extension(d)| d), helper.is_some());
+    Ok(Json(ApiResponse::ok(project(server, masked))))
+}
+
+/// Paired phones and browsers and the agent helper read MCP servers with every
+/// secret-bearing field masked (Jev 047); the desktop app keeps full values to edit them.
+fn masks_secrets(device: Option<&CurrentDevice>, helper: bool) -> bool {
+    helper || is_paired_device(device)
+}
+
+const MASK: &str = "***";
+
+fn project(mut server: McpServerResponse, masked: bool) -> McpServerResponse {
+    if !masked {
+        return server;
+    }
+    server.original_json = None;
+    server.transport = match server.transport {
+        McpTransport::Stdio { command, args, env } => McpTransport::Stdio {
+            command,
+            args: args.iter().map(|_| MASK.to_owned()).collect(),
+            env: env.into_keys().map(|k| (k, MASK.to_owned())).collect(),
+        },
+        McpTransport::Sse { url, headers } => McpTransport::Sse {
+            url: strip_url_secrets(&url),
+            headers: headers.into_keys().map(|k| (k, MASK.to_owned())).collect(),
+        },
+        McpTransport::Http { url, headers } => McpTransport::Http {
+            url: strip_url_secrets(&url),
+            headers: headers.into_keys().map(|k| (k, MASK.to_owned())).collect(),
+        },
+    };
+    server
+}
+
+/// Drops userinfo, query and fragment: `https://u:p@host/p?k=v#f` -> `https://host/p`.
+fn strip_url_secrets(url: &str) -> String {
+    let url = url.split(['?', '#']).next().unwrap_or_default();
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+            format!("{scheme}://{host}{path}")
+        }
+        None => url.to_owned(),
+    }
 }
 
 /// `POST /api/mcp/servers` — create (or upsert by name) an MCP server.
@@ -339,6 +422,17 @@ async fn oauth_authenticated(
 #[cfg(test)]
 mod error_mapping_tests {
     use super::*;
+
+    #[test]
+    fn url_secrets_are_stripped() {
+        assert_eq!(
+            strip_url_secrets("https://u:p@h.example:8443/sse?key=s#f"),
+            "https://h.example:8443/sse"
+        );
+        assert_eq!(strip_url_secrets("https://h.example?token=s"), "https://h.example");
+        assert_eq!(strip_url_secrets("https://a@b@h.example/x"), "https://h.example/x");
+        assert_eq!(strip_url_secrets("h.example/path?k=v"), "h.example/path");
+    }
 
     #[test]
     fn not_found_maps_to_app_not_found() {

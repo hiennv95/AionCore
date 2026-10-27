@@ -11,6 +11,7 @@ pub mod middleware;
 mod password;
 pub mod qr_token;
 mod rate_limit;
+mod rotation;
 mod routes;
 mod secret;
 mod security;
@@ -32,6 +33,7 @@ pub use secret::{
 
 // JWT service
 pub use jwt::{JwtService, TokenPayload, generate_random_secret_string, resolve_encryption_secret, resolve_jwt_secret};
+pub use rotation::{REFRESH_GRACE, RotateError};
 
 // Password service
 pub use password::{

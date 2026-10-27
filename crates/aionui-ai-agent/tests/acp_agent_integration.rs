@@ -199,6 +199,7 @@ fn event_type_name(event: &AgentStreamEvent) -> &'static str {
         AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
         AgentStreamEvent::SegmentBreak => "SegmentBreak",
         AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
+        AgentStreamEvent::FilesReported(_) => "FilesReported",
         AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
         AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
         AgentStreamEvent::MessageLifecycle(_) => "MessageLifecycle",

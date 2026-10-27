@@ -2293,7 +2293,7 @@ impl AssistantService {
         let destination_dir = self.user_avatars_dir_for_user(user_id);
         std::fs::create_dir_all(&destination_dir)
             .map_err(|e| AssistantError::Internal(format!("create assistant avatar directory: {e}")))?;
-        let destination = destination_dir.join(format!("{id}.{extension}"));
+        let destination = avatar_destination(&destination_dir, id, &extension)?;
         if paths_refer_to_same_file(source_path, &destination) {
             return managed_user_avatar_value_from_path(&destination);
         }
@@ -2330,9 +2330,8 @@ impl AssistantService {
         let destination_dir = self.user_avatars_dir_for_user(user_id);
         std::fs::create_dir_all(&destination_dir)
             .map_err(|e| AssistantError::Internal(format!("create assistant avatar directory: {e}")))?;
+        let destination = avatar_destination(&destination_dir, id, &extension)?;
         remove_assistant_avatar_files(&destination_dir, id);
-
-        let destination = destination_dir.join(format!("{id}.{extension}"));
         std::fs::write(&destination, bytes).map_err(|e| {
             AssistantError::Internal(format!("write assistant avatar to '{}': {e}", destination.display()))
         })?;
@@ -2342,10 +2341,11 @@ impl AssistantService {
 
     fn find_existing_user_avatar_file(&self, user_id: &str, id: &str) -> Option<PathBuf> {
         let entries = std::fs::read_dir(self.user_avatars_dir_for_user(user_id)).ok()?;
+        let stem = encode_filename_component(id);
         for entry in entries.flatten() {
             let path = entry.path();
             let file_stem = path.file_stem().and_then(|stem| stem.to_str());
-            if file_stem == Some(id) {
+            if file_stem == Some(stem.as_str()) {
                 return Some(path);
             }
         }
@@ -2741,8 +2741,22 @@ fn serialize_avatar(source: &str, avatar: Option<&str>) -> (String, Option<Strin
     (avatar_type.to_string(), Some(value.to_string()))
 }
 
-fn looks_like_avatar_asset(value: &str) -> bool {
-    value.contains('/') || (std::path::Path::new(value).extension().is_some() && !value.starts_with('.'))
+pub(crate) fn looks_like_avatar_asset(value: &str) -> bool {
+    value.contains('/')
+        || value.contains('\\')
+        || value.starts_with("file:")
+        || (std::path::Path::new(value).extension().is_some() && !value.starts_with('.'))
+}
+
+pub(crate) fn is_safe_untrusted_avatar(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return true;
+    }
+    if !looks_like_avatar_asset(v) {
+        return true;
+    }
+    parse_assistant_avatar_route(v).is_some()
 }
 
 fn managed_user_avatar_value_from_path(path: &Path) -> Result<String, AssistantError> {
@@ -2786,7 +2800,7 @@ fn is_unsupported_direct_avatar_reference(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://") || value.starts_with("data:")
 }
 
-fn parse_assistant_avatar_route(value: &str) -> Option<String> {
+pub(crate) fn parse_assistant_avatar_route(value: &str) -> Option<String> {
     let prefix = "/api/assistants/";
     let suffix = "/avatar";
     let route_start = value.find(prefix)?;
@@ -3419,12 +3433,23 @@ fn remove_assistant_md_files(dir: &Path, id: &str) -> bool {
     deleted
 }
 
+/// Where the avatar of `id` is stored. The id is untrusted (it comes from create/import
+/// requests), so it is percent-encoded into a single file name and the result must sit
+/// directly in `dir` (security candidate C1). Ordinary ids (`[A-Za-z0-9_-]`) are unchanged.
+fn avatar_destination(dir: &Path, id: &str, extension: &str) -> Result<PathBuf, AssistantError> {
+    let destination = dir.join(format!("{}.{extension}", encode_filename_component(id)));
+    if destination.parent() != Some(dir) {
+        return Err(AssistantError::BadRequest("invalid assistant id for an avatar".into()));
+    }
+    Ok(destination)
+}
+
 fn remove_assistant_avatar_files(dir: &Path, id: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
     let mut deleted = false;
-    let prefix = format!("{id}.");
+    let prefix = format!("{}.", encode_filename_component(id));
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -3510,6 +3535,63 @@ mod tests {
         );
     }
 
+    /// Security candidate C1: an assistant id is untrusted and must never steer where an
+    /// avatar is written; `../` and absolute ids stay inside the user's avatar directory.
+    #[tokio::test]
+    async fn avatar_writes_stay_inside_the_avatar_dir_whatever_the_id() {
+        let data = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let svc = test_service_with_data_dir(data.path()).await;
+        let dir = svc.user_avatars_dir_for_user("system_default_user");
+        let source = data.path().join("source.png");
+        std::fs::write(&source, b"png").unwrap();
+        let victim = outside.path().join("victim");
+        for id in ["../../escaped", "../../../../escaped", victim.to_str().unwrap()] {
+            svc.persist_user_avatar_bytes("system_default_user", id, b"bytes", Some("jpg"))
+                .unwrap();
+            svc.persist_user_avatar_file("system_default_user", id, &source)
+                .unwrap();
+        }
+        assert!(!outside.path().join("victim.jpg").exists() && !outside.path().join("victim.png").exists());
+        assert!(
+            !data.path().join("escaped.jpg").exists() && !data.path().join("assistant-avatars/escaped.jpg").exists()
+        );
+        for entry in walk(data.path()) {
+            let name = entry.file_name().unwrap().to_string_lossy().into_owned();
+            if name.ends_with(".jpg") || (name.ends_with(".png") && name != "source.png") {
+                assert_eq!(
+                    entry.parent().unwrap(),
+                    dir,
+                    "{} escaped the avatar dir",
+                    entry.display()
+                );
+            }
+        }
+        // The stored avatar is found again under the same encoded name.
+        assert!(
+            svc.find_existing_user_avatar_file("system_default_user", "../../escaped")
+                .is_some()
+        );
+        // A normal id keeps its plain file name.
+        let plain = svc
+            .persist_user_avatar_bytes("system_default_user", "custom-1", b"b", Some("jpg"))
+            .unwrap();
+        assert!(plain.ends_with("custom-1.jpg"), "{plain}");
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
     #[tokio::test]
     async fn avatar_dir_is_per_user() {
         let svc = test_service_with_data_dir(std::path::Path::new("/data")).await;
@@ -3521,6 +3603,49 @@ mod tests {
             svc.user_avatars_dir_for_user("system_default_user"),
             std::path::Path::new("/data/assistant-avatars/users/system_default_user")
         );
+    }
+
+    #[test]
+    fn safe_untrusted_avatar_lexical_classification() {
+        // Safe: empty / null / whitespace
+        assert!(is_safe_untrusted_avatar(""));
+        assert!(is_safe_untrusted_avatar("   "));
+
+        // Safe: unicode emojis and plain non-path strings
+        assert!(is_safe_untrusted_avatar("🤖"));
+        assert!(is_safe_untrusted_avatar("🎨"));
+        assert!(is_safe_untrusted_avatar("👨‍👩‍👧‍👦"));
+        assert!(is_safe_untrusted_avatar("Assistant Name"));
+
+        // Safe: assistant avatar routes (builtin / user asset refs)
+        assert!(is_safe_untrusted_avatar("/api/assistants/custom-1/avatar"));
+        assert!(is_safe_untrusted_avatar("/api/assistants/custom-1/avatar?v=2"));
+        assert!(is_safe_untrusted_avatar(
+            "http://localhost:25818/api/assistants/custom-1/avatar"
+        ));
+
+        // Unsafe / Host-file candidates: absolute paths
+        assert!(!is_safe_untrusted_avatar("/etc/passwd"));
+        assert!(!is_safe_untrusted_avatar("/var/folders/pic.png"));
+
+        // Unsafe / Host-file candidates: file:// URIs
+        assert!(!is_safe_untrusted_avatar("file:///path/to/image.png"));
+        assert!(!is_safe_untrusted_avatar("file://image.png"));
+
+        // Unsafe / Host-file candidates: relative paths
+        assert!(!is_safe_untrusted_avatar("image.png"));
+        assert!(!is_safe_untrusted_avatar("sub/image.png"));
+        assert!(!is_safe_untrusted_avatar("./image.png"));
+        assert!(!is_safe_untrusted_avatar("symlink.png"));
+
+        // Unsafe / Host-file candidates: windows paths
+        assert!(!is_safe_untrusted_avatar("C:\\Windows\\System32\\calc.exe"));
+        assert!(!is_safe_untrusted_avatar("relative\\image.png"));
+
+        // Unsafe / external URLs
+        assert!(!is_safe_untrusted_avatar("http://evil.com/pic.png"));
+        assert!(!is_safe_untrusted_avatar("https://evil.com/pic.png"));
+        assert!(!is_safe_untrusted_avatar("data:image/png;base64,xxxx"));
     }
 
     #[tokio::test]

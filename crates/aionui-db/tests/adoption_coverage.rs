@@ -21,6 +21,7 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     ("acp_session", "conversation_id", "conversations"),
     ("conversation_artifacts", "conversation_id", "conversations"),
     ("conversation_assistant_snapshots", "conversation_id", "conversations"),
+    ("conversation_file_refs", "conversation_id", "conversations"),
     // `cron_job_runs.owner_id` is the scheduler's run-lease holder, NOT a
     // user reference — ownership flows from `job_id`.
     ("cron_job_runs", "job_id", "cron_jobs"),

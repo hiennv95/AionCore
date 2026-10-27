@@ -24,6 +24,10 @@ use tracing::{debug, info, warn};
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
 
+/// Hooks told about files a finished tool call reported writing (ADR-017), shared
+/// between `ConversationService` and its relays.
+pub type FilesReportedHooks = Arc<std::sync::RwLock<Vec<Arc<dyn aionui_common::OnFilesReported>>>>;
+
 /// Running totals for tips that supersede themselves, kept for the whole turn.
 ///
 /// A superseding tip is one card the user watches update — codex's retry card
@@ -173,6 +177,7 @@ pub struct StreamRelay {
     complete_turn: bool,
     defer_clean_terminal_errors: bool,
     superseding_tips: SupersedingTipTotals,
+    files_reported_hooks: Option<FilesReportedHooks>,
 }
 
 impl StreamRelay {
@@ -206,7 +211,32 @@ impl StreamRelay {
             complete_turn: true,
             defer_clean_terminal_errors: false,
             superseding_tips: SupersedingTipTotals::default(),
+            files_reported_hooks: None,
         }
+    }
+
+    pub fn with_files_reported_hooks(mut self, hooks: FilesReportedHooks) -> Self {
+        self.files_reported_hooks = Some(hooks);
+        self
+    }
+
+    /// Hand reported files to the hooks off the relay's path: minting touches the
+    /// file system and the database, and must never stall the stream.
+    fn notify_files_reported(&self, data: &aionui_ai_agent::protocol::events::FilesReportedData) {
+        let Some(hooks) = self.files_reported_hooks.as_ref() else {
+            return;
+        };
+        let hooks: Vec<_> = hooks.read().map(|guard| guard.clone()).unwrap_or_default();
+        if hooks.is_empty() {
+            return;
+        }
+        let (user_id, conversation_id, data) = (self.user_id.clone(), self.conversation_id.clone(), data.clone());
+        tokio::spawn(async move {
+            for hook in hooks {
+                hook.on_files_reported(&user_id, &conversation_id, &data.call_id, &data.paths)
+                    .await;
+            }
+        });
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
@@ -387,6 +417,10 @@ impl StreamRelay {
                             // empty-turn judgment, never rendered. Explicitly dropped here so
                             // the catch-all below does not forward it to the WebSocket, and
                             // it is never persisted.
+                        }
+                        AgentStreamEvent::FilesReported(data) => {
+                            // Internal-only (host paths): never forwarded, never persisted.
+                            self.notify_files_reported(data);
                         }
                         AgentStreamEvent::BackendTurnBound(backend_turn_id) => {
                             // Internal-only fork anchor (codex Turn.id): stamp it on the
@@ -819,6 +853,7 @@ impl StreamRelay {
             AgentStreamEvent::SessionAssigned(_) => "SessionAssigned",
             AgentStreamEvent::SegmentBreak => "SegmentBreak",
             AgentStreamEvent::BackendTurnBound(_) => "BackendTurnBound",
+            AgentStreamEvent::FilesReported(_) => "FilesReported",
             AgentStreamEvent::WorkflowProgress(_) => "WorkflowProgress",
             AgentStreamEvent::AcpDialectSignal(_) => "AcpDialectSignal",
             AgentStreamEvent::MessageLifecycle(_) => "MessageLifecycle",
@@ -1641,6 +1676,77 @@ mod tests {
             repo.take_inserts().is_empty(),
             "AcpDialectSignal must not be persisted as a message"
         );
+    }
+
+    /// Preview refs (ADR-017): reported files reach the hooks with the relay's
+    /// user and conversation, and the host paths never reach the WS or a row.
+    #[tokio::test]
+    async fn files_reported_reach_the_hooks_and_nothing_else() {
+        use aionui_ai_agent::protocol::events::FilesReportedData;
+
+        /// (user, conversation, call, paths) per hook call.
+        type Report = (String, String, String, Vec<String>);
+        #[derive(Default)]
+        struct Seen(std::sync::Mutex<Vec<Report>>);
+        #[async_trait::async_trait]
+        impl aionui_common::OnFilesReported for Seen {
+            async fn on_files_reported(&self, user_id: &str, conversation_id: &str, call_id: &str, paths: &[String]) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((user_id.into(), conversation_id.into(), call_id.into(), paths.to_vec()));
+            }
+        }
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, _) = broadcast::channel(64);
+        let seen = Arc::new(Seen::default());
+        let hooks: FilesReportedHooks = Default::default();
+        hooks.write().unwrap().push(seen.clone());
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        )
+        .with_files_reported_hooks(hooks);
+        let mut ws_rx = bus.subscribe();
+        let rx = tx.subscribe();
+
+        tx.send(AgentStreamEvent::FilesReported(FilesReportedData {
+            call_id: "call-1".into(),
+            paths: vec!["/secret/ws/a.md".into()],
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        relay.consume(rx).await;
+        for _ in 0..50 {
+            if !seen.0.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            seen.0.lock().unwrap().as_slice(),
+            &[(
+                "user-1".to_string(),
+                "conv-1".to_string(),
+                "call-1".to_string(),
+                vec!["/secret/ws/a.md".to_string()]
+            )]
+        );
+        while let Ok(evt) = ws_rx.try_recv() {
+            assert!(
+                !evt.data.to_string().contains("/secret/ws"),
+                "host path on the WS: {:?}",
+                evt.data
+            );
+        }
+        assert!(repo.take_inserts().is_empty(), "FilesReported must not be persisted");
     }
 
     #[tokio::test]

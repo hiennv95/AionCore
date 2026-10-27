@@ -1438,6 +1438,20 @@ async fn request_json(
             status = status.as_u16(),
             "config CLI backend returned error status"
         );
+        // A desktop-only refusal (e.g. MCP_DESKTOP_ONLY) is not a failure to retry: the
+        // owner has to make this change in the desktop app.
+        let host_code = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|body| body.get("code").and_then(Value::as_str).map(str::to_owned));
+        if let Some(code) = host_code.filter(|code| code.ends_with("_DESKTOP_ONLY")) {
+            return Err(ConfigError::new(
+                ConfigErrorCode::DesktopOnly,
+                command,
+                "only the owner can make this change, in the desktop app",
+            )
+            .field("path", path)
+            .field("host_code", code));
+        }
         return Err(ConfigError::new(
             ConfigErrorCode::HttpStatusError,
             command,
@@ -1707,6 +1721,7 @@ enum ConfigErrorCode {
     PayloadInvalid,
     HttpRequestFailed,
     HttpStatusError,
+    DesktopOnly,
     ResponseReadFailed,
     ResponseJsonInvalid,
     StdoutWriteFailed,
@@ -1721,6 +1736,7 @@ impl ConfigErrorCode {
             Self::PayloadInvalid => "CONFIG_PAYLOAD_INVALID",
             Self::HttpRequestFailed => "CONFIG_HTTP_REQUEST_FAILED",
             Self::HttpStatusError => "CONFIG_HTTP_STATUS_ERROR",
+            Self::DesktopOnly => "CONFIG_DESKTOP_ONLY",
             Self::ResponseReadFailed => "CONFIG_RESPONSE_READ_FAILED",
             Self::ResponseJsonInvalid => "CONFIG_RESPONSE_JSON_INVALID",
             Self::StdoutWriteFailed => "CONFIG_STDOUT_WRITE_FAILED",
@@ -1732,7 +1748,7 @@ impl ConfigErrorCode {
             Self::EnvMissing | Self::ContextAssistantMissing | Self::PayloadMissing | Self::PayloadInvalid => {
                 ExitCode::from(2)
             }
-            Self::HttpRequestFailed | Self::HttpStatusError => ExitCode::from(3),
+            Self::HttpRequestFailed | Self::HttpStatusError | Self::DesktopOnly => ExitCode::from(3),
             Self::ResponseReadFailed | Self::ResponseJsonInvalid | Self::StdoutWriteFailed => ExitCode::from(1),
         }
     }

@@ -4,9 +4,11 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, Query, State};
+use axum::extract::{Extension, Json, Path, Query, Request, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post, put};
+use axum::middleware::{Next, from_fn};
+use axum::response::Response;
+use axum::routing::{MethodRouter, delete, get, patch, post, put};
 
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
@@ -17,7 +19,7 @@ use aionui_api_types::{
     TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
     TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentDevice, CurrentUser, is_paired_device};
 use aionui_common::ApiError;
 use aionui_db::{ActivityCursor, DbError, PageDirection};
 
@@ -176,57 +178,86 @@ impl From<TeamError> for ApiError {
     }
 }
 
+/// Paired phones and browsers may read teams and stop a run (ADR-020 T1, owner decision via
+/// Jev 037). Team members run their agents unattended in full-auto mode, so creating, changing,
+/// messaging or starting a team is for the desktop app; the agent helper keeps its access (T2).
+fn team_desktop_only_error() -> ApiError {
+    ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "TEAM_DESKTOP_ONLY",
+        "Teams are created and run from the desktop app; this device can view them and stop a run.",
+        None,
+    )
+}
+
+async fn team_desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
+    if is_paired_device(request.extensions().get::<CurrentDevice>()) {
+        return Err(team_desktop_only_error());
+    }
+    Ok(next.run(request).await)
+}
+
+fn desktop<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> MethodRouter<S> {
+    route.route_layer(from_fn(team_desktop_only))
+}
+
 pub fn team_routes(state: TeamRouterState) -> Router {
     Router::new()
-        .route("/api/teams", post(create_team).get(list_teams))
-        .route("/api/teams/{id}", get(get_team).delete(remove_team))
+        .route("/api/teams", get(list_teams).merge(desktop(post(create_team))))
+        .route("/api/teams/{id}", get(get_team).merge(desktop(delete(remove_team))))
         .route("/api/teams/{id}/run-state", get(get_run_state))
         .route("/api/teams/{id}/mailbox", get(list_mailbox))
         .route("/api/teams/{id}/tasks", get(list_tasks))
         .route("/api/teams/{id}/activity", get(list_activity))
-        .route("/api/teams/{id}/name", axum::routing::patch(rename_team))
-        .route("/api/teams/{id}/agents", post(add_agent))
-        .route("/api/teams/{id}/agents/{slot_id}", axum::routing::delete(remove_agent))
-        .route(
-            "/api/teams/{id}/agents/{slot_id}/name",
-            axum::routing::patch(rename_agent),
-        )
+        .route("/api/teams/{id}/name", desktop(patch(rename_team)))
+        .route("/api/teams/{id}/agents", desktop(post(add_agent)))
+        .route("/api/teams/{id}/agents/{slot_id}", desktop(delete(remove_agent)))
+        .route("/api/teams/{id}/agents/{slot_id}/name", desktop(patch(rename_agent)))
         .route(
             "/api/teams/{id}/agents/{slot_id}/model",
-            axum::routing::patch(update_agent_model),
+            desktop(patch(update_agent_model)),
         )
-        .route("/api/teams/{id}/messages", post(send_message))
-        .route("/api/teams/{id}/agents/{slot_id}/messages", post(send_message_to_agent))
-        .route("/api/teams/{id}/agents/{slot_id}/interrupt", post(interrupt_agent))
-        .route("/api/teams/{id}/agents/{slot_id}/attach", post(attach_agent))
+        .route("/api/teams/{id}/messages", desktop(post(send_message)))
+        .route(
+            "/api/teams/{id}/agents/{slot_id}/messages",
+            desktop(post(send_message_to_agent)),
+        )
+        .route(
+            "/api/teams/{id}/agents/{slot_id}/interrupt",
+            desktop(post(interrupt_agent)),
+        )
+        .route("/api/teams/{id}/agents/{slot_id}/attach", desktop(post(attach_agent)))
         .route(
             "/api/teams/{id}/agents/{slot_id}/runtime/restart",
-            post(restart_agent_runtime),
+            desktop(post(restart_agent_runtime)),
         )
         .route(
             "/api/teams/{id}/agents/{slot_id}/context/reset",
-            post(reset_agent_context),
+            desktop(post(reset_agent_context)),
         )
         .route(
             "/api/teams/{id}/conversations/{conversation_id}/config-options",
-            get(get_conversation_config_options),
+            desktop(get(get_conversation_config_options)),
         )
         .route(
             "/api/teams/{id}/conversations/{conversation_id}/config-options/{option_id}",
-            put(set_conversation_config_option),
+            desktop(put(set_conversation_config_option)),
         )
         .route("/api/teams/{id}/runs/{team_run_id}/cancel", post(cancel_run))
         .route(
             "/api/teams/{id}/runs/{team_run_id}/agents/{slot_id}/cancel",
-            post(cancel_child_turn),
+            desktop(post(cancel_child_turn)),
         )
         .route(
             "/api/teams/{id}/runs/{team_run_id}/agents/{slot_id}/pause",
-            post(pause_slot_work),
+            desktop(post(pause_slot_work)),
         )
-        .route("/api/teams/{id}/session", post(ensure_session).delete(stop_session))
-        .route("/api/teams/{id}/active-lease", post(active_lease))
-        .route("/api/teams/{id}/session-mode", post(set_session_mode))
+        .route(
+            "/api/teams/{id}/session",
+            desktop(post(ensure_session).delete(stop_session)),
+        )
+        .route("/api/teams/{id}/active-lease", desktop(post(active_lease)))
+        .route("/api/teams/{id}/session-mode", desktop(post(set_session_mode)))
         .with_state(state)
 }
 

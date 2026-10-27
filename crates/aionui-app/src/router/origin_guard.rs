@@ -68,6 +68,19 @@ impl AllowedOrigins {
         }
     }
 
+    /// The default for a non-local host started without `--allowed-origin` (C4, Jev 045):
+    /// only this machine's loopback origins on the bound port, as the AionX launchers pass.
+    pub fn bound_loopback(port: u16) -> Self {
+        let origins = ["127.0.0.1", "localhost", "[::1]"]
+            .iter()
+            .filter_map(|host| normalize_origin(&format!("http://{host}:{port}")))
+            .collect();
+        Self {
+            origins: Arc::new(origins),
+            any_loopback: false,
+        }
+    }
+
     /// Whether the raw `Origin` header value is allowlisted.
     pub fn allows(&self, origin: &str) -> bool {
         normalize_origin(origin)
@@ -143,6 +156,24 @@ mod tests {
     use tower_http::cors::{AllowOrigin, CorsLayer};
 
     const HOST: &str = "http://127.0.0.1:25818";
+
+    /// C4 (Jev 045): the default for a non-local host without `--allowed-origin`.
+    #[test]
+    fn bound_loopback_policy_allows_only_this_port() {
+        let allowed = AllowedOrigins::bound_loopback(25818);
+        for ok in ["http://127.0.0.1:25818", "http://localhost:25818", "http://[::1]:25818"] {
+            assert!(allowed.allows(ok), "{ok}");
+        }
+        for bad in [
+            "http://127.0.0.1:9",
+            "http://localhost:5173",
+            "https://127.0.0.1:25818",
+            "https://evil.example",
+            "null",
+        ] {
+            assert!(!allowed.allows(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn loopback_policy_allows_this_machine_on_any_port_only() {

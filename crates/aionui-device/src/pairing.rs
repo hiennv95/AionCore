@@ -66,11 +66,40 @@ pub struct PresentedPairing {
 #[derive(Default)]
 pub struct PairingBook {
     pairings: HashMap<String, Pairing>,
+    /// Device ids of approved pairings that expired unclaimed, still to be revoked.
+    pending_revocations: Vec<String>,
 }
 
 impl PairingBook {
-    /// Drop pairings that ended or expired more than one TTL ago.
+    /// Prunes expired pairings and returns the device ids still to be revoked: approved
+    /// pairings that expired unclaimed, plus earlier ids whose revocation failed.
+    pub fn prune_unclaimed_approved(&mut self, now: i64) -> Vec<String> {
+        self.prune(now);
+        std::mem::take(&mut self.pending_revocations)
+    }
+
+    /// Re-queues device ids whose revocation failed, for the next prune.
+    pub fn queue_failed_revocations(&mut self, device_ids: Vec<String>) {
+        for id in device_ids {
+            if !self.pending_revocations.contains(&id) {
+                self.pending_revocations.push(id);
+            }
+        }
+    }
+
+    /// Drop pairings that ended or expired more than one TTL ago. An approved pairing
+    /// that expired unclaimed gives up its session, and its device id is queued for
+    /// revocation; claimed and rejected pairings keep their state.
     fn prune(&mut self, now: i64) {
+        for p in self.pairings.values_mut() {
+            if now >= p.expires_at()
+                && p.state == PairingState::Approved
+                && let Some(session) = p.session.take()
+                && !self.pending_revocations.contains(&session.device_id)
+            {
+                self.pending_revocations.push(session.device_id);
+            }
+        }
         self.pairings.retain(|_, p| now < p.expires_at() + PAIRING_TTL_MS);
     }
 
@@ -190,6 +219,10 @@ impl PairingBook {
             PairingState::Claimed => Err(DeviceError::PairingUsed),
             PairingState::Approved => {
                 let pairing = self.pairings.get_mut(id).ok_or(DeviceError::PairingNotFound)?;
+                // Its session went to revocation when a prune found it expired.
+                if pairing.session.is_none() {
+                    return Err(DeviceError::PairingExpired);
+                }
                 pairing.state = PairingState::Claimed;
                 Ok((PairingState::Claimed, pairing.session.take()))
             }
@@ -302,5 +335,68 @@ mod tests {
         assert!(matches!(book.open(0), Err(DeviceError::PairingLimit)));
         // Once they expire, new ones can be opened again.
         assert!(book.open(PAIRING_TTL_MS).is_ok());
+    }
+
+    /// Pruning only collects approved-but-unclaimed sessions; it must not rewrite
+    /// the terminal state of claimed or rejected pairings (a repeated claim stays
+    /// "used", not "expired").
+    #[test]
+    fn prune_keeps_terminal_states() {
+        let mut book = PairingBook::default();
+        let o1 = book.open(0).unwrap();
+        let claimed = book.present(&o1.secret, "Claimed", DeviceKind::Mobile, 1).unwrap();
+        book.approve(&claimed.id, session(), 2).unwrap();
+        book.claim(&claimed.id, &claimed.claim_token, 3).unwrap();
+        let o2 = book.open(0).unwrap();
+        let rejected = book.present(&o2.secret, "Rejected", DeviceKind::Mobile, 1).unwrap();
+        book.reject(&rejected.id, 2).unwrap();
+
+        assert!(book.prune_unclaimed_approved(PAIRING_TTL_MS).is_empty());
+        assert_eq!(
+            book.view(&claimed.id, PAIRING_TTL_MS).unwrap().state,
+            PairingState::Claimed
+        );
+        assert_eq!(
+            book.view(&rejected.id, PAIRING_TTL_MS).unwrap().state,
+            PairingState::Rejected
+        );
+        assert!(matches!(
+            book.claim(&claimed.id, &claimed.claim_token, PAIRING_TTL_MS),
+            Err(DeviceError::PairingUsed)
+        ));
+        assert!(matches!(
+            book.claim(&rejected.id, &rejected.claim_token, PAIRING_TTL_MS),
+            Err(DeviceError::PairingRejected)
+        ));
+    }
+
+    #[test]
+    fn prune_unclaimed_approved_extracts_orphan_devices_and_preserves_claimed() {
+        let mut book = PairingBook::default();
+        // 1. Unclaimed approved pairing
+        let open1 = book.open(0).unwrap();
+        let p1 = book.present(&open1.secret, "Orphan", DeviceKind::Mobile, 1).unwrap();
+        book.approve(&p1.id, session(), 2).unwrap();
+
+        // 2. Claimed approved pairing
+        let open2 = book.open(0).unwrap();
+        let p2 = book.present(&open2.secret, "Claimed", DeviceKind::Mobile, 1).unwrap();
+        book.approve(&p2.id, session(), 2).unwrap();
+        let _ = book.claim(&p2.id, &p2.claim_token, 3).unwrap();
+
+        // Before expiration: no orphans
+        assert!(book.prune_unclaimed_approved(PAIRING_TTL_MS - 1).is_empty());
+
+        // At expiration: orphan device id extracted, claimed device is not
+        let orphans = book.prune_unclaimed_approved(PAIRING_TTL_MS);
+        assert_eq!(orphans, vec!["dev_1"]);
+
+        // Calling again does not re-extract the same orphan
+        assert!(book.prune_unclaimed_approved(PAIRING_TTL_MS).is_empty());
+
+        // Retry queue retains failed revocations
+        book.queue_failed_revocations(vec!["dev_failed".into()]);
+        let retried = book.prune_unclaimed_approved(PAIRING_TTL_MS);
+        assert_eq!(retried, vec!["dev_failed"]);
     }
 }

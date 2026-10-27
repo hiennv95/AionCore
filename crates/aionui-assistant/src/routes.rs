@@ -14,7 +14,7 @@ use aionui_api_types::{
     ApiResponse, AssistantDetailResponse, AssistantResponse, CreateAssistantRequest, ImportAssistantsRequest,
     ImportAssistantsResult, SetAssistantStateRequest, UpdateAssistantRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device};
 use aionui_common::ApiError;
 
 use crate::error::AssistantError;
@@ -52,6 +52,26 @@ impl From<AssistantError> for ApiError {
     }
 }
 
+fn fs_owner_only() -> ApiError {
+    ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "FS_OWNER_ONLY",
+        "Only the desktop app can use the host filesystem.",
+        None,
+    )
+}
+
+fn requires_desktop_fs_avatar(avatar: Option<&str>) -> bool {
+    avatar
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .is_some_and(|v| !crate::service::is_safe_untrusted_avatar(v))
+}
+
+fn is_desktop_fs_caller(device: Option<&CurrentDevice>, helper: Option<&RuntimeHelperCaller>) -> bool {
+    helper.is_none() && !is_paired_device(device)
+}
+
 async fn list(
     State(state): State<AssistantRouterState>,
     Extension(current_user): Extension<CurrentUser>,
@@ -63,9 +83,19 @@ async fn list(
 async fn create(
     State(state): State<AssistantRouterState>,
     Extension(current_user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     body: Result<Json<CreateAssistantRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AssistantResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if requires_desktop_fs_avatar(req.avatar.as_deref())
+        && !is_desktop_fs_caller(
+            device.as_ref().map(|Extension(d)| d),
+            helper.as_ref().map(|Extension(h)| h),
+        )
+    {
+        return Err(fs_owner_only());
+    }
     let created = state.service.create_for_user(&current_user.id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
 }
@@ -86,10 +116,20 @@ async fn get_one(
 async fn update(
     State(state): State<AssistantRouterState>,
     Extension(current_user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateAssistantRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<AssistantResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if requires_desktop_fs_avatar(req.avatar.as_deref())
+        && !is_desktop_fs_caller(
+            device.as_ref().map(|Extension(d)| d),
+            helper.as_ref().map(|Extension(h)| h),
+        )
+    {
+        return Err(fs_owner_only());
+    }
     let updated = state.service.update_for_user(&current_user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(updated)))
 }
@@ -117,9 +157,23 @@ async fn set_state(
 async fn import(
     State(state): State<AssistantRouterState>,
     Extension(current_user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     body: Result<Json<ImportAssistantsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportAssistantsResult>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    let has_fs_avatar = req
+        .assistants
+        .iter()
+        .any(|a| requires_desktop_fs_avatar(a.avatar.as_deref()));
+    if has_fs_avatar
+        && !is_desktop_fs_caller(
+            device.as_ref().map(|Extension(d)| d),
+            helper.as_ref().map(|Extension(h)| h),
+        )
+    {
+        return Err(fs_owner_only());
+    }
     let result = state.service.import_for_user(&current_user.id, req).await?;
     Ok(Json(ApiResponse::ok(result)))
 }

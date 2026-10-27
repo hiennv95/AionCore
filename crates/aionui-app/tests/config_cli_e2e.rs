@@ -170,6 +170,21 @@ async fn fake_mcp_server_update(
     }))
 }
 
+async fn fake_mcp_server_list_empty() -> axum::Json<serde_json::Value> {
+    axum::Json(json!({ "success": true, "data": [] }))
+}
+
+async fn fake_mcp_server_create_refused() -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(json!({
+            "success": false,
+            "error": "MCP servers are managed and tested from the desktop app; this device can view them.",
+            "code": "MCP_DESKTOP_ONLY"
+        })),
+    )
+}
+
 async fn fake_mcp_oauth_check_status(
     axum::Json(payload): axum::Json<serde_json::Value>,
 ) -> axum::Json<serde_json::Value> {
@@ -373,6 +388,10 @@ async fn spawn_config_probe_server(capture: SharedCapture) -> (String, tokio::ta
             put(fake_conversation_cron_update),
         )
         .route(
+            "/api/mcp/servers",
+            get(fake_mcp_server_list_empty).post(fake_mcp_server_create_refused),
+        )
+        .route(
             "/api/mcp/servers/{server_id}",
             get(fake_mcp_server_get).put(fake_mcp_server_update),
         )
@@ -440,6 +459,72 @@ async fn config_mcp_oauth_logout_reads_status_before_and_after_write() {
     let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(stdout["meta"]["before"]["authenticated"], true);
     assert_eq!(stdout["meta"]["after"]["authenticated"], true);
+}
+
+/// Cross-review F1 (Jev 046): MCP changes are desktop-only for the helper. A refusal
+/// is reported as such, with the host's code, so the agent can tell the owner.
+#[tokio::test]
+async fn config_mcp_change_refused_by_the_host_says_desktop_only() {
+    let capture = Arc::new(Mutex::new(None));
+    let (base_url, handle) = spawn_config_probe_server(capture).await;
+    let mut child = config_command()
+        .args(["mcp", "servers", "create"])
+        .env("AIONUI_BASE_URL", &base_url)
+        .env("AIONUI_CONVERSATION_ID", "conv-mcp")
+        .env("AIONUI_USER_ID", "user-mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(br#"{ "name": "x", "transport": { "type": "stdio", "command": "echo" } }"#)
+        .await
+        .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().await.unwrap();
+    handle.abort();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("CONFIG_DESKTOP_ONLY"), "{stderr}");
+    assert!(stderr.contains("MCP_DESKTOP_ONLY"), "{stderr}");
+    assert!(stderr.to_lowercase().contains("desktop app"), "{stderr}");
+}
+
+#[tokio::test]
+async fn config_capabilities_advertise_only_what_the_helper_may_do_with_mcp() {
+    let output = config_command()
+        .arg("capabilities")
+        .env_remove("AIONUI_BASE_URL")
+        .env_remove("AIONUI_CONVERSATION_ID")
+        .env_remove("AIONUI_USER_ID")
+        .output()
+        .await
+        .unwrap();
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let advertised: Vec<String> = stdout["data"]["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|domain| domain["commands"].as_array().into_iter().flatten())
+        .filter_map(|command| command["command"].as_str().map(str::to_owned))
+        .filter(|command| command.starts_with("config mcp"))
+        .collect();
+    assert_eq!(
+        advertised,
+        vec![
+            "config mcp servers list",
+            "config mcp servers get",
+            "config mcp oauth check-status",
+            "config mcp oauth authenticated"
+        ]
+    );
+    let desktop_only = stdout["data"]["safety"]["desktop_only"].to_string();
+    assert!(desktop_only.contains("MCP"), "{desktop_only}");
 }
 
 #[tokio::test]
@@ -1096,6 +1181,15 @@ fn builtin_config_skills_use_config_cli_not_python_or_cron_helper() {
     }
     assert!(aionui_config.contains("\"$AIONUI_HELPER_BIN\" config context"));
     assert!(aionui_config.contains("\"$AIONUI_HELPER_BIN\" config capabilities"));
+    // MCP changes are desktop-only for agents (Jev 046): the skill must not teach them.
+    for refused in [
+        "config mcp servers create",
+        "config mcp servers update",
+        "config mcp test-connection",
+    ] {
+        assert!(!aionui_config.contains(refused), "skill still teaches {refused}");
+    }
+    assert!(aionui_config.contains("CONFIG_DESKTOP_ONLY"));
     assert!(aionui_config.contains("assistant_id\": \"current"));
     for command in [
         "\"$AIONUI_HELPER_BIN\" config mcp servers",

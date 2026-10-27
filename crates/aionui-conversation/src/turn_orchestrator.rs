@@ -297,7 +297,8 @@ impl ConversationTurnOrchestrator {
             // A replay spawns a fresh CLI whose own retry counter starts at one,
             // but from the user's side it is still the same stalled prompt and
             // the same card counting up — so these totals span the attempts.
-            .with_superseding_tip_totals(input.superseding_tips.clone());
+            .with_superseding_tip_totals(input.superseding_tips.clone())
+            .with_files_reported_hooks(self.service.files_reported_hooks());
 
             let rx = agent.subscribe();
             if let Some(mode) = input

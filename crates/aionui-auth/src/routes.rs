@@ -25,12 +25,14 @@ use aionui_db::{DbError, IDeviceRepository, IUserRepository, UserStatus, UserTyp
 
 use crate::error::AuthError;
 use crate::extract::{extract_cookie_value, extract_token_from_headers};
+use crate::jwt::TokenType;
 use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
 use crate::qr_token::QrTokenStore;
 use crate::rate_limit::{
     RateLimiter, api_rate_limit_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
 };
+use crate::rotation::RotateError;
 use crate::service::{AuthProvisionService, ProvisionError};
 use crate::singleflight::{RefreshCoalescer, RefreshError, RefreshedTokens};
 use crate::validation::{validate_password, validate_username};
@@ -66,6 +68,12 @@ impl From<RefreshError> for ApiError {
                 None,
             ),
             RefreshError::UserContextRequired => user_context_required(),
+            RefreshError::Replayed => ApiError::coded(
+                axum::http::StatusCode::UNAUTHORIZED,
+                "REFRESH_TOKEN_REUSED",
+                "This session was signed out because an old sign-in token was used again.",
+                None,
+            ),
             RefreshError::Internal(msg) => ApiError::Internal(msg.into()),
         }
     }
@@ -528,21 +536,15 @@ async fn login_handler(
 /// Sign access + refresh tokens for `user` and return the login response with
 /// both cookies.
 async fn issue_session(state: &AuthRouterState, user: User) -> Result<Response, ApiError> {
-    let token = state
+    let (token, refresh_token) = state
         .jwt_service
-        .sign_with_session_generation(
+        .issue_session_pair(
             &user.id,
             user.username.as_deref().unwrap_or("external_user"),
             user.session_generation,
+            None,
         )
-        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
-    let refresh_token = state
-        .jwt_service
-        .sign_refresh(
-            &user.id,
-            user.username.as_deref().unwrap_or("external_user"),
-            user.session_generation,
-        )
+        .await
         .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
 
     // Update last login (best-effort)
@@ -937,18 +939,43 @@ async fn refresh_tokens(
     }
 
     // The renewed pair stays bound to the same device (or to none).
-    let (access, refresh) = state
-        .jwt_service
-        .sign_session_pair(
-            &user.id,
-            user.username.as_deref().unwrap_or("external_user"),
-            user.session_generation,
-            payload.device_id.as_deref(),
-        )
-        .map_err(|e| {
-            tracing::error!(error = %e, "refresh token signing failed");
-            RefreshError::Internal("Token signing error")
-        })?;
+    let username = user.username.as_deref().unwrap_or("external_user");
+    let rotated = match (payload.token_type, &payload.jti, &payload.grant_id) {
+        // Grant-bound refresh token (ADR-022): rotate, or answer inside the grace.
+        (TokenType::Refresh, Some(_), Some(_)) => state
+            .jwt_service
+            .rotate_refresh(&payload, username, user.session_generation)
+            .await
+            .map_err(|e| match e {
+                RotateError::Replayed => RefreshError::Replayed,
+                RotateError::Invalid => RefreshError::Unauthorized("Invalid authentication session"),
+                RotateError::Internal(e) => {
+                    tracing::error!(error = %e, "refresh grant rotation failed");
+                    RefreshError::Internal("Authentication service unavailable")
+                }
+            }),
+        // Half a grant binding is malformed: never treat it as a legacy token.
+        (TokenType::Refresh, Some(_), None) | (TokenType::Refresh, None, Some(_)) => {
+            Err(RefreshError::Unauthorized("Invalid or expired token"))
+        }
+        // A refresh token from before rotation, or an access token on the lenient
+        // body path: keeps its original checks above and starts a new, independent
+        // grant. The presented token itself is not tracked and stays usable until it expires.
+        _ => state
+            .jwt_service
+            .issue_session_pair(
+                &user.id,
+                username,
+                user.session_generation,
+                payload.device_id.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "refresh token signing failed");
+                RefreshError::Internal("Token signing error")
+            }),
+    };
+    let (access, refresh) = rotated?;
 
     Ok(RefreshedTokens { access, refresh })
 }

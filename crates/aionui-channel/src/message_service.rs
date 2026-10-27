@@ -244,6 +244,8 @@ impl ChannelMessageService {
             | AgentStreamEvent::SessionAssigned(_)
             | AgentStreamEvent::SegmentBreak
             | AgentStreamEvent::BackendTurnBound(_)
+            // Internal-only preview-ref signal carrying host paths.
+            | AgentStreamEvent::FilesReported(_)
             // A workflow progress refresh is a live re-render of a card in the
             // web UI; an IM transcript has no card to update, and streaming one
             // message per refresh would spam the channel.

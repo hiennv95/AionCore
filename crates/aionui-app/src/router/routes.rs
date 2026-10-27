@@ -35,6 +35,7 @@ use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
 use aionui_mcp::mcp_routes;
 use aionui_office::{office_proxy_routes, office_routes};
+use aionui_preview::preview_routes;
 use aionui_project::project_routes;
 use aionui_realtime::{NoopMessageRouter, WebSocketManager, WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
@@ -372,6 +373,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let cron_authenticated =
         cron_routes(states.cron).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // Preview routes (ADR-017) protected by auth middleware; reader rules are in the handlers
+    let preview_authenticated =
+        preview_routes(states.preview).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Office routes protected by auth middleware
     let office_authenticated =
         office_routes(states.office.clone()).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -447,6 +452,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(team_authenticated)
         .merge(cron_authenticated)
         .merge(office_authenticated)
+        .merge(preview_authenticated)
         .merge(shell_authenticated)
         .merge(assistant_authenticated)
         .merge(session_message_authenticated);

@@ -15,7 +15,8 @@ use tracing::{info, warn};
 
 use aionui_api_types::{RuntimeStatusScope, RuntimeStatusScopeKind};
 use aionui_app::{
-    AppConfig, AppServices, RouterBuildError, create_router_with_runtime, with_origin_guard, with_static_web_clients,
+    AllowedOrigins, AppConfig, AppServices, RouterBuildError, create_router_with_runtime, with_origin_guard,
+    with_static_web_clients,
 };
 use aionui_system::RuntimePrepareService;
 use aionui_team::TeamIdleCleanupCoordinator;
@@ -315,8 +316,15 @@ pub(crate) async fn run_server(
         warn!(%error, "device listener did not start");
     }
     // Outermost: must see every request before CORS, auth, WS upgrade or static files.
+    // Without an explicit list, a non-local host still only answers browsers on its own
+    // loopback origins (C4, Jev 045); local mode already guards inside the router.
     let router = match &env.allowed_origins {
         Some(allowed) => with_origin_guard(router, allowed.clone()),
+        None if !services.identity_mode.is_local() => {
+            let allowed = AllowedOrigins::bound_loopback(bound.addr.port());
+            info!(allowed_origins = ?allowed.sorted(), "startup: default browser origin allowlist (bound loopback)");
+            with_origin_guard(router, allowed)
+        }
         None => router,
     };
     info!(

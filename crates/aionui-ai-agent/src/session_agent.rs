@@ -25,7 +25,7 @@ use crate::agent_task::IAgentTask;
 use crate::error::AgentError;
 use crate::protocol::events::session_updates::AvailableCommandsEventData;
 use crate::protocol::events::session_updates::ThinkingEventData;
-use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+use crate::protocol::events::tool_call::{FilesReportedData, ToolCallEventData, ToolCallStatus};
 use crate::protocol::events::{
     AgentStreamEvent, FinishEventData, StartEventData, TextEventData, TipType, TipsEventData,
 };
@@ -4286,7 +4286,21 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             ..
         } => {
             let output = tool_result_text(&content);
-            vec![AgentStreamEvent::ToolCall(ToolCallEventData {
+            // Files a successful call wrote, for preview refs (ADR-017). Internal-only.
+            let paths: Vec<String> = content
+                .iter()
+                .filter_map(|part| match part {
+                    ToolResultContent::FilePath { path, .. } if !is_error => Some(path.clone()),
+                    _ => None,
+                })
+                .collect();
+            let files = (!paths.is_empty()).then(|| {
+                AgentStreamEvent::FilesReported(FilesReportedData {
+                    call_id: tool_use_id.clone(),
+                    paths,
+                })
+            });
+            std::iter::once(AgentStreamEvent::ToolCall(ToolCallEventData {
                 call_id: tool_use_id,
                 name: String::new(),
                 args: serde_json::Value::Null,
@@ -4299,7 +4313,9 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 output,
                 description: None,
                 parent_call_id: parent_tool_use_id,
-            })]
+            }))
+            .chain(files)
+            .collect()
         }
         SessionEvent::TurnResult {
             is_error,
@@ -5457,6 +5473,41 @@ mod translate_tests {
     use super::*;
     use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
     use aionui_session::PermissionKind;
+
+    /// Preview refs (ADR-017): a successful result's file paths ride an
+    /// internal `FilesReported` after the card frame; a failed one reports none.
+    #[test]
+    fn a_successful_tool_result_reports_its_files() {
+        let result = |is_error| SessionEvent::ToolResult {
+            tool_use_id: "call-1".into(),
+            is_error,
+            content: vec![
+                ToolResultContent::Text("done".into()),
+                ToolResultContent::FilePath {
+                    path: "/w/a.md".into(),
+                    mime: None,
+                    old_text: None,
+                    new_text: Some("# a\n".into()),
+                },
+            ],
+            parent_tool_use_id: None,
+        };
+        let events = translate_event(result(false), "conv-1", false);
+        assert!(matches!(events.first(), Some(AgentStreamEvent::ToolCall(_))));
+        match events.get(1) {
+            Some(AgentStreamEvent::FilesReported(data)) => {
+                assert_eq!(data.call_id, "call-1");
+                assert_eq!(data.paths, vec!["/w/a.md".to_string()]);
+            }
+            other => panic!("expected FilesReported, got {other:?}"),
+        }
+        assert!(
+            serde_json::to_value(&events[1]).is_err(),
+            "host paths must not serialize"
+        );
+        let failed = translate_event(result(true), "conv-1", false);
+        assert_eq!(failed.len(), 1, "a failed call reports no files: {failed:?}");
+    }
 
     fn usage_frame(total: u64, cost: Option<f64>, window: Option<u64>) -> serde_json::Value {
         let events = translate_event(

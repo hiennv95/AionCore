@@ -617,6 +617,14 @@ async fn only_the_desktop_app_uses_filesystem_routes_beyond_upload() {
             json!({"file_path": missing, "to": "markdown", "workspace": folder}),
         ),
         ("/api/excel-preview/start", json!({"file_path": missing})),
+        (
+            "/api/assistants",
+            json!({"name": "test", "agent_id": "632f31d2", "avatar": missing}),
+        ),
+        (
+            "/api/assistants/import",
+            json!({"assistants": [{"name": "test", "agent_id": "632f31d2", "avatar": missing}]}),
+        ),
     ];
     for (uri, body) in effects {
         let (status, code) = send(json_with_token("POST", uri, body.clone(), &phone, "c")).await;

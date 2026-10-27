@@ -30,8 +30,8 @@ use aionui_api_types::{
 use aionui_api_types::{ChatFileRef, SessionRef};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
-    OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
-    now_ms, validate_workspace_path_availability,
+    OnConversationTurnCancelled, OnFilesReported, PaginatedResult, TurnCancelCause, WorkspacePathValidationError,
+    generate_short_id, now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{
     AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
@@ -325,6 +325,9 @@ pub struct ConversationService {
     /// services can drop work aimed at this conversation. See
     /// `OnConversationTurnCancelled` for why only some branches fire.
     turn_cancelled_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationTurnCancelled>>>>,
+    /// Hooks told about files a finished tool call reported writing (preview
+    /// refs, ADR-017). Shared with every relay, so late registration still applies.
+    files_reported_hooks: crate::stream_relay::FilesReportedHooks,
     mcp_server_repo: Arc<RwLock<Option<Arc<dyn IMcpServerRepository>>>>,
     assistant_definition_repo: Arc<RwLock<Option<Arc<dyn IAssistantDefinitionRepository>>>>,
     assistant_state_repo: Arc<RwLock<Option<Arc<dyn IAssistantOverlayRepository>>>>,
@@ -413,6 +416,7 @@ impl ConversationService {
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
             turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
+            files_reported_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
             assistant_state_repo: Arc::new(RwLock::new(None)),
@@ -648,6 +652,17 @@ impl ConversationService {
         }
     }
 
+    /// Register a hook notified when a finished tool call reported files it wrote.
+    pub fn with_files_reported_hook(&self, hook: Arc<dyn OnFilesReported>) {
+        if let Ok(mut guard) = self.files_reported_hooks.write() {
+            guard.push(hook);
+        }
+    }
+
+    pub(crate) fn files_reported_hooks(&self) -> crate::stream_relay::FilesReportedHooks {
+        Arc::clone(&self.files_reported_hooks)
+    }
+
     /// Snapshot the hook list, then drop the guard before awaiting:
     /// `RwLockReadGuard` is not `Send`, so holding it across `.await` would
     /// make the caller's future non-`Send`. Same pattern as `delete()`.
@@ -716,6 +731,7 @@ impl ConversationService {
             runtime_state: Arc::clone(&self.runtime_state),
             title_only,
             pending_started_ttl: crate::background_stream::PENDING_STARTED_TTL,
+            files_reported_hooks: self.files_reported_hooks(),
         };
         let rx = agent.subscribe();
         let join = tokio::spawn(watcher.run(rx));

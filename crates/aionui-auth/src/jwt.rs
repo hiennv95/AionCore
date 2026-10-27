@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use aionui_common::constants::REFRESH_COOKIE_MAX_AGE_DAYS;
+
+use aionui_db::IRefreshGrantRepository;
 
 use crate::error::AuthError;
 
@@ -26,10 +28,11 @@ const ACCESS_TOKEN_EXPIRY: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// re-authenticating. Sliding: each refresh issues a fresh refresh token.
 /// Kept in sync with the refresh cookie's `Max-Age` so the token never outlives
 /// (or is outlived by) its container.
-const REFRESH_TOKEN_EXPIRY: Duration = Duration::from_secs(REFRESH_COOKIE_MAX_AGE_DAYS as u64 * 24 * 60 * 60);
+pub(crate) const REFRESH_TOKEN_EXPIRY: Duration =
+    Duration::from_secs(REFRESH_COOKIE_MAX_AGE_DAYS as u64 * 24 * 60 * 60);
 
 /// JWT issuer claim value.
-const JWT_ISSUER: &str = "aionui";
+pub(crate) const JWT_ISSUER: &str = "aionui";
 
 /// Clock-skew allowance on `exp`/`nbf`. The host signs and verifies its own
 /// tokens on one clock, so the library's 60 s default only stretched every
@@ -38,7 +41,7 @@ const JWT_ISSUER: &str = "aionui";
 const JWT_LEEWAY_SECS: u64 = 5;
 
 /// JWT audience claim value.
-const JWT_AUDIENCE: &str = "aionui-webui";
+pub(crate) const JWT_AUDIENCE: &str = "aionui-webui";
 
 /// Which credential role a token fills.
 ///
@@ -83,6 +86,12 @@ pub struct TokenPayload {
     /// that device is revoked. `None` for legacy username/password sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
+    /// Refresh tokens only: this token's id within its rotation grant (ADR-022).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
+    /// Refresh tokens only: the rotation grant (one per session) it belongs to.
+    #[serde(default, rename = "gid", skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
 }
 
 /// JWT service for signing, verification, and token blacklisting.
@@ -99,6 +108,10 @@ pub struct JwtService {
     /// When set, the refresh endpoint accepts only refresh tokens on every
     /// path (body included), never an access token. Set once at startup.
     strict_refresh: AtomicBool,
+    /// Rotation grants (ADR-022). In memory until the host sets its database store.
+    pub(crate) grants: RwLock<Arc<dyn IRefreshGrantRepository>>,
+    /// How long the previous refresh token of a grant still returns its successor.
+    pub(crate) refresh_grace_ms: AtomicU64,
 }
 
 impl JwtService {
@@ -111,6 +124,8 @@ impl JwtService {
             blacklist: DashMap::new(),
             access_ttl_secs: AtomicU64::new(ACCESS_TOKEN_EXPIRY.as_secs()),
             strict_refresh: AtomicBool::new(false),
+            grants: RwLock::new(Arc::new(crate::rotation::MemoryGrants::default())),
+            refresh_grace_ms: AtomicU64::new(crate::rotation::REFRESH_GRACE.as_millis() as u64),
         }
     }
 
@@ -229,19 +244,21 @@ impl JwtService {
             session_generation,
             token_type,
             device_id: device_id.map(str::to_owned),
+            jti: None,
+            grant_id: None,
         };
+        self.sign_payload(&claims)
+    }
 
+    /// Encode exactly these claims. Deterministic: the same claims and secret give the same token.
+    pub(crate) fn sign_payload(&self, claims: &TokenPayload) -> Result<String, AuthError> {
         let secret = self
             .secret
             .read()
             .map_err(|e| AuthError::TokenInvalid(format!("Secret lock poisoned: {e}")))?;
 
-        encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(secret.as_bytes()),
-        )
-        .map_err(|e| AuthError::TokenInvalid(format!("JWT encoding failed: {e}")))
+        encode(&Header::default(), claims, &EncodingKey::from_secret(secret.as_bytes()))
+            .map_err(|e| AuthError::TokenInvalid(format!("JWT encoding failed: {e}")))
     }
 
     /// Verify a JWT and return its payload.
@@ -417,7 +434,7 @@ pub fn generate_random_secret_string() -> String {
 }
 
 /// Current time in seconds since UNIX epoch.
-fn now_secs() -> Result<u64, AuthError> {
+pub(crate) fn now_secs() -> Result<u64, AuthError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -541,6 +558,8 @@ mod tests {
             session_generation: 0,
             token_type: TokenType::Access,
             device_id: Some("dev_1".into()),
+            jti: None,
+            grant_id: None,
         };
         let token = encode(
             &Header::default(),
@@ -589,6 +608,8 @@ mod tests {
             session_generation: 0,
             token_type: TokenType::Access,
             device_id: None,
+            jti: None,
+            grant_id: None,
         };
         let token = encode(
             &Header::default(),
@@ -616,6 +637,8 @@ mod tests {
             session_generation: 0,
             token_type: TokenType::Access,
             device_id: None,
+            jti: None,
+            grant_id: None,
         };
         let token = encode(
             &Header::default(),
@@ -700,6 +723,8 @@ mod tests {
             session_generation: 0,
             token_type: TokenType::Access,
             device_id: None,
+            jti: None,
+            grant_id: None,
         };
         let token = encode(
             &Header::default(),

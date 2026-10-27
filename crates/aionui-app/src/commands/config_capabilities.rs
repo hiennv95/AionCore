@@ -51,7 +51,10 @@ pub(crate) fn data() -> Value {
                 "agent env values",
                 "prompt and rule content outside explicit read commands"
             ],
-            "read_before_write": true
+            "read_before_write": true,
+            "desktop_only": [
+                "MCP server create, update, delete, toggle and import, connection tests, agent MCP config discovery, and MCP OAuth login/logout: the host refuses them from agents (CONFIG_DESKTOP_ONLY); ask the owner to make the change in the desktop app"
+            ]
         },
         "domains": [
             domain("core", &[
@@ -92,16 +95,7 @@ pub(crate) fn data() -> Value {
             domain("mcp", &[
                 no_input_redacted(&["mcp", "servers", "list"], "List MCP servers.", false, &["transport.headers", "transport.env"]),
                 stdin_redacted(&["mcp", "servers", "get"], "Read one MCP server.", &["server_id"], &[], false, false, &["transport.headers", "transport.env"]),
-                stdin_redacted(&["mcp", "servers", "create"], "Create an MCP server.", &["name", "transport"], &[], true, false, &["transport.headers", "transport.env"]),
-                stdin_redacted(&["mcp", "servers", "update"], "Update an MCP server.", &["server_id", "transport"], &[], true, false, &["transport.headers", "transport.env"]),
-                stdin_redacted(&["mcp", "servers", "delete"], "Delete an MCP server.", &["server_id"], &[], true, true, &["transport.headers", "transport.env"]),
-                stdin_redacted(&["mcp", "servers", "toggle"], "Toggle an MCP server.", &["server_id"], &[], true, false, &["transport.headers", "transport.env"]),
-                stdin_redacted(&["mcp", "servers", "import"], "Import MCP servers.", &["servers"], &[], true, false, &["transport.headers", "transport.env"]),
-                stdin_redacted(&["mcp", "test-connection"], "Test an MCP server configuration.", &["name", "transport"], &[], false, false, &["transport.headers", "transport.env"]),
-                no_input_redacted(&["mcp", "agent-configs"], "List agent MCP config state.", false, &["transport.headers", "transport.env"]),
                 stdin_redacted(&["mcp", "oauth", "check-status"], "Check MCP OAuth status.", &["server_url"], &[], false, false, &[]),
-                stdin_redacted(&["mcp", "oauth", "login"], "Start MCP OAuth login.", &["server_url"], &[], true, false, &[]),
-                stdin_redacted(&["mcp", "oauth", "logout"], "Logout MCP OAuth.", &["server_url"], &[], true, false, &[]),
                 no_input_redacted(&["mcp", "oauth", "authenticated"], "List authenticated MCP servers.", false, &[]),
             ]),
             domain("providers", &[

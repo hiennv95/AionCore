@@ -416,6 +416,7 @@ dependencies = [
  "aionui-network",
  "aionui-office",
  "aionui-peer",
+ "aionui-preview",
  "aionui-process",
  "aionui-project",
  "aionui-realtime",
@@ -520,6 +521,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "thiserror 2.0.18",
  "tokio",
  "tower",
@@ -662,6 +664,7 @@ dependencies = [
  "aionui-common",
  "aionui-db",
  "aionui-peer",
+ "async-trait",
  "axum",
  "getrandom 0.2.17",
  "hex",
@@ -840,6 +843,23 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
+ "tracing",
+]
+
+[[package]]
+name = "aionui-preview"
+version = "0.2.2"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "async-trait",
+ "axum",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

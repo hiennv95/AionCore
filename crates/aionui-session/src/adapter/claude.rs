@@ -67,6 +67,12 @@ pub struct ClaudeAdapter {
     /// the renderer append a nameless junk card. Cleared at each turn
     /// terminal, so it never grows across a session.
     todo_tool_use_ids: std::collections::HashSet<String>,
+    /// `file_path` of each open `Write` call by tool_use_id, so its successful
+    /// `tool_result` can report the file as `ToolResultContent::FilePath` (preview
+    /// refs, ADR-017). Shape verified: claude 2.1.308 `Write` input
+    /// `{file_path, content}` (aionx/contracts/fixtures/ws/claude-file-create.json).
+    /// `Edit` is not captured yet, so it reports nothing. Cleared at each turn terminal.
+    written_files: std::collections::HashMap<String, String>,
 }
 
 /// Per-message streaming state for `--include-partial-messages`. Reset on each
@@ -485,6 +491,11 @@ impl ClaudeAdapter {
                             continue;
                         }
 
+                        if raw_name == "Write"
+                            && let Some(path) = input.get("file_path").and_then(Value::as_str)
+                        {
+                            self.written_files.insert(tool_use_id.clone(), path.to_string());
+                        }
                         out.push(SessionEvent::ToolCall {
                             tool_use_id,
                             // Presentation only: a bare tool name ("Bash" × 73% of all
@@ -534,17 +545,27 @@ impl ClaudeAdapter {
                 if self.todo_tool_use_ids.remove(&tool_use_id) {
                     continue;
                 }
+                let is_error = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                // 009 R8: carry the tool OUTPUT the parser used to drop. claude's
+                // tool_result.content is polymorphic — a String (e.g. Bash stdout)
+                // or an Array of blocks (text / a base64 `image` block, e.g. a
+                // Read-tool image). A generated image is written to disk by the
+                // tool, so it surfaces only as text here (path in the text).
+                let mut content = parse_tool_result_content(b.get("content"));
+                if let Some(path) = self.written_files.remove(&tool_use_id).filter(|_| !is_error) {
+                    content.push(crate::event::ToolResultContent::FilePath {
+                        path,
+                        mime: None,
+                        old_text: None,
+                        new_text: None,
+                    });
+                }
                 out.push(SessionEvent::ToolResult {
                     tool_use_id,
                     // 009 R7/H3: the wire block carries is_error on a failed/rejected
                     // tool (default false = success). Carrying it keeps a red tool red.
-                    is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
-                    // 009 R8: carry the tool OUTPUT the parser used to drop. claude's
-                    // tool_result.content is polymorphic — a String (e.g. Bash stdout)
-                    // or an Array of blocks (text / a base64 `image` block, e.g. a
-                    // Read-tool image). A generated image is written to disk by the
-                    // tool, so it surfaces only as text here (path in the text).
-                    content: parse_tool_result_content(b.get("content")),
+                    is_error,
+                    content,
                     // 009 H5: attribute the result to the subagent's turn, main = None.
                     parent_tool_use_id: parent_tool_use_id.clone(),
                 });
@@ -583,6 +604,7 @@ impl ClaudeAdapter {
         // Turn terminal: any TodoWrite whose tool_result never arrived is dead
         // correlation state. Clearing here bounds the set to one turn.
         self.todo_tool_use_ids.clear();
+        self.written_files.clear();
         let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
         let result_text = match v.get("result").and_then(Value::as_str) {
             Some(s) if !s.is_empty() => s.to_string(),
@@ -1683,6 +1705,67 @@ mod tests {
         assert!(
             a.parse_command_lifecycle(&v).is_empty(),
             "an unknown phase must degrade to no event"
+        );
+    }
+
+    /// Preview refs (ADR-017): a successful `Write` reports its file as
+    /// `FilePath`; a failed one and an `Edit` (not captured yet) report nothing.
+    /// Input and result text follow the claude 2.1.308 capture
+    /// (aionx/contracts/fixtures/ws/claude-file-create.json).
+    #[test]
+    fn a_successful_write_reports_its_file() {
+        let mut a = ClaudeAdapter::new();
+        let tool_use = |id: &str, name: &str, input: &str| {
+            let frame = format!(
+                r#"{{"type":"assistant","message":{{"id":"m-{id}","role":"assistant","content":[
+                {{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]}}}}"#
+            );
+            serde_json::from_str::<serde_json::Value>(&frame).unwrap()
+        };
+        let result = |id: &str, is_error: bool| {
+            let frame = format!(
+                r#"{{"type":"user","message":{{"role":"user","content":[
+                {{"type":"tool_result","tool_use_id":"{id}","is_error":{is_error},
+                  "content":"File created successfully at: /w/a.md"}}]}}}}"#
+            );
+            serde_json::from_str::<serde_json::Value>(&frame).unwrap()
+        };
+        let files = |events: Vec<SessionEvent>| -> Vec<String> {
+            events
+                .into_iter()
+                .flat_map(|e| match e {
+                    SessionEvent::ToolResult { content, .. } => content,
+                    _ => Vec::new(),
+                })
+                .filter_map(|c| match c {
+                    crate::event::ToolResultContent::FilePath { path, .. } => Some(path),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        a.parse_assistant(&tool_use(
+            "w1",
+            "Write",
+            r##"{"file_path":"/w/a.md","content":"# a\n"}"##,
+        ));
+        assert_eq!(files(a.parse_user(&result("w1", false))), vec!["/w/a.md".to_string()]);
+
+        a.parse_assistant(&tool_use(
+            "w2",
+            "Write",
+            r##"{"file_path":"/w/b.md","content":"# b\n"}"##,
+        ));
+        assert!(
+            files(a.parse_user(&result("w2", true))).is_empty(),
+            "a failed write wrote nothing"
+        );
+
+        let edit = r#"{"file_path":"/w/a.md","old_string":"a","new_string":"b"}"#;
+        a.parse_assistant(&tool_use("e1", "Edit", edit));
+        assert!(
+            files(a.parse_user(&result("e1", false))).is_empty(),
+            "Edit is not captured yet"
         );
     }
 

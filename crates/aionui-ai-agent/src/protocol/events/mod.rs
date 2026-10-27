@@ -18,7 +18,7 @@ pub use session_updates::{
 pub use tool_call::{
     AcpToolCallContentItem, AcpToolCallEventData, AcpToolCallKind, AcpToolCallLocationItem,
     AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallTextBlock, AcpToolCallTextBlockType,
-    AcpToolCallUpdateData, ToolCallEventData, ToolCallStatus, ToolGroupEntry, ToolGroupStatus,
+    AcpToolCallUpdateData, FilesReportedData, ToolCallEventData, ToolCallStatus, ToolGroupEntry, ToolGroupStatus,
 };
 pub(crate) use translate::{permission_request_to_event_data, session_notification_to_events};
 
@@ -121,6 +121,13 @@ pub enum AgentStreamEvent {
     /// never forwarded to the WebSocket. Mirrors `SegmentBreak`'s "relay consumes
     /// internally, never forwards" contract.
     AcpDialectSignal(AcpDialectSignalData),
+    /// Internal-only: files a finished, successful tool call reported writing
+    /// (from `ToolResultContent::FilePath`: codex `fileChange`, claude `Write`).
+    /// The relay hands them to the conversation's `OnFilesReported` hooks
+    /// (preview refs, ADR-017). The paths are host paths, so this variant is
+    /// never serialized: it can never reach the WebSocket or a stored row.
+    #[serde(skip)]
+    FilesReported(FilesReportedData),
 }
 
 /// Data for the `Start` event.

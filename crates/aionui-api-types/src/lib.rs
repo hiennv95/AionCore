@@ -25,6 +25,7 @@ mod lifecycle;
 mod mcp;
 mod network;
 mod office;
+mod preview;
 mod project;
 mod provider;
 mod remote_agent;
@@ -158,6 +159,7 @@ pub use office::{
     ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, PptJsonData, PptSlideData, PreviewState, PreviewStatusEvent,
     PreviewUrlResponse, RefreshPreviewRequest, RefreshPreviewResponse, StartPreviewRequest, StopPreviewRequest,
 };
+pub use preview::{ConversationFileView, FilePreviewSettings, PreviewKind};
 pub use project::{
     AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest, ResolveRefResponse,
 };

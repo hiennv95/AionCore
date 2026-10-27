@@ -35,6 +35,7 @@ use aionui_mcp::{
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
 };
 use aionui_office::{ConversionService, OfficeRouterState, OfficecliWatchManager, ProxyService};
+use aionui_preview::{PreviewRouterState, PreviewService};
 use aionui_project::{ProjectRouterState, ProjectService};
 use aionui_realtime::{MessageRouter, TokenUserResolver, WsHandlerState, WsPrincipal};
 use aionui_session_message::drainer::Drainer;
@@ -147,6 +148,7 @@ pub struct ModuleStates {
     pub skill_runtime: SkillRuntimeRouterState,
     pub cron: CronRouterState,
     pub office: OfficeRouterState,
+    pub preview: PreviewRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
     /// Private-LAN network (ADR-009); `None` when its identity cannot be loaded.
@@ -340,6 +342,7 @@ pub async fn build_module_states(
         skill_runtime: build_module_state_phase(&boot, "skill_runtime", || build_skill_runtime_state(services)),
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
+        preview: build_module_state_phase(&boot, "preview", || build_preview_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
     };
@@ -1074,6 +1077,18 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
 }
 
 /// Build the default `OfficeRouterState` from application services.
+/// Preview v1 (ADR-017): conversation file refs and the paired-device setting.
+/// Agent tool calls that report files they wrote mint refs through the conversation hook.
+pub fn build_preview_state(services: &AppServices) -> PreviewRouterState {
+    let pool = services.database.pool().clone();
+    let service = Arc::new(PreviewService::new(
+        Arc::new(aionui_db::SqlitePreviewRepository::new(pool.clone())),
+        Arc::new(aionui_db::SqliteConversationRepository::new(pool)),
+    ));
+    services.conversation_service.with_files_reported_hook(service.clone());
+    PreviewRouterState { service }
+}
+
 pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
     let data_dir = services.data_dir.as_path();
     let allowed_roots = default_allowed_roots(Some(services.work_dir.as_path()));

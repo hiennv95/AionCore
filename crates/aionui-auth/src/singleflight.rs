@@ -63,6 +63,9 @@ pub(crate) enum RefreshError {
     DeviceRevoked,
     /// aionpro mode but the authenticated subject is not an aionpro user.
     UserContextRequired,
+    /// An older refresh token of a rotation grant was presented; the grant is
+    /// revoked (ADR-022). `401 REFRESH_TOKEN_REUSED`.
+    Replayed,
     /// Backend failure — user lookup or token signing. Maps to `500`.
     Internal(&'static str),
 }

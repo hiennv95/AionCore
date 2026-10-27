@@ -424,9 +424,15 @@ impl AppServices {
         conversation_service
             .with_turn_cancelled_hook(Arc::new(QueueClearingCancelHook::new(session_message_queue.clone())));
 
+        let jwt_service = Arc::new(JwtService::new(secret.clone()));
+        // Refresh-token rotation grants live in the database (ADR-022), so they survive a restart.
+        jwt_service.set_grant_repository(Arc::new(aionui_db::SqliteRefreshGrantRepository::new(
+            database.pool().clone(),
+        )));
+
         Ok(Self {
             database,
-            jwt_service: Arc::new(JwtService::new(secret.clone())),
+            jwt_service,
             antigravity_hook_tokens,
             user_repo,
             cookie_config: Arc::new(CookieConfig::from_env()),

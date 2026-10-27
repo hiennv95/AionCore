@@ -177,3 +177,11 @@ pub struct ToolGroupEntry {
     #[serde(default)]
     pub description: Option<String>,
 }
+
+/// Files one tool call reported writing; see `AgentStreamEvent::FilesReported`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesReportedData {
+    pub call_id: String,
+    /// As the agent reported them (absolute or relative); untrusted.
+    pub paths: Vec<String>,
+}

@@ -71,12 +71,15 @@ pub fn office_routes(state: OfficeRouterState) -> Router {
         .with_state(state)
 }
 
+/// The proxies serve the documents the desktop opened for preview, so they are host reads
+/// too: desktop only, like starting a preview (ADR-013; security candidate C2).
 pub fn office_proxy_routes(state: OfficeRouterState) -> Router {
     Router::new()
         .route("/api/ppt-proxy/{port}", get(ppt_proxy))
         .route("/api/ppt-proxy/{port}/{*path}", get(ppt_proxy))
         .route("/api/office-watch-proxy/{port}", get(office_watch_proxy))
         .route("/api/office-watch-proxy/{port}/{*path}", get(office_watch_proxy))
+        .route_layer(from_fn(desktop_only))
         .with_state(state)
 }
 

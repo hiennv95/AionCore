@@ -57,3 +57,15 @@ pub enum TurnCancelCause {
 pub trait OnConversationTurnCancelled: Send + Sync {
     async fn on_turn_cancelled(&self, user_id: &str, conversation_id: &str, turn_id: &str, cause: TurnCancelCause);
 }
+
+/// Notified when a finished agent tool call in a conversation reported files
+/// it wrote (codex `fileChange`, claude `Write`), so `aionui-preview` can mint
+/// preview refs (ADR-017) without `aionui-conversation` depending on it.
+///
+/// `paths` are the agent's untrusted report, absolute or relative; the hook
+/// validates them. Hooks run in registration order; failures must be logged
+/// inside the hook (never with the path at info) and not propagated.
+#[async_trait]
+pub trait OnFilesReported: Send + Sync {
+    async fn on_files_reported(&self, user_id: &str, conversation_id: &str, call_id: &str, paths: &[String]);
+}

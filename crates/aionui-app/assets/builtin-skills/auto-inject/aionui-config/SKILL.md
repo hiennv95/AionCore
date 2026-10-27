@@ -277,55 +277,30 @@ Enable or disable the skills market:
 
 ## MCP Servers
 
+You can read MCP servers. You cannot change them: an MCP server runs a command on
+the owner's computer, so adding, editing, deleting, enabling, importing, testing,
+discovering agent MCP configs, and OAuth login/logout are done by the owner in the
+desktop app. The host refuses these from agents with `CONFIG_DESKTOP_ONLY`. When the
+user asks for such a change, say what to change and ask them to do it in the desktop
+app (Settings → MCP). Do not retry, and do not work around the refusal.
+
 List MCP servers:
 
 ```bash
 "$AIONUI_HELPER_BIN" config mcp servers list
 ```
 
-Create an MCP server:
+Read one MCP server:
 
 ```bash
-"$AIONUI_HELPER_BIN" config mcp servers create <<'JSON'
+"$AIONUI_HELPER_BIN" config mcp servers get <<'JSON'
 {
-  "name": "Local Tools",
-  "transport": {
-    "type": "stdio",
-    "command": "my-mcp-server",
-    "args": [],
-    "env": {}
-  }
+  "server_id": "mcp_123"
 }
 JSON
 ```
 
-Update an MCP server:
-
-```bash
-"$AIONUI_HELPER_BIN" config mcp servers update <<'JSON'
-{
-  "server_id": "mcp_123",
-  "description": "Updated description"
-}
-JSON
-```
-
-Test a server configuration:
-
-```bash
-"$AIONUI_HELPER_BIN" config mcp test-connection <<'JSON'
-{
-  "name": "Local Tools",
-  "transport": {
-    "type": "stdio",
-    "command": "my-mcp-server",
-    "args": []
-  }
-}
-JSON
-```
-
-OAuth helpers:
+Check whether an MCP server URL is signed in:
 
 ```bash
 "$AIONUI_HELPER_BIN" config mcp oauth check-status <<'JSON'
@@ -335,8 +310,9 @@ OAuth helpers:
 JSON
 ```
 
-Never show MCP headers or stdio env values to the user. CLI output redacts
-sensitive fields by default.
+Secrets are masked for agents: stdio args and env values, header values, and URL
+credentials and query strings come back as `***` or are left out. Never ask the
+user to paste them into the conversation.
 
 ## Providers
 
