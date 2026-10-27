@@ -15,8 +15,12 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+git2.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
 http-body-util.workspace = true

@@ -189,3 +189,46 @@ async fn verified_refreshes_are_limited_per_session() {
     assert_eq!(code, StatusCode::UNAUTHORIZED);
     assert_eq!(json["code"], "UNAUTHORIZED");
 }
+
+fn get_as(path: &str, token: Option<&str>, peer: &str) -> Request<Body> {
+    let mut builder = Request::get(path);
+    if let Some(token) = token {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    from_peer(builder.body(Body::empty()).unwrap(), peer)
+}
+
+/// C7 residual: unauthenticated junk from another local caller no longer fills a shared
+/// per-IP bucket in front of the owner's authenticated reads.
+#[tokio::test]
+async fn junk_on_authenticated_routes_does_not_block_the_owners_ws_token() {
+    let host = host().await;
+    let (access, _) = login(&host.app, "127.0.0.1:50001").await;
+    for _ in 0..70 {
+        let (code, json) = send(&host.app, get_as("/api/auth/user", None, "127.0.0.1:50000")).await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert_ne!(json["code"], "RATE_LIMITED");
+    }
+    let (code, json) = send(&host.app, get_as("/api/ws-token", Some(&access), "127.0.0.1:50001")).await;
+    assert_eq!(code, StatusCode::OK, "{json}");
+    let (code, _) = send(&host.app, get_as("/api/auth/user", Some(&access), "127.0.0.1:50001")).await;
+    assert_eq!(code, StatusCode::OK);
+}
+
+/// The owner's own authenticated reads stay limited per user (20/min).
+#[tokio::test]
+async fn authenticated_reads_are_limited_per_user() {
+    let host = host().await;
+    let (access, _) = login(&host.app, "127.0.0.1:50001").await;
+    for _ in 0..20 {
+        assert_eq!(
+            send(&host.app, get_as("/api/auth/user", Some(&access), "127.0.0.1:50001"))
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let (code, json) = send(&host.app, get_as("/api/auth/user", Some(&access), "127.0.0.1:50002")).await;
+    assert_eq!(code, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(json["code"], "RATE_LIMITED");
+}

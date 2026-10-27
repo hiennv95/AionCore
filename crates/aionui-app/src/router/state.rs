@@ -30,7 +30,7 @@ use aionui_extension::{
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
 use aionui_file::{FileRouterState, FileService, SnapshotService};
-use aionui_inbox::{InboxRouterState, InboxService};
+use aionui_inbox::{InboxRouterState, InboxService, ReceiptService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -1096,11 +1096,20 @@ pub fn build_preview_state(services: &AppServices) -> PreviewRouterState {
 /// Turn ends and user stops are recorded through the conversation hooks.
 pub fn build_inbox_state(services: &AppServices) -> InboxRouterState {
     let pool = services.database.pool().clone();
+    let outcomes = Arc::new(aionui_db::SqliteTurnOutcomeRepository::new(pool.clone()));
+    let conversations = Arc::new(aionui_db::SqliteConversationRepository::new(pool.clone()));
+    let receipts = Arc::new(ReceiptService::new(
+        Arc::new(aionui_db::SqliteTurnReceiptRepository::new(pool.clone())),
+        outcomes.clone(),
+        conversations.clone(),
+        Arc::new(aionui_db::SqlitePreviewRepository::new(pool)),
+    ));
     let service = Arc::new(InboxService::new(
-        Arc::new(aionui_db::SqliteTurnOutcomeRepository::new(pool.clone())),
-        Arc::new(aionui_db::SqliteConversationRepository::new(pool)),
+        outcomes,
+        conversations,
         services.worker_task_manager.clone(),
         services.event_bus.clone(),
+        receipts,
     ));
     services.conversation_service.with_turn_ended_hook(service.clone());
     services.conversation_service.with_turn_cancelled_hook(service.clone());

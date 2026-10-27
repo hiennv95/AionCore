@@ -143,6 +143,7 @@ pub use file::{
 };
 pub use inbox::{
     INBOX_OUTCOME_LIMIT, InboxApproval, InboxChangedPayload, InboxOutcome, InboxResponse, InboxSeenRequest,
+    ReceiptFile, ReceiptTool, ReceiptWorkspace, TurnReceipt,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

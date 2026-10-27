@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
-use aionui_ai_agent::protocol::events::{ErrorEventData, FinishEventData};
+use aionui_ai_agent::protocol::events::tool_call::ToolCallEventData;
+use aionui_ai_agent::protocol::events::{ErrorEventData, FinishEventData, TextEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{
     AgentError, AgentStreamEvent, IWorkerTaskManager, RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
@@ -75,6 +76,23 @@ impl IAgentTask for ScriptedAgent {
                 options: vec![],
                 questions: None,
             }),
+            "work" => {
+                // A command the agent reports running, then its own summary of the result.
+                for status in ["running", "completed"] {
+                    let call: ToolCallEventData = serde_json::from_value(json!({
+                        "call_id": "exec-1",
+                        "name": "Run flutter test",
+                        "args": {"type": "commandExecution", "exit_code": null},
+                        "status": status,
+                    }))
+                    .unwrap();
+                    let _ = self.event_tx.send(AgentStreamEvent::ToolCall(call));
+                }
+                let _ = self.event_tx.send(AgentStreamEvent::Text(TextEventData {
+                    content: "Done. All tests pass.".into(),
+                }));
+                let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
+            }
             _ => {
                 let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
             }
@@ -478,4 +496,145 @@ async fn the_inbox_needs_a_session_csrf_and_is_not_for_the_agent_helper() {
     let body = body_json(resp).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["code"], "INBOX_OWNER_ONLY");
+}
+
+/// B05.R1: the receipt keeps the host's observations (outcome, folder state) apart from the
+/// agent's claims (its tool report and its summary) and from the owner's acceptance.
+#[tokio::test]
+async fn a_receipt_separates_host_observations_agent_claims_and_acceptance() {
+    let h = host().await;
+    let repo = git2::Repository::init(h.workspace.path()).unwrap();
+    std::fs::write(h.workspace.path().join("lib.dart"), "void main() {}").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("lib.dart")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("t", "t@example.com").unwrap();
+    let head = repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+
+    let id = h.conversation("receipt").await;
+    let turn = h.send(&id, "work").await;
+    h.inbox_until("the outcome", |i| outcomes_of(i, &id).len() == 1).await;
+    let uri = format!("/api/conversations/{id}/turns/{turn}/receipt");
+    let mut receipt = Value::Null;
+    for _ in 0..100 {
+        let (status, body) = h.call("GET", &uri, Value::Null).await;
+        if status == StatusCode::OK {
+            receipt = body["data"].clone();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(receipt["outcome"], "finished", "{receipt}");
+    assert_eq!(receipt["source"], "relay_finish");
+    assert!(receipt["started_at"].as_i64().unwrap() <= receipt["ended_at"].as_i64().unwrap());
+    // Agent claims, labelled as such: no exit code was reported, so none is made up.
+    assert_eq!(
+        receipt["tools"],
+        json!([{"call_id": "exec-1", "name": "Run flutter test", "status": "completed", "reported_exit_code": null}])
+    );
+    assert_eq!(receipt["agent_claim"], "Done. All tests pass.");
+    // Host observation of the folder: unchanged since the turn ended.
+    assert_eq!(
+        receipt["workspace"],
+        json!({"state": "git", "head": head.to_string(), "stale": false})
+    );
+    assert_eq!(receipt["accepted_at"], Value::Null);
+
+    // An edit after the turn makes its evidence stale.
+    std::fs::write(h.workspace.path().join("lib.dart"), "void main() { print(1); }").unwrap();
+    let (_, body) = h.call("GET", &uri, Value::Null).await;
+    assert_eq!(body["data"]["workspace"]["stale"], true);
+
+    // Acceptance is recorded once and changes nothing else.
+    let (status, body) = h.call("POST", &format!("{uri}/accept"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let accepted = body["data"]["accepted_at"].as_i64().expect("accepted");
+    assert_eq!(body["data"]["tools"], receipt["tools"]);
+    let (_, again) = h.call("POST", &format!("{uri}/accept"), json!({})).await;
+    assert_eq!(again["data"]["accepted_at"].as_i64(), Some(accepted));
+}
+
+#[tokio::test]
+async fn a_receipt_is_the_owners_only_and_needs_a_known_turn() {
+    let h = host().await;
+    let id = h.conversation("plain folder").await;
+    let turn = h.send(&id, "finish").await;
+    h.inbox_until("the outcome", |i| outcomes_of(i, &id).len() == 1).await;
+    let uri = format!("/api/conversations/{id}/turns/{turn}/receipt");
+    let mut body = Value::Null;
+    for _ in 0..100 {
+        let (status, b) = h.call("GET", &uri, Value::Null).await;
+        body = b;
+        if status == StatusCode::OK {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Not a git work tree: nothing to compare, and the receipt says so.
+    assert_eq!(
+        body["data"]["workspace"],
+        json!({"state": "not_git", "head": null, "stale": null}),
+        "{body}"
+    );
+    assert_eq!(body["data"]["tools"], json!([]));
+
+    let (status, body) = h
+        .call(
+            "GET",
+            &format!("/api/conversations/{id}/turns/turn_missing/receipt"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::NOT_FOUND, json!("RECEIPT_NOT_FOUND"))
+    );
+    let (status, _) = h
+        .call(
+            "POST",
+            &format!("/api/conversations/{id}/turns/turn_missing/receipt/accept"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let mut app = h.app.clone();
+    let (bob, bob_csrf) = setup_and_login(&mut app, &h.services, "bob", "StrongP@ss2").await;
+    let resp = app.clone().oneshot(get_with_token(&uri, &bob)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("{uri}/accept"),
+            json!({}),
+            &bob,
+            &bob_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = h
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{uri}/accept"))
+                .header("authorization", format!("Bearer {}", h.token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "accept without CSRF");
+    let resp = h
+        .app
+        .clone()
+        .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

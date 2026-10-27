@@ -84,6 +84,9 @@ pub struct TurnEnd {
     pub source: &'static str,
     /// The agent error code of an error terminal, when the agent sent one.
     pub error_code: Option<String>,
+    /// When the host started the turn (Unix ms): with the end time it bounds the
+    /// turn's messages and files for its result receipt (B05.R1).
+    pub started_at: i64,
 }
 
 /// Notified once per user turn after its last attempt ended, so `aionui-inbox` can

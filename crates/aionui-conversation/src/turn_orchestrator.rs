@@ -480,6 +480,7 @@ impl ConversationTurnOrchestrator {
         let mut auth_failure = false;
         // The last attempt's terminal, or the early-exit source when no relay ran (B05).
         let mut last_terminal: Option<RelayTerminal> = None;
+        let turn_started_at = now_ms();
         let mut early_exit_source: Option<&'static str> = None;
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
@@ -658,7 +659,7 @@ impl ConversationTurnOrchestrator {
             .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
             .await;
         if !was_deleting {
-            let end = turn_end(final_failed, last_terminal.as_ref(), early_exit_source);
+            let end = turn_end(final_failed, last_terminal.as_ref(), early_exit_source, turn_started_at);
             self.service
                 .notify_turn_ended(&input.user_id, &conv_id, &turn_id, &end)
                 .await;
@@ -676,7 +677,12 @@ impl ConversationTurnOrchestrator {
 }
 
 /// The host-observed end of a turn: which signal ended its last attempt (B05).
-fn turn_end(failed: bool, terminal: Option<&RelayTerminal>, early_exit_source: Option<&'static str>) -> TurnEnd {
+fn turn_end(
+    failed: bool,
+    terminal: Option<&RelayTerminal>,
+    early_exit_source: Option<&'static str>,
+    started_at: i64,
+) -> TurnEnd {
     let (source, error_code) = match (terminal, early_exit_source) {
         (_, Some(source)) => (source, None),
         (Some(RelayTerminal::Error { code, .. }), None) => (
@@ -691,6 +697,7 @@ fn turn_end(failed: bool, terminal: Option<&RelayTerminal>, early_exit_source: O
         failed,
         source,
         error_code,
+        started_at,
     }
 }
 
@@ -907,37 +914,39 @@ mod tests {
             retryable: Some(false),
         };
         assert_eq!(
-            turn_end(true, Some(&error), None),
+            turn_end(true, Some(&error), None, 7),
             TurnEnd {
                 failed: true,
                 source: "relay_error",
                 error_code: Some("AIONUI_STREAM_BROKEN".into()),
+                started_at: 7,
             }
         );
         let codeless = RelayTerminal::Error {
             code: None,
             retryable: None,
         };
-        assert_eq!(turn_end(true, Some(&codeless), None).error_code, None);
+        assert_eq!(turn_end(true, Some(&codeless), None, 0).error_code, None);
         assert_eq!(
-            turn_end(false, Some(&RelayTerminal::Finish), None).source,
+            turn_end(false, Some(&RelayTerminal::Finish), None, 0).source,
             "relay_finish"
         );
         assert_eq!(
-            turn_end(false, Some(&RelayTerminal::ChannelClosed), None).source,
+            turn_end(false, Some(&RelayTerminal::ChannelClosed), None, 0).source,
             "channel_closed"
         );
         // An early exit wins over an earlier attempt's terminal (replay that failed to start).
         assert_eq!(
-            turn_end(true, Some(&RelayTerminal::Finish), Some("start_failed")),
+            turn_end(true, Some(&RelayTerminal::Finish), Some("start_failed"), 0),
             TurnEnd {
                 failed: true,
                 source: "start_failed",
                 error_code: None,
+                started_at: 0,
             }
         );
         assert_eq!(
-            turn_end(false, None, Some("settled_without_relay")).source,
+            turn_end(false, None, Some("settled_without_relay"), 0).source,
             "settled_without_relay"
         );
     }

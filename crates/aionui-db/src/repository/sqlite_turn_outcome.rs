@@ -45,6 +45,16 @@ impl ITurnOutcomeRepository for SqliteTurnOutcomeRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn get(&self, user_id: &str, turn_id: &str) -> Result<Option<TurnOutcomeRow>, DbError> {
+        Ok(
+            sqlx::query_as("SELECT * FROM turn_outcomes WHERE user_id = ? AND turn_id = ?")
+                .bind(user_id)
+                .bind(turn_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
     async fn list_unseen(&self, user_id: &str, limit: u32) -> Result<Vec<TurnOutcomeRow>, DbError> {
         Ok(sqlx::query_as(
             "SELECT * FROM turn_outcomes \

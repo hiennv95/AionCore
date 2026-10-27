@@ -20,6 +20,7 @@ mod skill;
 mod system_settings;
 mod team;
 mod turn_outcome;
+mod turn_receipt;
 mod user;
 mod user_order;
 
@@ -51,5 +52,6 @@ pub use skill::{SkillImportRecordRow, SkillRow};
 pub use system_settings::SystemSettings;
 pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
 pub use turn_outcome::TurnOutcomeRow;
+pub use turn_receipt::{TurnReceiptRow, TurnTextMessageRow, TurnToolMessageRow};
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};
 pub use user_order::{OrderItemType, OrderScene, UserOrderRow};

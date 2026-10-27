@@ -10,6 +10,7 @@ use aionui_realtime::EventBroadcaster;
 use tracing::{debug, error, info};
 
 use crate::error::InboxError;
+use crate::receipt::ReceiptService;
 
 /// Builds the inbox from live agent state and recorded turn outcomes.
 ///
@@ -20,6 +21,7 @@ pub struct InboxService {
     conversations: Arc<dyn IConversationRepository>,
     task_manager: Arc<dyn IWorkerTaskManager>,
     broadcaster: Arc<dyn EventBroadcaster>,
+    receipts: Arc<ReceiptService>,
 }
 
 impl InboxService {
@@ -28,13 +30,20 @@ impl InboxService {
         conversations: Arc<dyn IConversationRepository>,
         task_manager: Arc<dyn IWorkerTaskManager>,
         broadcaster: Arc<dyn EventBroadcaster>,
+        receipts: Arc<ReceiptService>,
     ) -> Self {
         Self {
             outcomes,
             conversations,
             task_manager,
             broadcaster,
+            receipts,
         }
+    }
+
+    /// Result receipts (B05.R1).
+    pub fn receipts(&self) -> &ReceiptService {
+        &self.receipts
     }
 
     pub async fn inbox(&self, user_id: &str) -> Result<InboxResponse, InboxError> {
@@ -149,6 +158,10 @@ impl OnConversationTurnEnded for InboxService {
             end.error_code.as_deref(),
         )
         .await;
+        // After the outcome row: the receipt references it.
+        self.receipts
+            .record(user_id, conversation_id, turn_id, end.started_at)
+            .await;
     }
 }
 

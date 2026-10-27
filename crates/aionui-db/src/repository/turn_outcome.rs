@@ -23,6 +23,8 @@ pub trait ITurnOutcomeRepository: Send + Sync {
     /// `stopped` row is never overwritten (the user's stop explains whatever came after),
     /// and a seen row stays seen. Returns `false` when nothing changed.
     async fn record(&self, params: RecordTurnOutcomeParams<'_>) -> Result<bool, DbError>;
+    /// One turn's outcome, when it belongs to the user.
+    async fn get(&self, user_id: &str, turn_id: &str) -> Result<Option<TurnOutcomeRow>, DbError>;
     /// Unseen `finished`/`failed` outcomes of the user, newest first.
     async fn list_unseen(&self, user_id: &str, limit: u32) -> Result<Vec<TurnOutcomeRow>, DbError>;
     /// Mark every outcome of one conversation seen; returns how many changed.

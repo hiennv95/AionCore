@@ -357,7 +357,10 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .route_layer(from_fn_with_state(api_limiter.clone(), api_rate_limit_middleware))
         .with_state(state.clone());
 
-    // Authenticated routes: api limiter -> auth -> action limiter
+    // Authenticated routes: auth -> action limiter keyed by the user. No per-IP limiter
+    // in front of auth: every loopback caller shares one IP key, so another local
+    // process could fill it and cut the owner's ws-token and user reads (C7 residual,
+    // Jev 048's "stop sharing the key" principle). Unauthenticated requests stop at auth.
     // route_layer order: last added = outermost (first to process)
     let authenticated = Router::new()
         .route("/logout", post(logout_handler))
@@ -369,7 +372,6 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
             authenticated_action_rate_limit_middleware,
         ))
         .route_layer(from_fn_with_state(auth_state, auth_middleware))
-        .route_layer(from_fn_with_state(api_limiter.clone(), api_rate_limit_middleware))
         .with_state(state.clone());
 
     // Refresh (token in cookie or body, no auth middleware): limited inside the
