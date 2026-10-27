@@ -433,3 +433,97 @@ pub async fn desktop_and_phone(app: &axum::Router, root: &std::path::Path) -> (S
     let phone = claimed["data"]["session"]["access_token"].as_str().unwrap().to_owned();
     (desktop, phone)
 }
+
+/// `.route("…"` paths in non-test source, test modules cut off at `#[cfg(test)]`.
+pub fn route_paths(dir: &std::path::Path, out: &mut std::collections::BTreeSet<String>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            route_paths(&path, out);
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy();
+        if !name.ends_with(".rs") || name.ends_with("_test.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        let text = text.split("#[cfg(test)]").next().unwrap_or_default();
+        let mut rest = text;
+        while let Some(at) = rest.find(".route(") {
+            rest = &rest[at + ".route(".len()..];
+            let trimmed = rest.trim_start();
+            if let Some(quoted) = trimmed.strip_prefix('"')
+                && let Some(end) = quoted.find('"')
+            {
+                out.insert(quoted[..end].to_owned());
+            }
+        }
+    }
+}
+
+pub fn all_routes() -> std::collections::BTreeSet<String> {
+    let crates = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut out = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(&crates).unwrap() {
+        let src = entry.unwrap().path().join("src");
+        if src.is_dir() {
+            route_paths(&src, &mut out);
+        }
+    }
+    out
+}
+
+/// `{id}` and `{*rest}` placeholders become a dummy segment.
+pub fn concrete(path: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for c in path.chars() {
+        match c {
+            '{' => {
+                skipping = true;
+                out.push('x');
+            }
+            '}' => skipping = false,
+            _ if skipping => {}
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Calls every scanned route under each `(template, id)` pair (e.g. `("/api/teams/{id}", id)`),
+/// with every method as `token`: the template's one placeholder becomes `id` and later
+/// placeholders a dummy segment. Returns the calls that redirected or succeeded with anything
+/// but an empty list, for cross-user tests.
+pub async fn foreign_route_hits(
+    app: &axum::Router,
+    targets: &[(&str, &str)],
+    token: &str,
+    csrf: &str,
+    body: serde_json::Value,
+) -> (usize, Vec<String>) {
+    let routes = all_routes();
+    let mut probed = 0;
+    let mut hits = Vec::new();
+    for (template, id) in targets {
+        for path in routes.iter().filter(|r| r.starts_with(template)) {
+            probed += 1;
+            let (head, tail) = template.split_once('{').expect("template names a placeholder");
+            let tail = tail.split_once('}').map_or("", |(_, tail)| tail);
+            let uri = format!("{head}{id}{tail}{}", concrete(&path[template.len()..]));
+            for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+                let req = json_with_token(method, &uri, body.clone(), token, csrf);
+                let resp = app.clone().oneshot(req).await.unwrap();
+                let status = resp.status();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                // A list filtered down to nothing answers 200 without exposing anything.
+                let empty_list = body["data"].as_array().is_some_and(|items| items.is_empty());
+                if (status.is_success() && !empty_list) || status.is_redirection() {
+                    hits.push(format!("{method} {path} -> {status}"));
+                }
+            }
+        }
+    }
+    (probed, hits)
+}

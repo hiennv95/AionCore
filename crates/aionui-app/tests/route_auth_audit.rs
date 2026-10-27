@@ -10,9 +10,6 @@
 
 mod common;
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt;
@@ -62,67 +59,10 @@ fn is_public(path: &str) -> bool {
     })
 }
 
-/// `.route("…"` paths in non-test source, test modules cut off at `#[cfg(test)]`.
-fn route_paths(dir: &Path, out: &mut BTreeSet<String>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            route_paths(&path, out);
-            continue;
-        }
-        let name = path.file_name().unwrap().to_string_lossy();
-        if !name.ends_with(".rs") || name.ends_with("_test.rs") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).unwrap();
-        let text = text.split("#[cfg(test)]").next().unwrap_or_default();
-        let mut rest = text;
-        while let Some(at) = rest.find(".route(") {
-            rest = &rest[at + ".route(".len()..];
-            let trimmed = rest.trim_start();
-            if let Some(quoted) = trimmed.strip_prefix('"')
-                && let Some(end) = quoted.find('"')
-            {
-                out.insert(quoted[..end].to_owned());
-            }
-        }
-    }
-}
-
-fn all_routes() -> BTreeSet<String> {
-    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let mut out = BTreeSet::new();
-    for entry in std::fs::read_dir(&crates).unwrap() {
-        let src = entry.unwrap().path().join("src");
-        if src.is_dir() {
-            route_paths(&src, &mut out);
-        }
-    }
-    out
-}
-
-/// `{id}` and `{*rest}` placeholders become a dummy segment.
-fn concrete(path: &str) -> String {
-    let mut out = String::new();
-    let mut skipping = false;
-    for c in path.chars() {
-        match c {
-            '{' => {
-                skipping = true;
-                out.push('x');
-            }
-            '}' => skipping = false,
-            _ if skipping => {}
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
 #[tokio::test]
 async fn every_route_refuses_anonymous_callers_unless_declared_public() {
     let (app, _services) = common::build_app().await;
-    let routes = all_routes();
+    let routes = common::all_routes();
     assert!(routes.len() > 150, "route scan found too few routes: {}", routes.len());
 
     let mut open = Vec::new();
@@ -130,7 +70,7 @@ async fn every_route_refuses_anonymous_callers_unless_declared_public() {
         if is_public(path) {
             continue;
         }
-        let uri = concrete(path);
+        let uri = common::concrete(path);
         for method in [Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
             let request = Request::builder()
                 .method(method.clone())
@@ -162,7 +102,7 @@ async fn every_route_refuses_anonymous_callers_unless_declared_public() {
 /// Every PUBLIC entry still names a real route, so the list cannot rot into blanket exemptions.
 #[test]
 fn every_public_entry_matches_a_route() {
-    let routes = all_routes();
+    let routes = common::all_routes();
     for (entry, _) in PUBLIC {
         let hit = if entry.ends_with('/') {
             routes.iter().any(|r| r.starts_with(entry))
@@ -197,7 +137,7 @@ async fn another_user_cannot_use_any_conversation_route_of_the_owner() {
         .to_owned();
     let (bob, bob_csrf) = common::setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
 
-    let scoped: Vec<String> = all_routes()
+    let scoped: Vec<String> = common::all_routes()
         .into_iter()
         .filter(|r| r.starts_with("/api/conversations/{id}") || r.starts_with("/api/sidebar/conversation/{id}"))
         .collect();
@@ -205,7 +145,7 @@ async fn another_user_cannot_use_any_conversation_route_of_the_owner() {
 
     let mut leaks = Vec::new();
     for path in &scoped {
-        let uri = concrete(&path.replacen("{id}", &id, 1));
+        let uri = common::concrete(&path.replacen("{id}", &id, 1));
         for method in [Method::GET, Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
             let request = Request::builder()
                 .method(method.clone())
@@ -521,4 +461,132 @@ async fn another_user_cannot_read_or_replace_the_owners_assistant_rules() {
         leaks.push(format!("the owner's assistant changed: {body}"));
     }
     assert!(leaks.is_empty(), "{}", leaks.join("\n"));
+}
+
+/// Cross-user isolation for cron jobs and projects: bob calls every route under the owner's
+/// job and project, with every method. None succeeds, his lists do not show them, and they
+/// are unchanged. A probe as the owner shows the built URIs are real.
+#[tokio::test]
+async fn another_user_cannot_use_any_cron_or_project_route_of_the_owner() {
+    let (mut app, services) = common::build_app().await;
+    let (owner, oc) = common::setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (bob, bc) = common::setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/assistants",
+        &owner,
+        &oc,
+        serde_json::json!({"id": "owner-cron-a", "name": "owner cron assistant", "agent_id": "8e1acf31"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/cron/jobs",
+        &owner,
+        &oc,
+        serde_json::json!({
+            "name": "owner-cron",
+            "schedule": {"kind": "every", "every_ms": 3_600_000, "description": "hourly"},
+            "message": "owner cron message",
+            "conversation_id": "",
+            "created_by": "user",
+            "execution_mode": "new_conversation",
+            "agent_config": {"name": "owner cron assistant", "assistant_id": "owner-cron-a"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let job = body["data"]["id"].as_str().unwrap().to_owned();
+    // No HTTP route creates a project (conversations and teams only resolve existing ones),
+    // so the owner's is made through the service.
+    let (_, me) = call(
+        &app,
+        Method::GET,
+        "/api/system/current-user",
+        &owner,
+        &oc,
+        serde_json::Value::Null,
+    )
+    .await;
+    let owner_id = me["data"]["id"].as_str().unwrap().to_owned();
+    let workspace = tempfile::tempdir().unwrap();
+    let project = services
+        .project_service
+        .create_standard(
+            &owner_id,
+            aionui_project::canonical::to_file_uri(workspace.path()).unwrap(),
+        )
+        .await
+        .unwrap()
+        .project
+        .project_id;
+
+    // A chat of the owner's tied to the job, so an empty answer to bob means "filtered".
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/conversations",
+        &owner,
+        &oc,
+        serde_json::json!({"type": "acp", "name": "owner cron chat", "extra": {"workspace": workspace.path(), "cronJobId": job}}),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let (_, list) = call(&app, Method::GET, "/api/cron/jobs", &bob, &bc, serde_json::Value::Null).await;
+    assert!(!list.to_string().contains(&job), "bob lists the owner's job: {list}");
+    let (probed, hits) = common::foreign_route_hits(
+        &app,
+        &[
+            ("/api/cron/jobs/{id}", &job),
+            ("/api/internal/conversation-cron/jobs/{id}", &job),
+            ("/api/projects/{project_id}", &project),
+            ("/api/sidebar/project/{project_id}", &project),
+        ],
+        &bob,
+        &bc,
+        serde_json::json!({"name": "bob was here", "enabled": false, "content": "x", "uri": "/tmp", "ref": "x"}),
+    )
+    .await;
+    assert!(probed >= 9, "too few cron/project routes found: {probed}");
+    assert!(
+        hits.is_empty(),
+        "bob reached the owner's job or project:\n{}",
+        hits.join("\n")
+    );
+
+    let (_, own) = common::foreign_route_hits(
+        &app,
+        &[
+            ("/api/cron/jobs/{id}/conversations", &job),
+            ("/api/projects/{project_id}", &project),
+        ],
+        &owner,
+        &oc,
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(
+        own.iter()
+            .any(|h| h.starts_with("GET /api/cron/jobs/{id}/conversations -> 200")),
+        "{own:?}"
+    );
+    assert!(
+        own.iter()
+            .any(|h| h.starts_with("GET /api/projects/{project_id} -> 200")),
+        "{own:?}"
+    );
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/cron/jobs/{job}"),
+        &owner,
+        &oc,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["name"], "owner-cron");
 }

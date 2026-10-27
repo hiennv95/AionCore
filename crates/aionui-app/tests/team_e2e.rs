@@ -2120,3 +2120,53 @@ async fn full_team_lifecycle() {
     let json = body_json(resp).await;
     assert!(json["data"].as_array().unwrap().is_empty());
 }
+
+/// Cross-user isolation: bob calls every team-scoped route, with every method, on the
+/// owner's team. None succeeds, his list does not show it, and it is unchanged.
+#[tokio::test]
+async fn another_user_cannot_use_any_team_route_of_the_owner() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let team = create_team(&mut app, &services, &token, &csrf).await;
+    let id = team["id"].as_str().unwrap().to_owned();
+    let (bob, bc) = setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+
+    let resp = app
+        .clone()
+        .oneshot(common::get_with_token("/api/teams", &bob))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list = body_json(resp).await.to_string();
+    assert!(!list.contains(&id), "bob lists the owner's team: {list}");
+
+    let (probed, hits) = common::foreign_route_hits(
+        &app,
+        &[
+            ("/api/teams/{id}", &id),
+            ("/api/sidebar/team/{id}", &id),
+            ("/api/sidebar/archived/team/{id}", &id),
+        ],
+        &bob,
+        &bc,
+        json!({"name": "bob was here", "content": "hi", "agent_type": "acp"}),
+    )
+    .await;
+    assert!(probed > 12, "too few team routes found: {probed}");
+    assert!(hits.is_empty(), "bob reached the owner's team:\n{}", hits.join("\n"));
+    // The same probe as the owner reaches a read-only route, so the URIs it builds are real.
+    let (_, own) =
+        common::foreign_route_hits(&app, &[("/api/teams/{id}/activity", &id)], &token, &csrf, json!({})).await;
+    assert!(
+        own.contains(&"GET /api/teams/{id}/activity -> 200 OK".to_owned()),
+        "{own:?}"
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(common::get_with_token(&format!("/api/teams/{id}"), &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(body_json(resp).await["data"]["name"], "Alpha");
+}
