@@ -348,6 +348,40 @@ async fn rp5b_proxy_does_not_inject_in_json() {
 }
 
 // ---------------------------------------------------------------------------
+// C3: upstream cookies never reach the host origin
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn proxy_strips_upstream_cookies() {
+    let response = build_http_response(
+        200,
+        &[
+            ("Content-Type", "text/html"),
+            ("Set-Cookie", "aionui-csrf-token=attacker; Path=/"),
+            ("Set-Cookie", "aionui-session=attacker; Path=/; HttpOnly"),
+            ("Set-Cookie2", "legacy=1"),
+            ("X-Upstream", "kept"),
+        ],
+        "<html><body>doc</body></html>",
+    );
+    let (proxy, port, _dir) = setup_proxy(DocType::Word, &response).await;
+
+    let result = proxy.forward(port, "/", DocType::Word, &[]).await.unwrap();
+
+    assert_eq!(result.status, 200);
+    let names: Vec<&str> = result.headers.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(!names.contains(&"set-cookie"), "{names:?}");
+    assert!(!names.contains(&"set-cookie2"), "{names:?}");
+    assert!(
+        result
+            .headers
+            .iter()
+            .any(|(name, value)| name == "x-upstream" && value == "kept"),
+        "other upstream headers still pass: {names:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // RP-7: Hop-by-hop header stripping
 // ---------------------------------------------------------------------------
 

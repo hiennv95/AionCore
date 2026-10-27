@@ -82,6 +82,12 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub strict_refresh: bool,
 
+    /// Treat loopback peers as a trusted reverse proxy: rate limits then key by the
+    /// client address in X-Forwarded-For / X-Real-IP. Off by default, because any
+    /// local process can set those headers.
+    #[arg(long)]
+    pub trusted_proxy: bool,
+
     /// Lifetime in seconds of newly issued access tokens (60..=2592000).
     /// Defaults to 30 days when omitted.
     #[arg(long, value_name = "SECS")]

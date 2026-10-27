@@ -46,13 +46,14 @@ pub use validation::{validate_password, validate_username};
 
 // Rate limiting
 pub use rate_limit::{
-    RateLimiter, api_rate_limit_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
+    RateLimiter, RefreshLimiter, api_rate_limit_middleware, auth_rate_limit_middleware,
+    authenticated_action_rate_limit_middleware, status_rate_limit_middleware,
 };
 
 // Token / IP extraction
 pub use extract::{
     extract_client_ip, extract_client_ip_from_headers, extract_cookie_value, extract_token_from_headers,
-    extract_token_from_ws_headers,
+    extract_token_from_ws_headers, is_loopback_client, set_trust_forwarded_headers, trust_forwarded_headers,
 };
 
 // Cookie configuration

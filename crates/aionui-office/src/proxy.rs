@@ -232,6 +232,12 @@ impl ProxyService {
                 continue;
             }
 
+            // The response is served on the host origin: an upstream cookie would land
+            // beside the session and CSRF cookies and could overwrite them (C3).
+            if name_str == "set-cookie" || name_str == "set-cookie2" {
+                continue;
+            }
+
             if name_str == "location"
                 && let Ok(loc) = value.to_str()
             {

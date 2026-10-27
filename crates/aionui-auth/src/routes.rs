@@ -24,13 +24,14 @@ use aionui_common::constants::REFRESH_COOKIE_NAME;
 use aionui_db::{DbError, IDeviceRepository, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
-use crate::extract::{extract_cookie_value, extract_token_from_headers};
+use crate::extract::{extract_client_ip, extract_cookie_value, extract_token_from_headers};
 use crate::jwt::TokenType;
 use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
 use crate::qr_token::QrTokenStore;
 use crate::rate_limit::{
-    RateLimiter, api_rate_limit_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
+    RateLimiter, RefreshLimiter, api_rate_limit_middleware, auth_rate_limit_middleware,
+    authenticated_action_rate_limit_middleware, status_rate_limit_middleware,
 };
 use crate::rotation::RotateError;
 use crate::service::{AuthProvisionService, ProvisionError};
@@ -268,12 +269,14 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_limiter = Arc::new(RateLimiter::auth());
     let api_limiter = Arc::new(RateLimiter::api());
     let action_limiter = Arc::new(RateLimiter::authenticated_action());
+    let refresh_limiter = Arc::new(RefreshLimiter::new());
 
     // Start periodic cleanup for rate limiters
     let cleanup_interval = Duration::from_secs(60);
     auth_limiter.start_cleanup_task(cleanup_interval);
     api_limiter.start_cleanup_task(cleanup_interval);
     action_limiter.start_cleanup_task(cleanup_interval);
+    refresh_limiter.start_cleanup_task(cleanup_interval);
 
     let auth_state = AuthState {
         jwt_service: state.jwt_service.clone(),
@@ -296,9 +299,14 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .route_layer(from_fn_with_state(auth_limiter, auth_rate_limit_middleware))
         .with_state(state.clone());
 
+    // The public liveness probe: limited per IP, except from this machine (C7).
+    let status_public = Router::new()
+        .route("/api/auth/status", get(status_handler))
+        .route_layer(from_fn_with_state(api_limiter.clone(), status_rate_limit_middleware))
+        .with_state(state.clone());
+
     // API rate limited public routes (no auth required)
     let api_public = Router::new()
-        .route("/api/auth/status", get(status_handler))
         .route(
             "/api/auth/internal/external-users/{external_user_id}",
             put(ensure_external_user_handler),
@@ -364,14 +372,12 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .route_layer(from_fn_with_state(api_limiter.clone(), api_rate_limit_middleware))
         .with_state(state.clone());
 
-    // API + action limited routes (token in body, no auth middleware)
-    let api_action_limited = Router::new()
+    // Refresh (token in cookie or body, no auth middleware): limited inside the
+    // handler by the presented token's grant, not by IP (C7, Jev 048).
+    let refresh_limited = Router::new()
         .route("/api/auth/refresh", post(refresh_handler))
-        .route_layer(from_fn_with_state(
-            action_limiter,
-            authenticated_action_rate_limit_middleware,
-        ))
-        .route_layer(from_fn_with_state(api_limiter, api_rate_limit_middleware))
+        .route_layer(axum::middleware::from_fn(attach_client_ip))
+        .layer(Extension(refresh_limiter))
         .with_state(state);
 
     // Static page (no middleware)
@@ -379,9 +385,10 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
 
     Router::new()
         .merge(auth_rate_limited)
+        .merge(status_public)
         .merge(api_public)
         .merge(authenticated)
-        .merge(api_action_limited)
+        .merge(refresh_limited)
         .merge(static_routes)
 }
 
@@ -841,8 +848,20 @@ async fn change_password_handler(
 // POST /api/auth/refresh
 // ---------------------------------------------------------------------------
 
+/// The rate-limit client IP, resolved from the socket before the handler runs.
+#[derive(Clone)]
+struct ClientIp(String);
+
+async fn attach_client_ip(mut request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let ip = ClientIp(extract_client_ip(&request));
+    request.extensions_mut().insert(ip);
+    next.run(request).await
+}
+
 async fn refresh_handler(
     State(state): State<AuthRouterState>,
+    Extension(limiter): Extension<Arc<RefreshLimiter>>,
+    Extension(ClientIp(client_ip)): Extension<ClientIp>,
     headers: HeaderMap,
     body: Result<Json<RefreshTokenRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
@@ -855,6 +874,16 @@ async fn refresh_handler(
             (req.token, false)
         }
     };
+
+    // Count the request against the token's own grant when it verifies, so
+    // other callers on the same IP cannot exhaust the owner's refreshes; only
+    // unverifiable tokens share the per-IP bucket. `refresh_tokens` repeats
+    // the (stateless) verification and does the real checks.
+    match verify_refresh_credential(&state, &raw_token, from_cookie) {
+        Ok(payload) => limiter.check_verified(&payload.user_id, payload.grant_id.as_deref()),
+        Err(_) => limiter.check_invalid(&client_ip),
+    }
+    .map_err(ApiError::from)?;
 
     // Coalesce concurrent refreshes carrying the same token: one expired access
     // token can fail many in-flight requests at once, and without this each
@@ -881,6 +910,22 @@ async fn refresh_handler(
         .into_response())
 }
 
+/// Verify the signature and type of a presented refresh credential.
+///
+/// The body path stays lenient for legacy clients that post their access
+/// token, unless the host opted into strict refresh (--strict-refresh).
+fn verify_refresh_credential(
+    state: &AuthRouterState,
+    raw_token: &str,
+    from_cookie: bool,
+) -> Result<crate::jwt::TokenPayload, AuthError> {
+    if from_cookie || state.jwt_service.strict_refresh() {
+        state.jwt_service.verify_refresh(raw_token)
+    } else {
+        state.jwt_service.verify(raw_token)
+    }
+}
+
 /// Verify a refresh request and mint a fresh access + refresh token pair.
 ///
 /// A cookie-borne token must be a refresh token (`verify_refresh`); the legacy
@@ -894,14 +939,8 @@ async fn refresh_tokens(
     raw_token: &str,
     from_cookie: bool,
 ) -> Result<RefreshedTokens, RefreshError> {
-    // The body path stays lenient for legacy clients that post their access
-    // token, unless the host opted into strict refresh (--strict-refresh).
-    let payload = if from_cookie || state.jwt_service.strict_refresh() {
-        state.jwt_service.verify_refresh(raw_token)
-    } else {
-        state.jwt_service.verify(raw_token)
-    }
-    .map_err(|_| RefreshError::Unauthorized("Invalid or expired token"))?;
+    let payload = verify_refresh_credential(state, raw_token, from_cookie)
+        .map_err(|_| RefreshError::Unauthorized("Invalid or expired token"))?;
 
     let user = state
         .user_repo

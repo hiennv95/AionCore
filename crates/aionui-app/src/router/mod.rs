@@ -5,6 +5,7 @@ mod clipboard_writer;
 mod device_state;
 mod fs_monitor;
 mod health;
+mod host_guard;
 mod item_revealer;
 mod network_runner;
 mod network_state;
@@ -19,6 +20,7 @@ mod team_capability_resolver;
 mod team_conversation_adapters;
 mod trace;
 
+pub use host_guard::{AllowedHosts, with_host_guard};
 pub use origin_guard::{AllowedOrigins, InvalidOriginError, with_origin_guard};
 pub use routes::{
     RouterRuntime, create_router, create_router_with_all_state, create_router_with_runtime, create_router_with_states,
