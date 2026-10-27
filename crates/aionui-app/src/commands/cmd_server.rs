@@ -312,7 +312,13 @@ pub(crate) async fn run_server(
     // and other-machine browsers, behind its own same-origin guard. A bind
     // failure is reported in its status, not fatal: local use must keep working.
     if let Some(listener) = router_runtime.device_listener.as_ref()
-        && let Err(error) = listener.attach(router.clone()).await
+        && let Err(error) = listener
+            .attach(
+                router
+                    .clone()
+                    .layer(axum::Extension(aionui_realtime::ViaDeviceListener)),
+            )
+            .await
     {
         warn!(%error, "device listener did not start");
     }

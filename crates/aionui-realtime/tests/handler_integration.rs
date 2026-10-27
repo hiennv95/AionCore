@@ -442,3 +442,57 @@ async fn multiple_concurrent_connections() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(manager.client_count(), 10);
 }
+
+/// C6: sockets upgraded through the LAN device listener (marked with `ViaDeviceListener`)
+/// are cut when the owner turns the listener off; loopback sockets stay open.
+#[tokio::test]
+async fn turning_the_device_listener_off_cuts_only_its_sockets() {
+    let (state, manager) = default_state();
+    let loopback = start_server(state.clone()).await;
+    let lan_app = Router::new()
+        .route("/ws", get(ws_upgrade_handler))
+        .with_state(state)
+        .layer(axum::Extension(aionui_realtime::ViaDeviceListener));
+    let lan_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lan = lan_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(lan_listener, lan_app).await.unwrap() });
+
+    let (_desk_tx, mut desk_rx) = connect_with_token(loopback, "valid-token").await;
+    let (_phone_tx, mut phone_rx) = connect_with_token(lan, "valid-token").await;
+    for _ in 0..50 {
+        if manager.client_count() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(manager.client_count(), 2);
+
+    assert_eq!(manager.disconnect_device_listener("device listener stopped"), 1);
+    assert_eq!(manager.client_count(), 1);
+    assert_eq!(manager.disconnect_device_listener("again"), 0, "nothing left to cut");
+
+    // The phone's socket ends; the desktop's still receives events.
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(frame) = phone_rx.next().await {
+            if matches!(frame, Ok(tungstenite::Message::Close(_)) | Err(_)) {
+                return true;
+            }
+        }
+        true
+    })
+    .await;
+    assert_eq!(ended, Ok(true));
+    manager.broadcast_all(WebSocketMessage::new("still-here", json!({})));
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(Ok(frame)) = desk_rx.next().await {
+            if let tungstenite::Message::Text(text) = frame
+                && text.contains("still-here")
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert_eq!(got, Ok(true));
+}

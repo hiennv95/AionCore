@@ -46,9 +46,11 @@ pub struct WsHandlerState {
 pub async fn ws_upgrade_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
+    via: Option<axum::Extension<crate::types::ViaDeviceListener>>,
     axum::extract::State(state): axum::extract::State<WsHandlerState>,
 ) -> impl IntoResponse {
     let token = (state.token_extractor)(&headers);
+    let via_device_listener = via.is_some();
 
     // Echo Sec-WebSocket-Protocol so clients using it for auth
     // receive a valid subprotocol negotiation response.
@@ -63,14 +65,14 @@ pub async fn ws_upgrade_handler(
     };
 
     ws.on_upgrade(move |socket| async move {
-        handle_socket(socket, token, state).await;
+        handle_socket(socket, token, state, via_device_listener).await;
     })
 }
 
 /// Post-upgrade connection handler.
 ///
 /// Validates the token, registers the client, spawns send/recv loops.
-async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandlerState) {
+async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandlerState, via_device_listener: bool) {
     let Some(token) = token else {
         send_realtime_error_and_close(socket, RealtimeError::AuthMissing, "authentication required").await;
         return;
@@ -89,6 +91,9 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
     let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
     let user_id = principal.user_id.clone();
     let conn_id = state.manager.add_client_for_user(user_id.clone(), token, tx);
+    if via_device_listener {
+        state.manager.mark_via_device_listener(conn_id);
+    }
 
     info!(%conn_id, user_id = %user_id, "websocket connection established");
 
