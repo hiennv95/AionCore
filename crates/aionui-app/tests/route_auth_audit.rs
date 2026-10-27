@@ -421,3 +421,104 @@ async fn the_diagnostics_report_never_returns_another_users_rows() {
         assert!(!text.contains(leak), "bob's report contains {leak}: {text}");
     }
 }
+
+/// Cross-user isolation for assistants and their rule and skill files, which are addressed
+/// by a caller-chosen assistant id: bob can neither read, overwrite nor delete the owner's,
+/// nor take over the id by creating his own assistant with it.
+#[tokio::test]
+async fn another_user_cannot_read_or_replace_the_owners_assistant_rules() {
+    let (mut app, services) = common::build_app().await;
+    let (owner, oc) = common::setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (bob, bc) = common::setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
+    let assistant = serde_json::json!({"id": "owner-a", "name": "owner-assistant", "agent_id": "632f31d2"});
+    let (status, body) = call(&app, Method::POST, "/api/assistants", &owner, &oc, assistant.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for kind in ["rule", "skill"] {
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            &format!("/api/skills/assistant-{kind}/write"),
+            &owner,
+            &oc,
+            serde_json::json!({"assistant_id": "owner-a", "content": format!("owner {kind} body")}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let mut leaks = Vec::new();
+    let (status, body) = call(&app, Method::POST, "/api/assistants", &bob, &bc, assistant).await;
+    if status.is_success() {
+        leaks.push(format!("bob created an assistant with the owner's id: {body}"));
+    }
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        "/api/assistants/owner-a",
+        &bob,
+        &bc,
+        serde_json::Value::Null,
+    )
+    .await;
+    if status.is_success() {
+        leaks.push(format!("GET /api/assistants/owner-a -> {status} {body}"));
+    }
+    for kind in ["rule", "skill"] {
+        let read = format!("/api/skills/assistant-{kind}/read");
+        let (status, body) = call(
+            &app,
+            Method::POST,
+            &read,
+            &bob,
+            &bc,
+            serde_json::json!({"assistant_id": "owner-a"}),
+        )
+        .await;
+        if body.to_string().contains("owner ") {
+            leaks.push(format!("bob read the owner's {kind}: {status} {body}"));
+        }
+        call(
+            &app,
+            Method::POST,
+            &format!("/api/skills/assistant-{kind}/write"),
+            &bob,
+            &bc,
+            serde_json::json!({"assistant_id": "owner-a", "content": "bob was here"}),
+        )
+        .await;
+        call(
+            &app,
+            Method::DELETE,
+            &format!("/api/skills/assistant-{kind}/owner-a"),
+            &bob,
+            &bc,
+            serde_json::Value::Null,
+        )
+        .await;
+        let (_, body) = call(
+            &app,
+            Method::POST,
+            &read,
+            &owner,
+            &oc,
+            serde_json::json!({"assistant_id": "owner-a"}),
+        )
+        .await;
+        if body["data"] != format!("owner {kind} body") {
+            leaks.push(format!("the owner's {kind} changed: {body}"));
+        }
+    }
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/assistants/owner-a",
+        &owner,
+        &oc,
+        serde_json::Value::Null,
+    )
+    .await;
+    if !body.to_string().contains("owner-assistant") {
+        leaks.push(format!("the owner's assistant changed: {body}"));
+    }
+    assert!(leaks.is_empty(), "{}", leaks.join("\n"));
+}
