@@ -412,6 +412,7 @@ dependencies = [
  "aionui-device",
  "aionui-extension",
  "aionui-file",
+ "aionui-inbox",
  "aionui-mcp",
  "aionui-network",
  "aionui-office",
@@ -742,6 +743,26 @@ dependencies = [
  "tracing",
  "walkdir",
  "zip 2.4.2",
+]
+
+[[package]]
+name = "aionui-inbox"
+version = "0.2.2"
+dependencies = [
+ "aionui-ai-agent",
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "aionui-realtime",
+ "async-trait",
+ "axum",
+ "http-body-util",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]

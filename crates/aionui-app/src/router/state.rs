@@ -30,6 +30,7 @@ use aionui_extension::{
     resolve_scan_paths_for_data_dir, resolve_state_file_path,
 };
 use aionui_file::{FileRouterState, FileService, SnapshotService};
+use aionui_inbox::{InboxRouterState, InboxService};
 use aionui_mcp::{
     AionrsAdapter, AionuiAdapter, ClaudeAdapter, CodeBuddyAdapter, CodexAdapter, GeminiAdapter, McpAgentAdapter,
     McpConfigService, McpConnectionTestService, McpRouterState, McpSyncService, OpencodeAdapter, QwenAdapter,
@@ -149,6 +150,7 @@ pub struct ModuleStates {
     pub cron: CronRouterState,
     pub office: OfficeRouterState,
     pub preview: PreviewRouterState,
+    pub inbox: InboxRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
     /// Private-LAN network (ADR-009); `None` when its identity cannot be loaded.
@@ -343,6 +345,7 @@ pub async fn build_module_states(
         cron,
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         preview: build_module_state_phase(&boot, "preview", || build_preview_state(services)),
+        inbox: build_module_state_phase(&boot, "inbox", || build_inbox_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
     };
@@ -1087,6 +1090,21 @@ pub fn build_preview_state(services: &AppServices) -> PreviewRouterState {
     ));
     services.conversation_service.with_files_reported_hook(service.clone());
     PreviewRouterState { service }
+}
+
+/// Attention inbox (B05): live approvals from running agents plus recorded turn outcomes.
+/// Turn ends and user stops are recorded through the conversation hooks.
+pub fn build_inbox_state(services: &AppServices) -> InboxRouterState {
+    let pool = services.database.pool().clone();
+    let service = Arc::new(InboxService::new(
+        Arc::new(aionui_db::SqliteTurnOutcomeRepository::new(pool.clone())),
+        Arc::new(aionui_db::SqliteConversationRepository::new(pool)),
+        services.worker_task_manager.clone(),
+        services.event_bus.clone(),
+    ));
+    services.conversation_service.with_turn_ended_hook(service.clone());
+    services.conversation_service.with_turn_cancelled_hook(service.clone());
+    InboxRouterState { service }
 }
 
 pub fn build_office_state(services: &AppServices) -> OfficeRouterState {

@@ -21,6 +21,7 @@ mod custom_agent;
 mod device;
 mod extension;
 mod file;
+mod inbox;
 mod lifecycle;
 mod mcp;
 mod network;
@@ -139,6 +140,9 @@ pub use file::{
     ReadFileRequest, RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
     SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery,
     WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
+};
+pub use inbox::{
+    INBOX_OUTCOME_LIMIT, InboxApproval, InboxChangedPayload, InboxOutcome, InboxResponse, InboxSeenRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

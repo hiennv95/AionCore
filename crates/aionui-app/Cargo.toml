@@ -43,6 +43,7 @@ aionui-team.workspace = true
 aionui-team-prompts.workspace = true
 aionui-cron.workspace = true
 aionui-preview.workspace = true
+aionui-inbox.workspace = true
 aionui-project.workspace = true
 aionui-sidebar.workspace = true
 aionui-assistant.workspace = true

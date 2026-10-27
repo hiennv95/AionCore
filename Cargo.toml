@@ -30,6 +30,7 @@ members = [
     "crates/aionui-sidebar",
     "crates/aionui-cron",
     "crates/aionui-preview",
+    "crates/aionui-inbox",
     "crates/aionui-assistant",
     "crates/aionui-app",
 ]
@@ -70,6 +71,7 @@ aionui-project = { path = "crates/aionui-project" }
 aionui-sidebar = { path = "crates/aionui-sidebar" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-preview = { path = "crates/aionui-preview" }
+aionui-inbox = { path = "crates/aionui-inbox" }
 aionui-assistant = { path = "crates/aionui-assistant" }
 aionui-app = { path = "crates/aionui-app" }
 
