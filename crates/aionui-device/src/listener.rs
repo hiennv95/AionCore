@@ -82,6 +82,17 @@ async fn same_origin_only(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
+/// The desktop bootstrap (session from the bootstrap secret, and the host proof) is for
+/// the desktop app on loopback only: the LAN has no reason to reach it (audit H14).
+async fn no_desktop_bootstrap(request: Request, next: Next) -> Response {
+    let path = request.uri().path().trim_end_matches('/');
+    if path == "/api/devices/app-session" || path == "/api/devices/host-proof" {
+        tracing::info!(path, "device listener: desktop bootstrap refused");
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    next.run(request).await
+}
+
 /// Every cookie issued over this TLS listener is `Secure`, so a browser never
 /// replays the owner session over plain HTTP to another port on this host.
 async fn secure_cookies(request: Request, next: Next) -> Response {
@@ -134,6 +145,7 @@ impl DeviceListener {
     pub async fn attach(&self, router: Router) -> Result<(), DeviceError> {
         let _ = self.router.set(
             router
+                .layer(middleware::from_fn(no_desktop_bootstrap))
                 .layer(middleware::from_fn(same_origin_only))
                 .layer(middleware::from_fn(secure_cookies)),
         );

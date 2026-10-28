@@ -34,9 +34,12 @@ pub async fn run_doctor(cli: &Cli, merged_path: &str) -> Result<ExitCode, CliBou
 
     // Use the real on-disk DB so the report reflects the user's actual
     // catalog (including custom agents they've added via the UI).
-    let db_path = cli.data_dir.join("aionui-backend.db");
+    // Same owner-only data dir and database as the server (audit H2).
+    let data_dir = crate::bootstrap::secure_data_dir(&cli.data_dir).map_err(|_| doctor_database_error())?;
+    let db_path = data_dir.join("aionui-backend.db");
     maybe_copy_legacy_database(&db_path).map_err(|_| doctor_database_error())?;
     let database = init_database(&db_path).await.map_err(|_| doctor_database_error())?;
+    crate::bootstrap::secure_database_files(&db_path);
 
     let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(database.pool().clone()));
     let registry = AgentRegistry::new(repo);

@@ -54,11 +54,18 @@ pub(crate) async fn backup_before_migrations(
         "{file_name}{BACKUP_MARKER}{applied}-{}.sqlite",
         aionui_common::now_ms()
     ));
-    sqlx::query("VACUUM INTO ?")
+    // VACUUM INTO fills an existing empty file and keeps its mode, so the copy is
+    // owner-only from the start (audit H1).
+    crate::private_file::create_private_file(&backup)
+        .map_err(|e| DbError::Init(format!("Failed to create the pre-migration backup: {e}")))?;
+    if let Err(error) = sqlx::query("VACUUM INTO ?")
         .bind(backup.to_string_lossy().into_owned())
         .execute(pool)
         .await
-        .map_err(DbError::Query)?;
+    {
+        let _ = std::fs::remove_file(&backup);
+        return Err(DbError::Query(error));
+    }
     info!(
         applied_version = applied,
         target_version = latest,
@@ -149,6 +156,21 @@ mod tests {
         let copy = file_pool(&backup).await;
         let (body,): (String,) = sqlx::query_as("SELECT body FROM notes").fetch_one(&copy).await.unwrap();
         assert_eq!(body, "kept");
+    }
+
+    /// Audit H1: the copy holds the database secrets, so it is owner-only whatever the umask.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_backup_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aionui.db");
+        let pool = file_pool(&path).await;
+        migrated_to(&pool, 44).await;
+
+        let backup = backup_before_migrations(&pool, &path, Some(45)).await.unwrap().unwrap();
+        assert_eq!(std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[tokio::test]

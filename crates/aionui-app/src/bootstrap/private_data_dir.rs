@@ -48,20 +48,21 @@ pub(crate) fn secure_data_dir(dir: &Path) -> Result<PathBuf, BootstrapError> {
 }
 
 /// Restricts the SQLite database and its WAL/SHM side files to the owner
-/// (0600). Best effort: the 0700 directory already blocks other accounts.
+/// (0600). Best effort: the 0700 directory already blocks other accounts. A
+/// symlink in place of one of them is left alone, and so is its target: the
+/// chmod goes through a descriptor opened without following it (audit H2).
 #[cfg(unix)]
 pub(crate) fn secure_database_files(db_path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
     for suffix in ["", "-wal", "-shm"] {
         let mut path = db_path.as_os_str().to_owned();
         path.push(suffix);
         let path = std::path::PathBuf::from(path);
-        if !path.exists() {
-            continue;
-        }
-        if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
-            tracing::warn!(path = %path.display(), %error, "could not restrict database file permissions");
+        match aionui_db::restrict_to_owner(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "could not restrict database file permissions");
+            }
         }
     }
 }
@@ -106,5 +107,23 @@ mod tests {
         secure_database_files(&db);
         assert_eq!(mode(&db), 0o600);
         assert_eq!(mode(&root.path().join("aionui-backend.db-wal")), 0o600);
+    }
+
+    /// Audit H2: a symlink planted as a side file never has its target's mode changed.
+    #[test]
+    fn leaves_a_symlinked_side_file_and_its_target_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("aionui-backend.db");
+        std::fs::write(&db, b"x").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, b"not ours").unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&outside, root.path().join("aionui-backend.db-wal")).unwrap();
+
+        secure_database_files(&db);
+
+        assert_eq!(mode(&db), 0o600);
+        assert_eq!(mode(&outside), 0o644, "the symlink target keeps its mode");
     }
 }

@@ -8,6 +8,8 @@ mod instance_lock;
 mod legacy_handoff;
 mod migrate_repair;
 mod migration_backup;
+mod private_file;
+pub use private_file::restrict_to_owner;
 pub mod models;
 mod repository;
 

@@ -67,6 +67,9 @@ impl HttpsPeerTransport {
             .connect_timeout(CONNECT_TIMEOUT)
             // Peer calls go straight to the LAN address; never through a proxy.
             .no_proxy()
+            // Nor anywhere a peer redirects to: a 3xx could send the request, body
+            // included, to a plain-HTTP or unpinned URL (audit H22).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| NetworkError::Internal(format!("peer client: {e}")))
     }

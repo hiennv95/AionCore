@@ -226,8 +226,16 @@ pub fn maybe_copy_legacy_database(target: &Path) -> Result<(), DbError> {
     }
 
     let tmp = target.with_extension("db.tmp");
-    retry_startup_file_op("copy legacy database", &legacy, || std::fs::copy(&legacy, &tmp))
-        .map_err(|e| DbError::Init(format!("Failed to copy legacy database: {e}")))?;
+    // Owner-only from the start, and never through a planted symlink (audit H1). A
+    // regular staging file left by an interrupted copy is replaced; anything else
+    // there makes the copy fail.
+    retry_startup_file_op("copy legacy database", &legacy, || {
+        if std::fs::symlink_metadata(&tmp).is_ok_and(|meta| meta.file_type().is_file()) {
+            std::fs::remove_file(&tmp)?;
+        }
+        crate::private_file::copy_to_private_file(&legacy, &tmp)
+    })
+    .map_err(|e| DbError::Init(format!("Failed to copy legacy database: {e}")))?;
     if target.exists() {
         let _ = std::fs::remove_file(&tmp);
         return Ok(());
@@ -712,6 +720,13 @@ async fn recover_and_retry(path: &Path, original_error: DbError) -> Result<Datab
                 "Recovery failed: could not backup corrupted database: {e}. \
                  Original error: {original_error}"
             )),
+        )
+    })?;
+    // The moved file still holds the secrets (audit H1).
+    crate::private_file::restrict_to_owner(Path::new(&backup_path)).map_err(|e| {
+        DatabaseInitError::new(
+            "database.recovery",
+            DbError::Init(format!("Recovery failed: could not restrict the database backup: {e}")),
         )
     })?;
 
