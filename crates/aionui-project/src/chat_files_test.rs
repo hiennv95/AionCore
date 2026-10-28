@@ -636,3 +636,166 @@ async fn upgraded_ref_carries_exactly_the_fs_channel_target_fields() {
     assert_eq!(target.pe_id, pe_id);
     assert_eq!(target.relative_path, "watched.md");
 }
+
+/// An `upload` ref answers the same for an existing and a missing target behind a symlink
+/// inside the upload dir (final component or a parent), so a planted link is no existence
+/// probe for files outside it; nothing behind the link is followed.
+#[cfg(unix)]
+#[tokio::test]
+async fn upload_symlinks_are_refused_without_probing_their_targets() {
+    let (service, _pe_id, _dir, upload_root) = setup().await;
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), b"x").unwrap();
+    let root = upload_root.path();
+    std::os::unix::fs::symlink(outside.path().join("secret.txt"), root.join("to-file")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("missing.txt"), root.join("to-missing")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("to-dir")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("no-dir"), root.join("to-missing-dir")).unwrap();
+
+    let resolve = |path: std::path::PathBuf| {
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .resolve_chat_message(
+                    "system_default_user",
+                    "x",
+                    &[ChatFileRef::Upload {
+                        path: path.to_string_lossy().into_owned(),
+                    }],
+                    root,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| std::mem::discriminant(&e))
+        }
+    };
+    let file_link = resolve(root.join("to-file")).await;
+    let missing_link = resolve(root.join("to-missing")).await;
+    assert!(file_link.is_err());
+    assert_eq!(file_link, missing_link, "final-component link");
+    let dir_link = resolve(root.join("to-dir").join("secret.txt")).await;
+    let missing_dir_link = resolve(root.join("to-missing-dir").join("secret.txt")).await;
+    assert!(dir_link.is_err());
+    assert_eq!(dir_link, missing_dir_link, "parent link");
+    assert_eq!(file_link, dir_link, "one refusal for every link");
+
+    // A regular upload in a regular subdirectory still resolves.
+    std::fs::create_dir(root.join("conv-1")).unwrap();
+    std::fs::write(root.join("conv-1").join("note.txt"), b"hi").unwrap();
+    assert!(resolve(root.join("conv-1").join("note.txt")).await.is_ok());
+}
+
+/// The upload root itself must be a real directory of this user that others cannot write:
+/// a root planted as a symlink (e.g. in a shared `/tmp`) or a world-writable root would
+/// turn "inside the upload dir" into any directory the planter chose.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_untrusted_upload_root_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (service, _pe_id, _dir, scratch) = setup().await;
+    let target = scratch.path().join("owner-dir");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("secret.txt"), b"x").unwrap();
+    let linked_root = scratch.path().join("aionui-link");
+    std::os::unix::fs::symlink(&target, &linked_root).unwrap();
+
+    let resolve = |root: std::path::PathBuf, path: std::path::PathBuf| {
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .resolve_chat_message(
+                    "system_default_user",
+                    "x",
+                    &[ChatFileRef::Upload {
+                        path: path.to_string_lossy().into_owned(),
+                    }],
+                    &root,
+                )
+                .await
+                .map(|_| ())
+        }
+    };
+    let via_link = resolve(linked_root.clone(), linked_root.join("secret.txt")).await;
+    assert!(
+        matches!(via_link, Err(ProjectError::UploadPathOutsideRoot { .. })),
+        "symlinked root: {via_link:?}"
+    );
+
+    let open_root = scratch.path().join("open-root");
+    std::fs::create_dir(&open_root).unwrap();
+    std::fs::write(open_root.join("note.txt"), b"x").unwrap();
+    std::fs::set_permissions(&open_root, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let open = resolve(open_root.clone(), open_root.join("note.txt")).await;
+    assert!(
+        matches!(open, Err(ProjectError::UploadPathOutsideRoot { .. })),
+        "world-writable root: {open:?}"
+    );
+    std::fs::set_permissions(&open_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        resolve(open_root.clone(), open_root.join("note.txt")).await.is_ok(),
+        "a private root works"
+    );
+}
+
+/// Group- or other-writable directories anywhere on the walk (the root or a directory
+/// below it) are refused: another account could plant or swap links there.
+#[cfg(unix)]
+#[tokio::test]
+async fn group_or_world_writable_upload_dirs_are_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (service, _pe_id, _dir, scratch) = setup().await;
+    let resolve = |root: std::path::PathBuf, path: std::path::PathBuf| {
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .resolve_chat_message(
+                    "system_default_user",
+                    "x",
+                    &[ChatFileRef::Upload {
+                        path: path.to_string_lossy().into_owned(),
+                    }],
+                    &root,
+                )
+                .await
+                .map(|_| ())
+        }
+    };
+    let mode = |path: &std::path::Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+
+    let root = scratch.path().join("root");
+    std::fs::create_dir_all(root.join("conv")).unwrap();
+    std::fs::write(root.join("conv").join("note.txt"), b"x").unwrap();
+    let file = root.join("conv").join("note.txt");
+    mode(&root, 0o755);
+    mode(&root.join("conv"), 0o755);
+    assert!(
+        resolve(root.clone(), file.clone()).await.is_ok(),
+        "0755 root and dir work"
+    );
+
+    mode(&root, 0o770);
+    let group_root = resolve(root.clone(), file.clone()).await;
+    assert!(
+        matches!(group_root, Err(ProjectError::UploadPathOutsideRoot { .. })),
+        "group-writable root: {group_root:?}"
+    );
+    mode(&root, 0o755);
+
+    mode(&root.join("conv"), 0o777);
+    let open_dir = resolve(root.clone(), file.clone()).await;
+    assert!(
+        matches!(open_dir, Err(ProjectError::UploadPathOutsideRoot { .. })),
+        "world-writable dir below the root: {open_dir:?}"
+    );
+    mode(&root.join("conv"), 0o775);
+    let group_dir = resolve(root.clone(), file.clone()).await;
+    assert!(
+        matches!(group_dir, Err(ProjectError::UploadPathOutsideRoot { .. })),
+        "group-writable dir below the root: {group_dir:?}"
+    );
+    mode(&root.join("conv"), 0o755);
+}

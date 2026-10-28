@@ -174,3 +174,27 @@ async fn create_local_user_rejects_invalid_input_without_writing() {
         "no user may be created when validation fails"
     );
 }
+
+// Audit H15: setting the password of an existing account revokes its sessions, like
+// `POST /api/auth/change-password` does. The auth middleware compares the token's
+// session generation with the stored one on every request, so the bump also applies to
+// a server that is already running.
+#[tokio::test]
+async fn setting_an_existing_password_bumps_the_session_generation() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteUserRepository::new(db.pool().clone());
+
+    let before = repo.get_system_user().await.unwrap().unwrap().session_generation;
+    set_local_password(&repo, None, "StrongP@ss1").await.unwrap();
+    let after = repo.get_system_user().await.unwrap().unwrap().session_generation;
+    assert!(after > before, "default user: {before} -> {after}");
+
+    let created = set_local_password(&repo, Some("alice"), "StrongP@ss1").await.unwrap();
+    let PasswordOutcome::Created { id, .. } = created else {
+        panic!("expected Created");
+    };
+    let first = repo.find_by_id(&id).await.unwrap().unwrap().session_generation;
+    set_local_password(&repo, Some("alice"), "An0ther#Pass").await.unwrap();
+    let second = repo.find_by_id(&id).await.unwrap().unwrap().session_generation;
+    assert!(second > first, "existing user: {first} -> {second}");
+}

@@ -561,6 +561,28 @@ async fn t8_1_change_password_success() {
     assert_eq!(json["message"], "Password changed successfully");
 }
 
+/// Audit H16: on a passwordless host the seeded owner has an empty hash. Changing the
+/// password then answers 401 like a wrong current password, not a 500 from bcrypt.
+#[tokio::test]
+async fn t8_1b_change_password_without_a_password_is_unauthorized() {
+    let (app, ctx) = test_app().await;
+    let token = ctx
+        .jwt_service
+        .sign_with_session_generation("system_default_user", "admin", 0)
+        .unwrap();
+
+    let req = json_post_with_token(
+        "/api/auth/change-password",
+        r#"{"current_password":"Anything1!","new_password":"NewP@ssword2"}"#,
+        &token,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
 #[tokio::test]
 async fn t8_2_change_password_old_token_invalidated() {
     let (mut app, ctx) = test_app().await;

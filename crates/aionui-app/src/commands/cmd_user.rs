@@ -15,10 +15,9 @@
 //! outcome. No account business logic (validation, hashing, seed-vs-named-user
 //! resolution) lives here.
 //!
-//! `set-password` does NOT bump `session_generation`, so changing a password
-//! while a server is running will not revoke live sessions — restart the
-//! server after a hot change. For fresh bootstrap (server not yet started)
-//! this is irrelevant.
+//! `set-password` on an existing account bumps its `session_generation`, so its
+//! live sessions (desktop app and paired devices included) are revoked at once,
+//! even on a running server, as with `POST /api/auth/change-password`.
 
 use std::io::{self, IsTerminal};
 use std::process::ExitCode;

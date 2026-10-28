@@ -869,7 +869,7 @@ impl SessionAgentTask {
                     conv_id = %conv_id,
                     request_id = %request_id,
                     error = %e,
-                    "permission answer FAILED after REST confirm already returned success — claude stays blocked on can_use_tool"
+                    "permission answer FAILED after REST confirm already returned success — no open approval with this id (already answered, resolved or from a replaced process), or the backend write failed"
                 ),
             }
         });

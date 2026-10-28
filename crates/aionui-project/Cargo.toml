@@ -28,6 +28,9 @@ ignore.workspace = true
 git2.workspace = true
 trash.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

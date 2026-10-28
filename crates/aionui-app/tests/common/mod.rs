@@ -130,6 +130,47 @@ pub async fn build_app_with_mock_version(
 /// Use for tests that exercise runtime preparation paths (team ensure_session,
 /// send_message) where spawning a real CLI process is not feasible.
 pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
+    build_app_with_mock_agents_config(&AppConfig::default()).await
+}
+
+/// [`build_app_with_mock_agents`] with a data dir, so the desktop bootstrap file exists
+/// (for [`desktop_and_phone`]).
+pub async fn build_app_with_mock_agents_at(root: &std::path::Path) -> (axum::Router, AppServices) {
+    let config = AppConfig {
+        data_dir: root.to_path_buf(),
+        work_dir: root.to_path_buf(),
+        ..Default::default()
+    };
+    build_app_with_mock_agents_config(&config).await
+}
+
+/// Runtime env each mock agent was built with, by conversation id (what a real agent
+/// process would receive, e.g. `AIONUI_RUNTIME_TOKEN`).
+pub type CapturedRuntimeEnv =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<(String, String)>>>>;
+
+/// [`build_app_with_mock_agents_at`] that also records each agent's runtime env.
+pub async fn build_app_with_capturing_mock_agents_at(
+    root: &std::path::Path,
+) -> (axum::Router, AppServices, CapturedRuntimeEnv) {
+    let config = AppConfig {
+        data_dir: root.to_path_buf(),
+        work_dir: root.to_path_buf(),
+        ..Default::default()
+    };
+    let captured: CapturedRuntimeEnv = Default::default();
+    let (router, services) = build_app_with_mock_agents_capturing(&config, Some(captured.clone())).await;
+    (router, services, captured)
+}
+
+async fn build_app_with_mock_agents_config(config: &AppConfig) -> (axum::Router, AppServices) {
+    build_app_with_mock_agents_capturing(config, None).await
+}
+
+async fn build_app_with_mock_agents_capturing(
+    config: &AppConfig,
+    captured: Option<CapturedRuntimeEnv>,
+) -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
     let factory: std::sync::Arc<
         dyn Fn(
@@ -138,7 +179,13 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
                 -> futures_util::future::BoxFuture<'static, Result<AgentInstance, aionui_ai_agent::AgentError>>
             + Send
             + Sync,
-    > = std::sync::Arc::new(|opts| {
+    > = std::sync::Arc::new(move |opts| {
+        if let Some(captured) = &captured {
+            captured
+                .lock()
+                .unwrap()
+                .insert(opts.conversation_id().to_owned(), opts.context.runtime_env.clone());
+        }
         Box::pin(async move {
             Ok(AgentInstance::Mock(std::sync::Arc::new(NoopMockAgent {
                 conversation_id: opts.conversation_id().to_owned(),
@@ -147,7 +194,7 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
     });
     let wtm: std::sync::Arc<dyn aionui_ai_agent::IWorkerTaskManager> =
         std::sync::Arc::new(WorkerTaskManagerImpl::new(factory));
-    let services = AppServices::from_config(db, &AppConfig::default())
+    let services = AppServices::from_config(db, config)
         .await
         .unwrap()
         .with_worker_task_manager(wtm);

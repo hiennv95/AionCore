@@ -809,7 +809,8 @@ async fn change_password_handler(
         .ok_or_else(|| ApiError::NotFound("User not found".into()))?;
 
     // Verify current password
-    let Some(password_hash) = user.password_hash.as_deref() else {
+    // A passwordless owner (empty seeded hash) answers like a wrong password (audit H16).
+    let Some(password_hash) = user.password_hash.as_deref().filter(|hash| !hash.trim().is_empty()) else {
         return Err(ApiError::Unauthorized("Current password is incorrect".into()));
     };
     let valid = verify_password_timed(&req.current_password, password_hash).await?;

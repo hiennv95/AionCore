@@ -14,7 +14,7 @@ use aionui_api_types::{
     ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
     SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, ensure_no_local_files};
 use aionui_common::ApiError;
 
 use crate::ConversationError;
@@ -304,10 +304,13 @@ async fn get_msg(
 async fn send_msg(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    ensure_no_local_files(&req.files, device.as_deref(), helper.as_deref())?;
     let response = state
         .service
         .send_message(&user.id, &id, req, &state.task_manager)

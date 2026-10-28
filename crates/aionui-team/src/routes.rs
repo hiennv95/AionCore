@@ -19,7 +19,7 @@ use aionui_api_types::{
     TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
     TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, is_paired_device};
+use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, ensure_no_local_files, is_paired_device};
 use aionui_common::ApiError;
 use aionui_db::{ActivityCursor, DbError, PageDirection};
 
@@ -536,10 +536,13 @@ async fn reset_agent_context(
 async fn send_message(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
     body: Result<Json<SendTeamMessageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TeamRunAckResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    ensure_no_local_files(req.files.iter().flatten(), device.as_deref(), helper.as_deref())?;
     let ack = state
         .service
         .send_message(&user.id, &id, &req.content, req.files)
@@ -550,10 +553,13 @@ async fn send_message(
 async fn send_message_to_agent(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     Path(params): Path<AgentPathParams>,
     body: Result<Json<SendAgentMessageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TeamRunAckResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    ensure_no_local_files(req.files.iter().flatten(), device.as_deref(), helper.as_deref())?;
     let ack = state
         .service
         .send_message_to_agent(&user.id, &params.id, &params.slot_id, &req.content, req.files)
@@ -564,10 +570,13 @@ async fn send_message_to_agent(
 async fn interrupt_agent(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     Path(params): Path<AgentPathParams>,
     body: Result<Json<InterruptTeamAgentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TeamInterruptAgentResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    ensure_no_local_files(req.files.iter().flatten(), device.as_deref(), helper.as_deref())?;
     let response = state
         .service
         .interrupt_agent(&user.id, &params.id, &params.slot_id, req)

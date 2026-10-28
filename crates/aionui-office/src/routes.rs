@@ -12,7 +12,7 @@ use aionui_api_types::{
     ApiResponse, DocumentConversionRequest, PreviewUrlResponse, RefreshPreviewRequest, RefreshPreviewResponse,
     StartPreviewRequest, StopPreviewRequest,
 };
-use aionui_auth::{CurrentUser, desktop_only};
+use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, desktop_only, ensure_no_local_files};
 use aionui_common::ApiError;
 use aionui_file::{FileError, path_safety::validate_path_with_extra_root};
 use axum::middleware::from_fn;
@@ -102,9 +102,19 @@ async fn start_word_preview(
 async fn stop_word_preview(
     State(state): State<OfficeRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, &user.id, body, DocType::Word).await
+    stop_preview(
+        state,
+        &user.id,
+        device.as_deref(),
+        helper.as_deref(),
+        body,
+        DocType::Word,
+    )
+    .await
 }
 
 async fn refresh_word_preview(
@@ -126,9 +136,19 @@ async fn start_excel_preview(
 async fn stop_excel_preview(
     State(state): State<OfficeRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, &user.id, body, DocType::Excel).await
+    stop_preview(
+        state,
+        &user.id,
+        device.as_deref(),
+        helper.as_deref(),
+        body,
+        DocType::Excel,
+    )
+    .await
 }
 
 async fn refresh_excel_preview(
@@ -150,9 +170,19 @@ async fn start_ppt_preview(
 async fn stop_ppt_preview(
     State(state): State<OfficeRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, &user.id, body, DocType::Ppt).await
+    stop_preview(
+        state,
+        &user.id,
+        device.as_deref(),
+        helper.as_deref(),
+        body,
+        DocType::Ppt,
+    )
+    .await
 }
 
 async fn refresh_ppt_preview(
@@ -311,10 +341,14 @@ fn refresh_resolve_error(err: aionui_project::ProjectError) -> ApiError {
 async fn stop_preview(
     state: OfficeRouterState,
     user_id: &str,
+    device: Option<&CurrentDevice>,
+    helper: Option<&RuntimeHelperCaller>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    // Stop stays open to devices, but resolving a `Local` ref probes a host path.
+    ensure_no_local_files(req.file.iter(), device, helper)?;
     // Resolve the same identity `start_preview` used so `stop_for_user` derives
     // the same session key (watch_manager re-canonicalizes internally). Prefer
     // the ChatFileRef; fall back to the legacy device path. Post-migration the

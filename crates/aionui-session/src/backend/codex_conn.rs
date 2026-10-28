@@ -1552,6 +1552,12 @@ impl CodexSessionBackend {
         // Clearing it prevents a steer/interrupt right after wake from targeting a
         // stale turn id (the reader re-binds active_turn_id on the next turn/started).
         *self.active_turn_id.lock().await = None;
+        // Approvals belong to the process that raised them: the fresh process cannot
+        // answer them, and it must not inherit them (its own ids restart at 0).
+        self.pending_tool_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let reader = start_codex_reader(&self.reader_state, stdout, io.clone());
         // Replay the handshake against the bound threadId (resume re-attach). On a
         // handshake failure, abort the just-started reader so its AgentIo clone
@@ -2557,11 +2563,20 @@ fn rollback_to_turn(result: &Value) -> u64 {
         .unwrap_or(0)
 }
 
-/// Remove a resolved/answered approval from the recovery registry. `serverRequest/
-/// resolved` carries the RAW wire id, but an elicitation was stored under the
-/// `ELICIT_PREFIX`-tagged key — so try the raw id first, then the prefixed form, so
-/// a resolved notification clears either entry shape. `dispatch(AnswerPermission)`
-/// passes the exact stored key (raw or prefixed), which the first lookup catches.
+/// Remove `request_id` (the exact stored key: raw for tool/file, `ELICIT_PREFIX`-tagged
+/// for elicitation) from the open approvals, returning its entry when it was open.
+/// `dispatch(AnswerPermission)` uses it before writing an answer.
+fn take_pending_tool_approval(
+    pending: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    request_id: &str,
+) -> Option<String> {
+    pending.lock().unwrap_or_else(|e| e.into_inner()).remove(request_id)
+}
+
+/// Remove a resolved approval from the recovery registry. `serverRequest/resolved`
+/// carries the RAW wire id, but an elicitation was stored under the
+/// `ELICIT_PREFIX`-tagged key — so try the raw id first, then the prefixed form, so a
+/// resolved notification clears either entry shape.
 fn remove_pending_tool_approval(pending: &Arc<std::sync::Mutex<HashMap<String, String>>>, request_id: &str) {
     let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
     if map.remove(request_id).is_none() {
@@ -4417,6 +4432,18 @@ impl SessionBackend for CodexSessionBackend {
                 selected: _, // codex approval is accept/decline; no pick-one label
                 answers: _,  // codex has no AskUserQuestion; per-question answers N/A
             } => {
+                // Only an approval that is open on this backend is answered, exactly once:
+                // a repeated answer, or one for an approval of a process that was replaced
+                // (a wake clears them), is refused and never written. Not
+                // covered yet: codex numbers requests per process (captured first
+                // approvals are all id "0"), so after a restart an old card's id can match
+                // a new open approval (per-process id tagging is the planned next slice).
+                // Same rule as claude's `answer_permission`.
+                let Some(taken) = take_pending_tool_approval(&self.pending_tool_approvals, &request_id) else {
+                    return Err(BackendError::Transport(format!(
+                        "no pending permission for request_id {request_id}"
+                    )));
+                };
                 let approved = matches!(
                     decision,
                     super::types::PermissionDecision::Approved | super::types::PermissionDecision::AllowAlways
@@ -4453,12 +4480,15 @@ impl SessionBackend for CodexSessionBackend {
                         "result": { "decision": decision_str }
                     })
                 };
-                self.write_frame(frame).await?;
-                // We answered it → drop from the REST-recovery registry so a
-                // subsequent GET /confirmations no longer resurfaces a card the user
-                // already resolved. `request_id` is the exact stored key (raw for
-                // tool/file, ELICIT_PREFIX-tagged for elicitation).
-                remove_pending_tool_approval(&self.pending_tool_approvals, &request_id);
+                // The entry was taken above, so a later GET /confirmations no longer
+                // resurfaces a card the user already resolved. A failed write puts it back.
+                if let Err(error) = self.write_frame(frame).await {
+                    self.pending_tool_approvals
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(request_id, taken);
+                    return Err(error);
+                }
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -5284,6 +5314,67 @@ mod tests {
         );
     }
 
+    /// An answer is only written for an approval this process has open. Codex numbers its
+    /// server requests per process (every captured first approval is id "0"), so an answer
+    /// for an id that is not pending here — a stale card from an earlier process, or a
+    /// repeated answer — must be refused and must never reach codex as a response.
+    #[tokio::test]
+    async fn an_answer_for_an_approval_that_is_not_open_is_refused_and_not_written() {
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(
+            concat!(
+                r#"{"jsonrpc":"2.0","id":0,"method":"item/commandExecution/requestApproval","params":{"command":"ls"}}"#,
+                "\n",
+            )
+            .as_bytes()
+            .to_vec(),
+        );
+        let stdin = fake.captured_stdin();
+        let releaser = fake.stdout_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut events = backend.events();
+        let answer = |request_id: &str| Command::AnswerPermission {
+            request_id: request_id.to_owned(),
+            decision: crate::PermissionDecision::Approved,
+            selected: None,
+            answers: Vec::new(),
+        };
+        let response_frames = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .lines()
+                .filter(|line| line.contains(r#""result""#) && line.contains(r#""decision""#))
+                .count()
+        };
+
+        // Nothing open yet: an answer for id 0 is refused and nothing is written.
+        assert!(backend.dispatch(answer("0")).await.is_err(), "no approval is open");
+        assert_eq!(response_frames(&stdin.lock().await), 0, "no response frame written");
+
+        // The live approval 0 opens; its answer is written once.
+        releaser();
+        let request_id = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::Permission { request_id, .. } = env.event {
+                    return Some(request_id);
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for Permission")
+        .expect("a Permission frame");
+        backend
+            .dispatch(answer(&request_id))
+            .await
+            .expect("the open approval is answered");
+        let written = captured_str(&stdin).await;
+        assert_eq!(response_frames(written.as_bytes()), 1, "{written}");
+
+        // Answering it again (a duplicate or stale card) is refused; still one frame.
+        assert!(backend.dispatch(answer(&request_id)).await.is_err(), "already answered");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(response_frames(&stdin.lock().await), 1, "no second response frame");
+    }
+
     #[tokio::test]
     async fn command_execution_output_delta_maps_to_tool_output_delta() {
         // codex item/commandExecution/outputDelta → ToolOutputDelta (plaintext delta
@@ -5647,6 +5738,12 @@ mod tests {
             let fake = fake_with_binding("th-1", None);
             let captured = fake.captured_stdin();
             let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+            // Answers are written only for an approval this process has open.
+            backend
+                .pending_tool_approvals
+                .lock()
+                .unwrap()
+                .insert("11".into(), "CommandExecution".into());
             backend
                 .dispatch(Command::AnswerPermission {
                     request_id: "11".into(),
@@ -6406,6 +6503,12 @@ mod tests {
         let fake = fake_with_binding("th-1", None);
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        // Answers are written only for an approval this process has open.
+        backend
+            .pending_tool_approvals
+            .lock()
+            .unwrap()
+            .insert(format!("{ELICIT_PREFIX}5"), "Elicitation".into());
         backend
             .dispatch(Command::AnswerPermission {
                 request_id: format!("{ELICIT_PREFIX}5"),

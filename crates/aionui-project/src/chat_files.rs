@@ -105,9 +105,10 @@ impl ProjectService {
             }
             ChatFileRef::Upload { path } => {
                 let candidate = Path::new(path);
-                if !candidate.is_file() {
-                    return Err(ProjectError::ChatFileMissing { path: path.clone() });
-                }
+                // Containment before existence, and no symlink followed on the way: the
+                // answer for a path outside the upload dir, or behind a link in it, never
+                // depends on whether something exists outside (audit, held unit 4).
+                upload_path_in_root(upload_root, candidate, path)?;
                 if !path_within(upload_root, candidate) {
                     return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
                 }
@@ -246,6 +247,85 @@ impl ProjectService {
         }
 
         Ok(None)
+    }
+}
+
+/// An upload ref must name a regular file reached from the upload root through
+/// regular directories only. The path must be absolute, without `..`, and start with
+/// `root` (as given or resolved). Each component below the root is then looked at
+/// with `symlink_metadata`, which does not follow links:
+/// - a symlink anywhere is refused as outside the root, without looking behind it;
+/// - a missing component is `ChatFileMissing`, which only describes the inside of
+///   the root.
+///
+/// This is a read-time check, not a guarantee from the writer: `create_upload_file`
+/// creates directories along a path, so whatever is on disk is checked here.
+fn upload_path_in_root(root: &Path, target: &Path, path: &str) -> Result<(), ProjectError> {
+    let outside = || ProjectError::UploadPathOutsideRoot { path: path.to_owned() };
+    if !target.is_absolute()
+        || target
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(outside());
+    }
+    if !trusted_upload_root(root) {
+        tracing::warn!(root = %root.display(), "upload root is not a private directory of this user; refusing upload refs");
+        return Err(outside());
+    }
+    let (base, rest) = match target.strip_prefix(root) {
+        Ok(rest) => (root.to_path_buf(), rest.to_path_buf()),
+        Err(_) => {
+            let canonical = std::fs::canonicalize(root).map_err(|_| outside())?;
+            let rest = target.strip_prefix(&canonical).map_err(|_| outside())?.to_path_buf();
+            (canonical, rest)
+        }
+    };
+    let parts: Vec<_> = rest.components().collect();
+    if parts.is_empty() {
+        return Err(outside());
+    }
+    let mut current = base;
+    for (index, part) in parts.iter().enumerate() {
+        current.push(part);
+        let meta =
+            std::fs::symlink_metadata(&current).map_err(|_| ProjectError::ChatFileMissing { path: path.to_owned() })?;
+        if meta.file_type().is_symlink() {
+            return Err(outside());
+        }
+        let last = index + 1 == parts.len();
+        if (last && !meta.is_file()) || (!last && !meta.is_dir()) {
+            return Err(ProjectError::ChatFileMissing { path: path.to_owned() });
+        }
+        // A directory another account can write could have links planted or swapped in.
+        if !last && !private_dir(&meta) {
+            return Err(outside());
+        }
+    }
+    Ok(())
+}
+
+/// The upload root itself is a real directory (not a symlink) that passes [`private_dir`].
+/// Otherwise a root planted in a shared temp dir, or replaced with a link, would make any
+/// directory count as "the upload dir". The directories above the root are trusted (on
+/// macOS `temp_dir()` itself lives under `/var`, a link).
+fn trusted_upload_root(root: &Path) -> bool {
+    std::fs::symlink_metadata(root).is_ok_and(|meta| meta.file_type().is_dir() && private_dir(&meta))
+}
+
+/// On unix: owned by this user and writable by neither group nor others (mode bits only;
+/// ACLs are not inspected). Elsewhere: no ownership model is checked.
+fn private_dir(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        meta.uid() == unsafe { libc::geteuid() } && meta.permissions().mode() & 0o022 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        true
     }
 }
 

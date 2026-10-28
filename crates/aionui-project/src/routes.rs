@@ -22,7 +22,7 @@ use aionui_api_types::{
     ApiResponse, AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest,
     ResolveRefResponse,
 };
-use aionui_auth::{CurrentUser, desktop_only};
+use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, desktop_only, ensure_no_local_files};
 use aionui_common::ApiError;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path, State};
@@ -89,10 +89,14 @@ async fn get_project(
 async fn resolve_ref(
     State(state): State<ProjectRouterState>,
     Extension(user): Extension<CurrentUser>,
+    device: Option<Extension<CurrentDevice>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     Path(project_id): Path<String>,
     body: Result<Json<ResolveRefRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ResolveRefResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    // Upgrading a local ref canonicalizes the path: an existence probe (ADR-013).
+    ensure_no_local_files([&req.file], device.as_deref(), helper.as_deref())?;
     let file = state
         .project
         .upgrade_chat_file_ref(&user.id, &project_id, &req.file)

@@ -319,6 +319,24 @@ pub async fn no_paired_devices(request: Request, next: Next) -> Result<Response,
     Ok(next.run(request).await)
 }
 
+/// A `Local` file ref names any path on the host, so only callers with host file
+/// authority may send one (ADR-013): the desktop app and device-less sessions. Paired
+/// phones and browsers, and agents' helper CLIs, get the same 403 whatever the path, so
+/// the refusal never says whether a file exists. Call before the path is looked at.
+pub fn ensure_no_local_files<'a>(
+    files: impl IntoIterator<Item = &'a aionui_api_types::ChatFileRef>,
+    device: Option<&CurrentDevice>,
+    helper: Option<&RuntimeHelperCaller>,
+) -> Result<(), ApiError> {
+    let has_local = files
+        .into_iter()
+        .any(|file| matches!(file, aionui_api_types::ChatFileRef::Local { .. }));
+    if has_local && (helper.is_some() || is_paired_device(device)) {
+        return Err(fs_owner_only());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -67,9 +67,10 @@ pub enum AccountError {
 /// with bcrypt on a blocking thread (CPU-bound; kept off the async reactor)
 /// before touching the database.
 ///
-/// Does NOT bump `session_generation`: changing a password while a server is
-/// running will not revoke live sessions — restart after a hot change. For
-/// fresh bootstrap (server not yet started) this is irrelevant.
+/// Changing an existing account's password bumps its `session_generation`, which
+/// revokes its sessions, as `POST /api/auth/change-password` does (audit H15). The
+/// auth middleware compares the generation on every request, so this also applies
+/// to a server that is already running.
 pub async fn set_local_password(
     repo: &dyn IUserRepository,
     username: Option<&str>,
@@ -90,11 +91,13 @@ pub async fn set_local_password(
     let outcome = match username {
         None => {
             repo.update_password(SYSTEM_DEFAULT_USER_ID, &hash).await?;
+            repo.increment_session_generation(SYSTEM_DEFAULT_USER_ID).await?;
             PasswordOutcome::DefaultUser
         }
         Some(name) => match repo.find_by_username(name).await? {
             Some(user) => {
                 repo.update_password(&user.id, &hash).await?;
+                repo.increment_session_generation(&user.id).await?;
                 PasswordOutcome::UpdatedExisting {
                     id: user.id,
                     username: name.to_owned(),

@@ -911,14 +911,22 @@ impl crate::traits::IFileService for FileService {
         let bytes = data.to_vec();
 
         tokio::task::spawn_blocking(move || {
-            let mut dir = std::env::temp_dir().join("aionui");
-            if let Some(conv_id) = conv_id.as_deref() {
-                dir = dir.join(conv_id);
-            } else {
-                dir = dir.join("general");
-            }
-            std::fs::create_dir_all(&dir)
+            let root = std::env::temp_dir().join("aionui");
+            let dir = root.join(conv_id.as_deref().unwrap_or("general"));
+            // New Unix dirs are requested 0700: upload refs are refused from directories
+            // other accounts can write (`aionui-project` `upload_path_in_root`).
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder
+                .create(&dir)
                 .map_err(|e| FileError::Internal(format!("cannot create upload directory: {e}")))?;
+            // Directories made by an earlier version under a 002 umask are 0775: tighten
+            // the ones this user owns, or their uploads would be refused.
+            for path in [&root, &dir] {
+                tighten_own_dir(path);
+            }
 
             let (base, ext) = split_base_ext(&name);
             let mut candidate = name.clone();
@@ -1711,5 +1719,65 @@ mod tests {
             let url = reqwest::Url::parse(&url_str).unwrap();
             assert!(is_allowed_image_host(&url), "host '{host}' should be allowed");
         }
+    }
+}
+
+/// Remove group/other write from a directory this user owns, through a descriptor opened
+/// without following a symlink, so a planted link's target is never changed. Best effort:
+/// a directory owned by someone else is left alone (and refused when read).
+fn tighten_own_dir(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        let Ok(dir) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)
+        else {
+            return;
+        };
+        let Ok(meta) = dir.metadata() else { return };
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if meta.uid() != unsafe { libc::geteuid() } || meta.permissions().mode() & 0o022 == 0 {
+            return;
+        }
+        let mode = meta.permissions().mode() & 0o7777 & !0o022;
+        if let Err(error) = dir.set_permissions(std::fs::Permissions::from_mode(mode)) {
+            tracing::warn!(path = %path.display(), %error, "could not tighten upload directory permissions");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tighten_own_dir_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::tighten_own_dir;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn group_writable_own_dirs_are_tightened_and_links_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let open = tmp.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o775)).unwrap();
+        tighten_own_dir(&open);
+        assert_eq!(mode(&open), 0o755);
+
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        tighten_own_dir(&link);
+        assert_eq!(mode(&target), 0o777, "a link's target keeps its mode");
     }
 }
