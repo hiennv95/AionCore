@@ -9,8 +9,10 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Extension, Json, Path, State};
-use axum::middleware::from_fn;
+use axum::extract::{Extension, Json, Path, Request, State};
+use axum::http::StatusCode;
+use axum::middleware::{Next, from_fn};
+use axum::response::Response;
 use axum::routing::{MethodRouter, get, patch, post, put};
 
 use aionui_api_types::{
@@ -18,7 +20,7 @@ use aionui_api_types::{
     CustomAgentUpsertRequest, DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
     SetAgentOverridesRequest, SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device, no_paired_devices};
+use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device};
 use aionui_common::ApiError;
 
 use crate::routes::error_mapping::agent_error_to_api_error;
@@ -45,10 +47,24 @@ pub fn agent_routes(state: AgentRouterState) -> Router {
 }
 
 /// Routes that choose a command the host runs (custom agents, command overrides, the
-/// connection probe) are refused to paired phones and browsers (ADR-013). The agent
-/// helper keeps them: the config CLI advertises them to agents.
+/// connection probe) are for the desktop app only (ADR-013): paired phones and browsers
+/// and the agent helper are refused, as for MCP stdio servers (Jev 046).
 fn host_only<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> MethodRouter<S> {
-    route.route_layer(from_fn(no_paired_devices))
+    route.route_layer(from_fn(agents_desktop_only))
+}
+
+/// `*_DESKTOP_ONLY`, so the agent config CLI reports `CONFIG_DESKTOP_ONLY`.
+async fn agents_desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
+    let extensions = request.extensions();
+    if is_paired_device(extensions.get::<CurrentDevice>()) || extensions.get::<RuntimeHelperCaller>().is_some() {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "AGENTS_DESKTOP_ONLY",
+            "Custom agents and agent command overrides are managed from the desktop app.",
+            None,
+        ));
+    }
+    Ok(next.run(request).await)
 }
 
 const MASK: &str = "***";

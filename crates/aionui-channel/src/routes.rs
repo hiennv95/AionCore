@@ -115,17 +115,18 @@ pub fn channel_routes(state: ChannelRouterState) -> Router {
         .route("/api/channel/users/revoke", post(revoke_user))
         // Session management
         .route("/api/channel/sessions", get(get_active_sessions))
-        // Settings sync
+        // Settings sync. Choosing which assistant and model answer a chat platform, and
+        // syncing (which clears its sessions), are owner decisions like connecting a bot.
         .route("/api/channel/settings/{platform}", get(get_channel_settings))
         .route(
             "/api/channel/settings/{platform}/assistant",
-            put(set_channel_assistant_setting),
+            desktop(put(set_channel_assistant_setting)),
         )
         .route(
             "/api/channel/settings/{platform}/default-model",
-            put(set_channel_default_model_setting),
+            desktop(put(set_channel_default_model_setting)),
         )
-        .route("/api/channel/settings/sync", post(sync_channel_settings))
+        .route("/api/channel/settings/sync", desktop(post(sync_channel_settings)))
         .with_state(state)
 }
 

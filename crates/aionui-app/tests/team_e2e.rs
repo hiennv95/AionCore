@@ -1913,6 +1913,77 @@ async fn sm1b_team_send_persists_user_bubble_through_projection_adapter() {
     }));
 }
 
+// An empty or whitespace-only team message is refused before any session or run starts.
+#[tokio::test]
+async fn sm1e_team_send_rejects_empty_content_without_starting_a_run() {
+    let (mut app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+
+    let data = create_team(&mut app, &services, &token, &csrf).await;
+    let team_id = data["id"].as_str().unwrap();
+    let slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
+    let lead_conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
+
+    for content in ["", " \n\t "] {
+        for uri in [
+            format!("/api/teams/{team_id}/messages"),
+            format!("/api/teams/{team_id}/agents/{slot_id}/messages"),
+        ] {
+            let req = json_with_token("POST", &uri, json!({ "content": content }), &token, &csrf);
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = body_json(resp).await;
+            assert_eq!(
+                (status, &body["code"]),
+                (StatusCode::BAD_REQUEST, &json!("TEAM_MESSAGE_EMPTY")),
+                "{uri} with {content:?}: {body}"
+            );
+        }
+    }
+
+    // No run started and nothing was posted to the leader.
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/teams/{team_id}/run-state"), &token))
+        .await
+        .unwrap();
+    let run_state = body_json(resp).await;
+    assert!(run_state["data"]["active_run"].is_null(), "{run_state}");
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let user_id = repo.owner_user_id(lead_conversation_id).await.unwrap().unwrap();
+    let page_params = MessagePageParams {
+        limit: 50,
+        direction: MessagePageDirection::InitialLatest,
+    };
+    let messages = repo
+        .list_messages_page(&user_id, lead_conversation_id, &page_params)
+        .await
+        .unwrap();
+    assert!(
+        !messages
+            .items
+            .iter()
+            .any(|row| row.position.as_deref() == Some("right")),
+        "no user message was stored"
+    );
+
+    // A real message still goes through.
+    let req = json_with_token(
+        "POST",
+        &format!("/api/teams/{team_id}/messages"),
+        json!({ "content": "Hello team" }),
+        &token,
+        &csrf,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let messages = repo
+        .list_messages_page(&user_id, lead_conversation_id, &page_params)
+        .await
+        .unwrap();
+    assert!(messages.items.iter().any(|row| row.content.contains("Hello team")));
+}
+
 #[tokio::test]
 async fn sm1c_team_owned_conversation_regular_send_is_forbidden() {
     let (mut app, services) = build_app_with_mock_agents().await;

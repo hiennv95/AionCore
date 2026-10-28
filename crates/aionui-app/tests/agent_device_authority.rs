@@ -1,7 +1,7 @@
-//! ADR-013 / Jev 047 for agents. A paired phone or browser may not choose a command the host
-//! runs: custom agent create/update/delete, command overrides and the connection probe are
-//! refused with 403 `FS_OWNER_ONLY`. The agent helper keeps those (the config CLI advertises
-//! them). Remote agents may only be listed and read from a phone or the helper: changing one,
+//! ADR-013 / Jev 047 for agents. Only the desktop app may choose a command the host runs:
+//! custom agent create/update/delete, command overrides and the connection probe are refused
+//! to a paired phone or browser and to the agent helper with 403 `AGENTS_DESKTOP_ONLY`, as for
+//! MCP stdio servers (Jev 046). Remote agents may only be listed and read from a phone or the helper: changing one,
 //! or making the host connect to a URL to test or handshake, is desktop-only. Phones read
 //! env override values masked; the desktop reads them in full.
 
@@ -128,7 +128,16 @@ async fn phones_cannot_choose_host_commands_or_change_remote_agents_and_read_env
         ("POST", format!("/api/remote-agents/{remote}/handshake"), json!({})),
     ];
     let refused = json!("FS_OWNER_ONLY");
-    for (method, uri, body) in host_command_routes.iter().chain(remote_routes.iter()) {
+    let agents_refused = json!("AGENTS_DESKTOP_ONLY");
+    for (method, uri, body) in &host_command_routes {
+        let (status, resp) = send(json_with_token(method, uri, body.clone(), &phone, "c")).await;
+        assert_eq!(
+            (status, &resp["code"]),
+            (StatusCode::FORBIDDEN, &agents_refused),
+            "phone {method} {uri}: {resp}"
+        );
+    }
+    for (method, uri, body) in &remote_routes {
         let (status, resp) = send(json_with_token(method, uri, body.clone(), &phone, "c")).await;
         assert_eq!(
             (status, &resp["code"]),
@@ -138,7 +147,7 @@ async fn phones_cannot_choose_host_commands_or_change_remote_agents_and_read_env
     }
     assert!(!marker.exists(), "the phone's probe ran a command on the host");
 
-    // The helper is refused on remote agents and keeps the custom agent routes it advertises.
+    // The helper is refused on remote agents and on every custom agent change.
     let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
     let helper = services.runtime_token_service.issue(
         owner.as_str(),
@@ -165,6 +174,15 @@ async fn phones_cannot_choose_host_commands_or_change_remote_agents_and_read_env
             "helper {method} {uri}: {resp}"
         );
     }
+    for (method, uri, body) in &host_command_routes {
+        let (status, resp) = send(helper_call(method, uri, body)).await;
+        assert_eq!(
+            (status, &resp["code"]),
+            (StatusCode::FORBIDDEN, &agents_refused),
+            "helper {method} {uri}: {resp}"
+        );
+    }
+    assert!(!marker.exists(), "the helper's probe ran a command on the host");
     let req = Request::builder()
         .uri(format!("/api/agents/{agent}/overrides"))
         .header("x-aionui-runtime-token", helper.token.as_str())
@@ -179,15 +197,11 @@ async fn phones_cannot_choose_host_commands_or_change_remote_agents_and_read_env
         !resp.to_string().contains(ENV_SECRET),
         "helper reads the secret: {resp}"
     );
-    let (status, resp) = send(helper_call(
-        "PUT",
-        &format!("/api/agents/{agent}/overrides"),
-        &json!({"env_override": []}),
-    ))
-    .await;
-    assert_eq!(status, StatusCode::OK, "helper overrides: {resp}");
 
-    // Nothing the phone sent changed anything.
+    // Nothing the phone or the helper sent changed anything.
+    let (_, read) = send(get(&overrides, &desktop)).await;
+    assert_eq!(read["data"]["env_override"][0]["value"], ENV_SECRET, "{read}");
+    assert_ne!(read["data"]["command_override"], "touch", "{read}");
     let (_, remote_now) = send(get(&format!("/api/remote-agents/{remote}"), &desktop)).await;
     assert_eq!(remote_now["data"]["url"], "wss://remote.example.invalid");
     let (_, rows) = send(get("/api/agents/management", &desktop)).await;

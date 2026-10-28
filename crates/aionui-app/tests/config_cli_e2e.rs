@@ -525,6 +525,23 @@ async fn config_capabilities_advertise_only_what_the_helper_may_do_with_mcp() {
     );
     let desktop_only = stdout["data"]["safety"]["desktop_only"].to_string();
     assert!(desktop_only.contains("MCP"), "{desktop_only}");
+    assert!(desktop_only.contains("custom agent"), "{desktop_only}");
+    let agent_commands: Vec<String> = stdout["data"]["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|domain| domain["commands"].as_array().into_iter().flatten())
+        .filter_map(|command| command["command"].as_str().map(str::to_owned))
+        .filter(|command| command.starts_with("config agents"))
+        .collect();
+    assert_eq!(
+        agent_commands,
+        vec![
+            "config agents list",
+            "config agents enable",
+            "config agents overrides get"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1181,11 +1198,16 @@ fn builtin_config_skills_use_config_cli_not_python_or_cron_helper() {
     }
     assert!(aionui_config.contains("\"$AIONUI_HELPER_BIN\" config context"));
     assert!(aionui_config.contains("\"$AIONUI_HELPER_BIN\" config capabilities"));
-    // MCP changes are desktop-only for agents (Jev 046): the skill must not teach them.
+    // MCP changes (Jev 046) and agent host commands are desktop-only for agents: the skill
+    // must not teach them.
     for refused in [
         "config mcp servers create",
         "config mcp servers update",
         "config mcp test-connection",
+        "config agents overrides set",
+        "config agents custom create",
+        "config agents custom update",
+        "config agents custom try-connect",
     ] {
         assert!(!aionui_config.contains(refused), "skill still teaches {refused}");
     }

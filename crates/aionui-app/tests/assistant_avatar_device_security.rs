@@ -4,8 +4,9 @@
 //! are restricted to desktop sessions only, while paired devices (phones, web
 //! browsers) and agent runtime helpers cannot copy host files via assistant
 //! creation, update, or bulk import. Non-host avatar values (Unicode emojis,
-//! builtin/managed avatar route references, null) remain open to all
-//! authenticated callers.
+//! builtin/managed avatar route references, null) remain open to the desktop
+//! app and the agent helper; paired devices make no assistant changes at all
+//! (Jev 049).
 //!
 //! Historical Red Behavior (before ADR-013 guard):
 //! Untrusted callers (paired devices, runtime helpers) submitting host file
@@ -524,6 +525,8 @@ async fn assistant_avatar_host_file_copy_is_desktop_only() {
 
     // =========================================================================
     // 5. SAFE MIXED IMPORT SUCCESS: All-safe entries (emoji, builtin route, null)
+    // from the desktop app. Paired devices make no assistant changes at all
+    // (Jev 049; see assistant_skill_device_authority.rs).
     // =========================================================================
     let (status, body) = send(json_with_token(
         "POST",
@@ -550,14 +553,14 @@ async fn assistant_avatar_host_file_copy_is_desktop_only() {
                 }
             ]
         }),
-        &phone,
+        &desktop,
         "c",
     ))
     .await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "safe mixed bulk import from paired phone must succeed"
+        "safe mixed bulk import from the desktop app must succeed"
     );
     assert_eq!(body["data"]["imported"], 3);
     assert_eq!(body["data"]["failed"], 0);
@@ -585,9 +588,8 @@ async fn assistant_avatar_host_file_copy_is_desktop_only() {
     );
 
     // =========================================================================
-    // 6. POSITIVE CONTROLS: Individual safe operations for Phone & Browser
+    // 6. Safe avatars do not open assistant changes to paired devices (Jev 049)
     // =========================================================================
-    // Phone create with Emoji
     let (status, body) = send(json_with_token(
         "POST",
         "/api/assistants",
@@ -601,10 +603,7 @@ async fn assistant_avatar_host_file_copy_is_desktop_only() {
         "c",
     ))
     .await;
-    assert_eq!(status, StatusCode::CREATED);
-    assert_eq!(body["data"]["avatar"], "🎨");
-
-    // Browser create with Builtin Ref
+    assert_eq!((status, body["code"].clone()), fs_owner_only, "phone create with emoji");
     let (status, body) = send(json_with_cookie(
         "POST",
         "/api/assistants",
@@ -618,50 +617,87 @@ async fn assistant_avatar_host_file_copy_is_desktop_only() {
         "c",
     ))
     .await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        fs_owner_only,
+        "browser create with builtin ref"
+    );
+
+    // =========================================================================
+    // 7. POSITIVE CONTROLS: data-only avatars (emoji, null) for the agent helper;
+    // a builtin ref copies a managed file, so that one is shown from the desktop.
+    // =========================================================================
+    // Create with Emoji
+    let (status, body) = send(helper_request(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "helper-individual-emoji",
+            "name": "Helper Emoji",
+            "agent_id": "632f31d2",
+            "avatar": "🎨",
+        }),
+        &helper,
+    ))
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(body["data"]["avatar"], "🎨");
+
+    // Create with Builtin Ref (desktop)
+    let (status, body) = send(json_with_token(
+        "POST",
+        "/api/assistants",
+        json!({
+            "id": "desktop-individual-builtin-ref",
+            "name": "Desktop Builtin Ref",
+            "agent_id": "632f31d2",
+            "avatar": "/api/assistants/desktop-baseline-assistant/avatar",
+        }),
+        &desktop,
+        "c",
+    ))
+    .await;
     assert_eq!(status, StatusCode::CREATED);
     assert!(
         body["data"]["avatar"]
             .as_str()
             .unwrap()
-            .contains("/api/assistants/browser-individual-builtin-ref/avatar")
+            .contains("/api/assistants/desktop-individual-builtin-ref/avatar")
     );
 
-    // Phone create with Null
-    let (status, body) = send(json_with_token(
+    // Create with Null
+    let (status, body) = send(helper_request(
         "POST",
         "/api/assistants",
         json!({
-            "id": "phone-individual-null",
-            "name": "Phone Null",
+            "id": "helper-individual-null",
+            "name": "Helper Null",
             "agent_id": "632f31d2",
             "avatar": null,
         }),
-        &phone,
-        "c",
+        &helper,
     ))
     .await;
     assert_eq!(status, StatusCode::CREATED);
     assert!(body["data"]["avatar"].is_null());
 
-    // Phone update with Emoji
-    let (status, body) = send(json_with_token(
+    // Update with Emoji
+    let (status, body) = send(helper_request(
         "PUT",
-        "/api/assistants/phone-individual-emoji",
+        "/api/assistants/helper-individual-emoji",
         json!({"avatar": "🎯"}),
-        &phone,
-        "c",
+        &helper,
     ))
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["avatar"], "🎯");
 
-    // Browser update to clear avatar with empty string
-    let (status, body) = send(json_with_cookie(
+    // Update to clear avatar with empty string
+    let (status, body) = send(helper_request(
         "PUT",
-        "/api/assistants/browser-individual-builtin-ref",
+        "/api/assistants/helper-individual-emoji",
         json!({"avatar": ""}),
-        &browser_cookie,
-        "c",
+        &helper,
     ))
     .await;
     assert_eq!(status, StatusCode::OK);

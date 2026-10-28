@@ -88,6 +88,15 @@ pub(crate) fn inherit_team_workspace(extra: &mut serde_json::Value, workspace: &
     }
 }
 
+/// A user message to a team must carry text or files: an empty one would still
+/// start a run, and the members run full-auto.
+fn ensure_message_not_empty(content: &str, files: Option<&[ChatFileRef]>) -> Result<(), TeamError> {
+    if content.trim().is_empty() && files.is_none_or(<[ChatFileRef]>::is_empty) {
+        return Err(TeamError::InvalidRequest(crate::error::EMPTY_MESSAGE.into()));
+    }
+    Ok(())
+}
+
 /// Why a member's model selection is being persisted. Decides whether a runtime
 /// that is mid-start may block the write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2499,6 +2508,7 @@ impl TeamSessionService {
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
+        ensure_message_not_empty(content, files.as_deref())?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
         let session = self.published_session(team_id)?;
@@ -2514,6 +2524,7 @@ impl TeamSessionService {
         files: Option<Vec<ChatFileRef>>,
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
+        ensure_message_not_empty(content, files.as_deref())?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
         let session = self.published_session(team_id)?;

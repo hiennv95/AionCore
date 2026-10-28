@@ -53,7 +53,8 @@ pub(crate) fn data() -> Value {
             ],
             "read_before_write": true,
             "desktop_only": [
-                "MCP server create, update, delete, toggle and import, connection tests, agent MCP config discovery, and MCP OAuth login/logout: the host refuses them from agents (CONFIG_DESKTOP_ONLY); ask the owner to make the change in the desktop app"
+                "MCP server create, update, delete, toggle and import, connection tests, agent MCP config discovery, and MCP OAuth login/logout: the host refuses them from agents (CONFIG_DESKTOP_ONLY); ask the owner to make the change in the desktop app",
+                "Agent command overrides, and custom agent create, update, delete and try-connect: they choose a command the host runs, so the host refuses them from agents (CONFIG_DESKTOP_ONLY); ask the owner to make the change in the desktop app"
             ]
         },
         "domains": [
@@ -118,11 +119,6 @@ pub(crate) fn data() -> Value {
                 no_input_redacted(&["agents", "list"], "List agent catalog and custom agents.", false, &["env"]),
                 stdin_redacted(&["agents", "enable"], "Enable or disable an agent.", &["agent_id", "enabled"], &[], true, false, &["env"]),
                 stdin_redacted(&["agents", "overrides", "get"], "Read agent overrides.", &["agent_id"], &[], false, false, &["env", "secret overrides"]),
-                stdin_redacted(&["agents", "overrides", "set"], "Set agent overrides.", &["agent_id"], &[], true, false, &["env", "secret overrides"]),
-                stdin_redacted(&["agents", "custom", "create"], "Create a custom agent.", &["name", "command"], &[], true, false, &["env"]),
-                stdin_redacted(&["agents", "custom", "update"], "Update a custom agent.", &["agent_id", "name", "command"], &[], true, false, &["env"]),
-                stdin_redacted(&["agents", "custom", "delete"], "Delete a custom agent.", &["agent_id"], &[], true, true, &["env"]),
-                stdin_redacted(&["agents", "custom", "try-connect"], "Test a custom agent connection.", &["command"], &[], false, false, &["env"]),
             ]),
             domain("cron", &[
                 no_input(&["cron", "jobs", "list"], "List cron jobs.", false),

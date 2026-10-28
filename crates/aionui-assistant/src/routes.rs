@@ -7,14 +7,15 @@ use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::from_fn;
 use axum::response::Response;
-use axum::routing::{get, patch, post};
+use axum::routing::{MethodRouter, get, patch, post, put};
 
 use aionui_api_types::{
     ApiResponse, AssistantDetailResponse, AssistantResponse, CreateAssistantRequest, ImportAssistantsRequest,
     ImportAssistantsResult, SetAssistantStateRequest, UpdateAssistantRequest,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device};
+use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device, no_paired_devices};
 use aionui_common::ApiError;
 
 use crate::error::AssistantError;
@@ -23,12 +24,21 @@ pub use crate::state::AssistantRouterState;
 /// Build the router for `/api/assistants/*`.
 pub fn assistant_routes(state: AssistantRouterState) -> Router {
     Router::new()
-        .route("/api/assistants", get(list).post(create))
-        .route("/api/assistants/{id}", get(get_one).put(update).delete(delete_one))
-        .route("/api/assistants/{id}/state", patch(set_state))
+        .route("/api/assistants", get(list).merge(host_only(post(create))))
+        .route(
+            "/api/assistants/{id}",
+            get(get_one).merge(host_only(put(update).delete(delete_one))),
+        )
+        .route("/api/assistants/{id}/state", host_only(patch(set_state)))
         .route("/api/assistants/{id}/avatar", get(get_avatar))
-        .route("/api/assistants/import", post(import))
+        .route("/api/assistants/import", host_only(post(import)))
         .with_state(state)
+}
+
+/// Assistant changes are for the desktop app (Jev 049): paired phones and browsers read
+/// only. The agent helper keeps them, because the config CLI advertises them to agents.
+fn host_only<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> MethodRouter<S> {
+    route.route_layer(from_fn(no_paired_devices))
 }
 
 #[derive(Debug, serde::Deserialize, Default)]

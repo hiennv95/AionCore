@@ -87,7 +87,12 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
             "/api/skills/export-symlink",
             post(export_skill_symlink).route_layer(from_fn(desktop_only)),
         )
-        .route("/api/skills/{name}", delete(delete_skill))
+        // Skill delete is a DB soft delete (no host files removed): paired devices are
+        // read-only for skills (Jev 049); the helper CLI keeps it.
+        .route(
+            "/api/skills/{name}",
+            delete(delete_skill).route_layer(from_fn(no_paired_devices)),
+        )
         // Scanning & discovery
         .route(
             "/api/skills/scan",
@@ -100,14 +105,27 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
         .route("/api/skills/builtin-skill", post(read_builtin_skill))
         // Per-agent skill resolution (for agent CLI symlink layout).
         .route("/api/skills/materialize-for-agent", post(materialize_for_agent))
-        // Assistant rules CRUD
+        // Assistant rules CRUD. Writes are assistant changes, which are desktop-only for
+        // paired devices (Jev 049); the helper CLI uses them.
         .route("/api/skills/assistant-rule/read", post(read_assistant_rule))
-        .route("/api/skills/assistant-rule/write", post(write_assistant_rule))
-        .route("/api/skills/assistant-rule/{id}", delete(delete_assistant_rule))
-        // Assistant skills CRUD
+        .route(
+            "/api/skills/assistant-rule/write",
+            post(write_assistant_rule).route_layer(from_fn(no_paired_devices)),
+        )
+        .route(
+            "/api/skills/assistant-rule/{id}",
+            delete(delete_assistant_rule).route_layer(from_fn(no_paired_devices)),
+        )
+        // Assistant skills CRUD, under the same rule.
         .route("/api/skills/assistant-skill/read", post(read_assistant_skill))
-        .route("/api/skills/assistant-skill/write", post(write_assistant_skill))
-        .route("/api/skills/assistant-skill/{id}", delete(delete_assistant_skill))
+        .route(
+            "/api/skills/assistant-skill/write",
+            post(write_assistant_skill).route_layer(from_fn(no_paired_devices)),
+        )
+        .route(
+            "/api/skills/assistant-skill/{id}",
+            delete(delete_assistant_skill).route_layer(from_fn(no_paired_devices)),
+        )
         // External path management
         .route(
             "/api/skills/external-paths",

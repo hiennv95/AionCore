@@ -107,7 +107,17 @@ impl TeamPublicError {
     }
 }
 
+/// Message of the `InvalidRequest` for a user message with no text and no files.
+pub(crate) const EMPTY_MESSAGE: &str = "Message content is empty";
+
 pub fn classify_public_error(message: &str) -> Option<TeamPublicError> {
+    if message == EMPTY_MESSAGE {
+        return Some(TeamPublicError::new(
+            "TEAM_MESSAGE_EMPTY",
+            Some(json!({ "field": "content" })),
+        ));
+    }
+
     if matches!(
         message,
         "Missing required field: assistant_id"

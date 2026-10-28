@@ -434,52 +434,17 @@ Enable or disable an agent:
 JSON
 ```
 
-Read or set per-agent overrides:
+You can read per-agent overrides. You cannot set them, and you cannot create, update,
+delete or try-connect a custom agent: each chooses a command that runs on the owner's
+computer, so the owner does it in the desktop app. The host refuses these from agents with
+`CONFIG_DESKTOP_ONLY`. When the user asks for such a change, say what to change and ask them
+to do it in the desktop app (Settings → Agents). Do not retry, and do not work around the
+refusal.
 
 ```bash
 "$AIONUI_HELPER_BIN" config agents overrides get <<'JSON'
 {
   "agent_id": "codex"
-}
-JSON
-```
-
-```bash
-"$AIONUI_HELPER_BIN" config agents overrides set <<'JSON'
-{
-  "agent_id": "codex",
-  "command_override": "/absolute/path/to/codex"
-}
-JSON
-```
-
-Create, update, delete, or try-connect a custom agent:
-
-```bash
-"$AIONUI_HELPER_BIN" config agents custom create <<'JSON'
-{
-  "name": "Custom Agent",
-  "command": "/absolute/path/to/agent-cli"
-}
-JSON
-```
-
-```bash
-"$AIONUI_HELPER_BIN" config agents custom update <<'JSON'
-{
-  "agent_id": "custom_agent_123",
-  "name": "Custom Agent",
-  "command": "/absolute/path/to/agent-cli"
-}
-JSON
-```
-
-Test whether a custom agent binary is reachable (does not persist anything):
-
-```bash
-"$AIONUI_HELPER_BIN" config agents custom try-connect <<'JSON'
-{
-  "command": "/absolute/path/to/agent-cli"
 }
 JSON
 ```
