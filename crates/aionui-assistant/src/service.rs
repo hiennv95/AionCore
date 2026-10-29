@@ -2803,11 +2803,9 @@ fn is_unsupported_direct_avatar_reference(value: &str) -> bool {
 pub(crate) fn parse_assistant_avatar_route(value: &str) -> Option<String> {
     let prefix = "/api/assistants/";
     let suffix = "/avatar";
-    let route_start = value.find(prefix)?;
-    let route_and_after = &value[route_start..];
-    let suffix_end = route_and_after.find(suffix)? + suffix.len();
-    let route = &route_and_after[..suffix_end];
-    let id = route.strip_prefix(prefix)?.strip_suffix(suffix)?.trim();
+    let value = value.trim();
+    let route = value.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    let id = route.trim();
     (!id.is_empty()).then(|| id.to_string())
 }
 

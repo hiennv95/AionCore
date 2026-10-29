@@ -170,7 +170,8 @@ pub fn with_static_web_clients(router: Router, root_dir: Option<&Path>, legacy_d
 
                         // Check containment and symlink escape.
                         if !subpath.is_empty() {
-                            let target = legacy_path.join(subpath);
+                            let effective_subpath = percent_decode(subpath).unwrap_or_else(|| subpath.to_owned());
+                            let target = legacy_path.join(effective_subpath);
                             if !is_path_contained_in(canonical_legacy, &target) {
                                 return StatusCode::NOT_FOUND.into_response();
                             }
@@ -208,7 +209,8 @@ pub fn with_static_web_clients(router: Router, root_dir: Option<&Path>, legacy_d
 
                     let subpath = path.trim_start_matches('/');
                     if !subpath.is_empty() {
-                        let target = root_path.join(subpath);
+                        let effective_subpath = percent_decode(subpath).unwrap_or_else(|| subpath.to_owned());
+                        let target = root_path.join(effective_subpath);
                         if !is_path_contained_in(canonical_root, &target) {
                             return StatusCode::NOT_FOUND.into_response();
                         }

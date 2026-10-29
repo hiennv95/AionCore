@@ -198,6 +198,15 @@ async fn get_avatar(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            if asset.extension.as_deref() == Some("svg") {
+                "default-src 'none'; sandbox; style-src 'unsafe-inline'"
+            } else {
+                "default-src 'none'"
+            },
+        )
         .body(Body::from(asset.bytes))
         .map_err(|e| ApiError::Internal(e.to_string()))
 }

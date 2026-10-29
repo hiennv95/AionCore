@@ -63,12 +63,12 @@ pub fn office_routes(state: OfficeRouterState) -> Router {
         .route("/api/ppt-preview/refresh", post(refresh_ppt_preview))
         .route("/api/document/convert", post(convert_document))
         .route_layer(from_fn(desktop_only));
-    Router::new()
+    let preview_stops = Router::new()
         .route("/api/word-preview/stop", post(stop_word_preview))
         .route("/api/excel-preview/stop", post(stop_excel_preview))
         .route("/api/ppt-preview/stop", post(stop_ppt_preview))
-        .merge(host_reads)
-        .with_state(state)
+        .route_layer(from_fn(desktop_only));
+    Router::new().merge(preview_stops).merge(host_reads).with_state(state)
 }
 
 /// The proxies serve the documents the desktop opened for preview, so they are host reads

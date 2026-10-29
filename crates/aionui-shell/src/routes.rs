@@ -61,11 +61,14 @@ pub fn shell_routes(state: ShellRouterState) -> Router {
         .route("/api/shell/show-item-in-folder", post(show_item_in_folder))
         .route("/api/shell/open-folder-with", post(open_folder_with))
         .route_layer(from_fn(desktop_only));
-    Router::new()
+    let host_probes = Router::new()
         .route("/api/shell/open-external", post(open_external))
         .route("/api/shell/check-tool-installed", post(check_tool_installed))
+        .route_layer(from_fn(desktop_only));
+    Router::new()
         .route("/api/stt", post(speech_to_text))
         .route("/api/stt/stream", get(speech_to_text_stream))
+        .merge(host_probes)
         .merge(host_file_effects)
         .with_state(state)
 }

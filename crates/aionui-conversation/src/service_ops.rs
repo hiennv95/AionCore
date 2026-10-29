@@ -382,7 +382,16 @@ impl ConversationService {
                     reason: "this LAN share's agent is not in the shared mode".into(),
                 })
             }
-            _ => Ok(()),
+            Some(_) => Ok(()),
+            None => {
+                warn!(
+                    conversation_id,
+                    "LAN share agent did not report a mode; refusing the peer turn"
+                );
+                Err(ConversationError::Forbidden {
+                    reason: "this LAN share's agent did not report a mode".into(),
+                })
+            }
         }
     }
 

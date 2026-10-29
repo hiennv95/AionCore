@@ -87,8 +87,8 @@ pub fn new_pairing_nonce() -> Result<[u8; 32], crate::error::NetworkError> {
     Ok(nonce)
 }
 
-/// `hex(SHA-256("aionx-sas-commit-v1" ‖ nonce))`: the initiator commits to its
-/// nonce before it sees the responder's (ADR-016).
+/// `hex(SHA-256("aionx-sas-commit-v1" ‖ nonce))`: the sender commits to its
+/// nonce before seeing the peer's (ADR-016).
 pub fn pairing_commitment(nonce: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"aionx-sas-commit-v1");
