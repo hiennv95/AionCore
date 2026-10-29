@@ -37,6 +37,7 @@ async fn ctx() -> Ctx {
             identity_mode: AuthIdentityMode::UserSession,
             runtime_token_verifier: None,
             device_repo,
+            desktop_requires_loopback_tls: false,
         };
         Router::new()
             .route("/protected", get(|| async { "ok" }))

@@ -93,6 +93,162 @@ fn identity_is_created_once_then_reloaded_with_a_private_key_file() {
 }
 
 #[test]
+fn a_partial_identity_is_refused_and_left_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("peer");
+    PeerIdentity::load_or_create(&path, "host-a").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "a new identity directory is owner-only");
+    }
+    let cert = std::fs::read(path.join("identity.crt")).unwrap();
+    let key = std::fs::read(path.join("identity.key")).unwrap();
+
+    // Key gone: the certificate must not be replaced by a new identity.
+    std::fs::remove_file(path.join("identity.key")).unwrap();
+    let error = PeerIdentity::load_or_create(&path, "host-a").unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("identity.key: missing next to its certificate"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(path.join("identity.crt")).unwrap(), cert);
+    assert!(!path.join("identity.key").exists());
+
+    // Certificate gone instead: same refusal, the key is kept.
+    std::fs::write(path.join("identity.key"), &key).unwrap();
+    std::fs::remove_file(path.join("identity.crt")).unwrap();
+    assert!(PeerIdentity::load_or_create(&path, "host-a").is_err());
+    assert_eq!(std::fs::read(path.join("identity.key")).unwrap(), key);
+    assert!(!path.join("identity.crt").exists());
+
+    // A corrupt certificate fails to load and is not replaced either.
+    std::fs::write(path.join("identity.crt"), b"not a certificate").unwrap();
+    assert!(PeerIdentity::load_or_create(&path, "host-a").is_err());
+    assert_eq!(std::fs::read(path.join("identity.crt")).unwrap(), b"not a certificate");
+}
+
+/// The key is what lets a host be impersonated: an identity that others could have read
+/// or swapped is refused before it is loaded, and nothing is changed or regenerated.
+#[cfg(unix)]
+#[test]
+fn an_exposed_or_planted_identity_is_refused_before_loading() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let set_mode = |path: &std::path::Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    let fresh = || {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer");
+        PeerIdentity::load_or_create(&path, "host-a").unwrap();
+        (dir, path)
+    };
+    let refused = |path: &std::path::Path, needle: &str| {
+        let error = PeerIdentity::load_or_create(path, "host-a").unwrap_err().to_string();
+        assert!(error.contains(needle), "expected {needle:?} in {error}");
+    };
+
+    // A key others can read.
+    let (_dir, path) = fresh();
+    let key = path.join("identity.key");
+    let before = std::fs::read(&key).unwrap();
+    set_mode(&key, 0o644);
+    refused(&path, "identity.key: must be a regular file owned by this user");
+    assert_eq!(std::fs::read(&key).unwrap(), before, "not rewritten");
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        0o644,
+        "not chmodded"
+    );
+
+    // A certificate others can replace.
+    let (_dir, path) = fresh();
+    set_mode(&path.join("identity.crt"), 0o666);
+    refused(&path, "identity.crt: must be a regular file owned by this user");
+
+    // An identity directory others can write.
+    let (_dir, path) = fresh();
+    set_mode(&path, 0o777);
+    refused(&path, "the identity directory must be a directory owned by this user");
+
+    // A planted link in place of the directory, to an otherwise valid identity.
+    let (dir, path) = fresh();
+    let planted = dir.path().join("planted");
+    std::fs::rename(&path, &planted).unwrap();
+    symlink(&planted, &path).unwrap();
+    refused(&path, "the identity directory must be a directory owned by this user");
+
+    // Links in place of the files, to valid files, are not followed.
+    let (dir, path) = fresh();
+    let elsewhere = dir.path().join("elsewhere.key");
+    std::fs::rename(path.join("identity.key"), &elsewhere).unwrap();
+    symlink(&elsewhere, path.join("identity.key")).unwrap();
+    refused(&path, "identity.key");
+    assert!(
+        std::fs::symlink_metadata(path.join("identity.key"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    // A FIFO in place of the key fails at once instead of blocking the load.
+    let (_dir, path) = fresh();
+    std::fs::remove_file(path.join("identity.key")).unwrap();
+    let status = std::process::Command::new("mkfifo")
+        .arg(path.join("identity.key"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    refused(&path, "identity.key: must be a regular file owned by this user");
+
+    // An empty certificate (a write cut short) names its file.
+    let (_dir, path) = fresh();
+    std::fs::write(path.join("identity.crt"), b"").unwrap();
+    refused(&path, "identity.crt: not a PEM certificate");
+
+    // A first start never writes into an untrusted directory: a link to an empty directory
+    // elsewhere, or an empty world-writable directory, is refused before any file exists.
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    symlink(&outside, dir.path().join("peer")).unwrap();
+    refused(
+        &dir.path().join("peer"),
+        "the identity directory must be a directory owned by this user",
+    );
+    assert_eq!(
+        std::fs::read_dir(&outside).unwrap().count(),
+        0,
+        "nothing created through the link"
+    );
+    let open = dir.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    set_mode(&open, 0o777);
+    refused(&open, "the identity directory must be a directory owned by this user");
+    assert_eq!(
+        std::fs::read_dir(&open).unwrap().count(),
+        0,
+        "nothing created in a 0777 dir"
+    );
+    assert_eq!(
+        std::fs::metadata(&open).unwrap().permissions().mode() & 0o777,
+        0o777,
+        "not chmodded"
+    );
+
+    // An identity written by an older version (0755 dir, 0644 cert, 0600 key) still loads.
+    let (_dir, path) = fresh();
+    let first = PeerIdentity::load_or_create(&path, "host-a").unwrap();
+    set_mode(&path, 0o755);
+    set_mode(&path.join("identity.crt"), 0o644);
+    let again = PeerIdentity::load_or_create(&path, "host-a").unwrap();
+    assert_eq!(first.fingerprint(), again.fingerprint());
+}
+
+#[test]
 fn fingerprint_parse_normalizes_and_rejects_garbage() {
     let fp = host("a").identity.fingerprint().clone();
     let colons = fp

@@ -240,6 +240,7 @@ async fn a_paired_device_may_read_teams_and_stop_a_run_only() {
     assert_eq!(status, StatusCode::OK, "{body}");
 
     // The agent helper keeps its access (ADR-020 T2 unchanged).
+    common::ensure_conversation(&services, owner.as_str(), "conv-agent-helper").await;
     let issue = services.runtime_token_service.issue(
         owner.as_str(),
         "conv-agent-helper",

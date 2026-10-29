@@ -223,6 +223,7 @@ async fn an_agent_helper_token_cannot_manage_devices_or_lan_trust() {
     };
     let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
     let conversation = "conv-agent-helper";
+    common::ensure_conversation(&services, &owner, conversation).await;
     let issue = services.runtime_token_service.issue(
         owner.as_str(),
         conversation,
@@ -360,6 +361,7 @@ async fn runtime_headers_neither_forge_nor_widen_authority() {
     };
     let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
     let conversation = "conv-agent-helper";
+    common::ensure_conversation(&services, &owner, conversation).await;
     let issue = services.runtime_token_service.issue(
         owner.as_str(),
         conversation,
@@ -569,6 +571,7 @@ async fn only_the_desktop_app_uses_filesystem_routes_beyond_upload() {
     .await;
     let phone = claimed["data"]["session"]["access_token"].as_str().unwrap().to_owned();
     let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
+    common::ensure_conversation(&services, &owner, "conv-agent-helper").await;
     let issue = services.runtime_token_service.issue(
         owner.as_str(),
         "conv-agent-helper",
@@ -739,6 +742,7 @@ async fn a_paired_device_may_inspect_and_pause_cron_jobs_only() {
     .await;
     let device = claimed["data"]["session"]["access_token"].as_str().unwrap().to_owned();
     let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
+    common::ensure_conversation(&services, &owner, "conv-agent-helper").await;
     let issue = services.runtime_token_service.issue(
         owner.as_str(),
         "conv-agent-helper",
@@ -833,4 +837,300 @@ async fn a_paired_device_may_inspect_and_pause_cron_jobs_only() {
     assert_eq!(resumed["data"]["enabled"], true);
     let (status, _) = send(delete_with_token(&job, &desktop, "c")).await;
     assert_eq!(status, StatusCode::OK, "desktop delete");
+}
+
+/// Policy B (Jev 057): logs in by password or QR and returns
+/// (access token, refresh cookie value, csrf).
+async fn browser_login(app: &axum::Router, uri: &str, body: serde_json::Value, ua: Option<&str>) -> (String, String) {
+    let mut req = public_post(uri, body);
+    if let Some(ua) = ua {
+        req.headers_mut().insert("user-agent", ua.parse().unwrap());
+    }
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "{uri} login");
+    let refresh = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|c| c.strip_prefix("aionui-refresh="))
+        .map(|c| c.split(';').next().unwrap().to_owned())
+        .expect("refresh cookie");
+    let token = body_json(resp).await["token"].as_str().unwrap().to_owned();
+    (token, refresh)
+}
+
+async fn refresh_status(app: &axum::Router, refresh: &str) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/refresh")
+        .header("content-type", "application/json")
+        .header("cookie", format!("aionui-refresh={refresh}; aionui-csrf-token=c"))
+        .header("x-csrf-token", "c")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+async fn assert_listed_restricted_and_revocable(
+    app: &axum::Router,
+    desktop: &str,
+    token: &str,
+    refresh: &str,
+    expected_name: &str,
+) {
+    let send = |req: Request<Body>| async move {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        (status, body_json(resp).await)
+    };
+    // The login session sees itself as the current browser device.
+    let (status, own) = send(get_with_token("/api/devices", token)).await;
+    assert_eq!(status, StatusCode::OK, "list as browser: {own}");
+    let me = own["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["current"] == true)
+        .cloned()
+        .unwrap_or_else(|| panic!("login session is device-bound: {own}"));
+    assert_eq!(me["kind"], "browser");
+    assert_eq!(me["name"], expected_name);
+    let device_id = me["id"].as_str().unwrap().to_owned();
+    // The desktop's paired-device list shows it.
+    let (_, listed) = send(get_with_token("/api/devices", desktop)).await;
+    assert!(
+        listed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["id"] == device_id.as_str()),
+        "desktop list: {listed}"
+    );
+    // Restricted like a paired browser: no host files, no device/LAN management.
+    let (status, body) = send(json_with_token(
+        "POST",
+        "/api/fs/image-base64",
+        json!({"path": "/etc/hosts"}),
+        token,
+        "c",
+    ))
+    .await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::FORBIDDEN, json!("FS_OWNER_ONLY"))
+    );
+    let (status, body) = send(json_with_token("POST", "/api/devices/pairings", json!({}), token, "c")).await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::FORBIDDEN, json!("DEVICE_OWNER_ONLY"))
+    );
+    let (status, body) = send(json_with_token(
+        "PUT",
+        "/api/network/status",
+        json!({"display_name": "x"}),
+        token,
+        "c",
+    ))
+    .await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::FORBIDDEN, json!("NETWORK_OWNER_ONLY"))
+    );
+    // The desktop revokes it alone; both its tokens die.
+    let (status, _) = send(json_with_token(
+        "POST",
+        &format!("/api/devices/{device_id}/revoke"),
+        json!({}),
+        desktop,
+        "c",
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(get_with_token("/api/auth/user", token)).await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::UNAUTHORIZED, json!("DEVICE_REVOKED"))
+    );
+    let (status, body) = refresh_status(app, refresh).await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::UNAUTHORIZED, json!("DEVICE_REVOKED")),
+        "refresh: {body}"
+    );
+    let (status, _) = send(get_with_token("/api/auth/user", desktop)).await;
+    assert_eq!(status, StatusCode::OK, "desktop unaffected");
+}
+
+#[tokio::test]
+async fn password_login_creates_a_listed_revocable_browser_device() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, services) = common::build_app_with_mock_agents_at(tmp.path()).await;
+    let desktop = common::desktop_session(&app, tmp.path()).await;
+    let _ = common::setup_and_login(&mut app, &services, "admin", "Passw0rd!Long").await;
+    let login = json!({"username": "admin", "password": "Passw0rd!Long"});
+    let ua = "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
+    let (token, refresh) = browser_login(&app, "/login", login.clone(), Some(ua)).await;
+    assert_listed_restricted_and_revocable(&app, &desktop, &token, &refresh, "Chrome (password)").await;
+    let (token, refresh) = browser_login(&app, "/login", login, None).await;
+    assert_listed_restricted_and_revocable(&app, &desktop, &token, &refresh, "Browser (password)").await;
+}
+
+#[tokio::test]
+async fn qr_login_creates_a_listed_revocable_browser_device() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, services) = common::build_app_with_mock_agents_at(tmp.path()).await;
+    let desktop = common::desktop_session(&app, tmp.path()).await;
+    let _ = common::setup_and_login(&mut app, &services, "admin", "Passw0rd!Long").await;
+    let qr = services.qr_token_store.generate();
+    let (token, refresh) = browser_login(&app, "/api/auth/qr-login", json!({"qr_token": qr}), None).await;
+    assert_listed_restricted_and_revocable(&app, &desktop, &token, &refresh, "Browser (QR)").await;
+}
+
+#[tokio::test]
+async fn old_deviceless_tokens_keep_working_until_they_expire() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, services) = common::build_app_with_mock_agents_at(tmp.path()).await;
+    let _ = common::setup_and_login(&mut app, &services, "admin", "Passw0rd!Long").await;
+    let owner = services.user_repo.get_system_user().await.unwrap().unwrap();
+    let (access, refresh) = services
+        .jwt_service
+        .sign_session_pair(&owner.id, "admin", owner.session_generation, None)
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/auth/user", &access))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "device-less access token");
+    let (status, body) = refresh_status(&app, &refresh).await;
+    assert_eq!(status, StatusCode::OK, "device-less refresh: {body}");
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/devices/pairings",
+            json!({}),
+            &access,
+            "c",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["code"], "DEVICE_OWNER_ONLY", "still restricted");
+}
+
+/// Policy B (Jev 057) for the AionPro external-account path: the session exchange
+/// binds a restricted `browser` device named "External account".
+#[tokio::test]
+async fn external_session_creates_a_listed_revocable_browser_device() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = aionui_app::AppConfig {
+        identity_mode: aionui_app::IdentityMode::AionPro,
+        bootstrap_secret: Some("bootstrap-secret".into()),
+        data_dir: tmp.path().to_path_buf(),
+        work_dir: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let app = aionui_app::create_router(&services).await.unwrap();
+    let internal = |method: &str, uri: &str, body: serde_json::Value| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("x-aioncore-bootstrap-secret", "bootstrap-secret")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let resp = app
+        .clone()
+        .oneshot(internal(
+            "PUT",
+            "/api/auth/internal/external-users/ext-1",
+            json!({"user_type": "aionpro", "username": "Ext"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = app
+        .clone()
+        .oneshot(internal(
+            "POST",
+            "/api/auth/internal/external-sessions",
+            json!({"user_type": "aionpro", "external_user_id": "ext-1"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = |name: &str| {
+        resp.headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(|c| {
+                c.strip_prefix(&format!("{name}="))
+                    .map(|c| c.split(';').next().unwrap().to_owned())
+            })
+            .expect("cookie")
+    };
+    let refresh = cookie("aionui-refresh");
+    let token = cookie("aionui-session");
+    let send = |req: Request<Body>| async {
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        (status, body_json(resp).await)
+    };
+    // /api/devices is host-owner only (single-owner model), so read the row directly.
+    let user_id = body_json(resp).await["data"]["user"]["id"].as_str().unwrap().to_owned();
+    let repo = aionui_db::SqliteDeviceRepository::new(services.database.pool().clone());
+    let rows = aionui_db::IDeviceRepository::list(&repo, &user_id).await.unwrap();
+    assert_eq!(rows.len(), 1, "external session is device-bound");
+    assert_eq!(
+        (rows[0].kind.as_str(), rows[0].name.as_str()),
+        ("browser", "External account")
+    );
+    let device_id = rows[0].id.clone();
+    for (method, uri, body, code) in [
+        (
+            "POST",
+            "/api/fs/image-base64",
+            json!({"path": "/etc/hosts"}),
+            "FS_OWNER_ONLY",
+        ),
+        ("POST", "/api/devices/pairings", json!({}), "DEVICE_OWNER_ONLY"),
+        (
+            "PUT",
+            "/api/network/status",
+            json!({"display_name": "x"}),
+            "NETWORK_OWNER_ONLY",
+        ),
+    ] {
+        let (status, body) = send(json_with_token(method, uri, body, &token, "c")).await;
+        assert_eq!(
+            (status, body["code"].clone()),
+            (StatusCode::FORBIDDEN, json!(code)),
+            "{uri}"
+        );
+    }
+    let (status, _) = send(get_with_token("/api/auth/user", &token)).await;
+    assert_eq!(status, StatusCode::OK, "live before revoke");
+    // Revoking that one device kills both of its tokens.
+    assert!(
+        aionui_db::IDeviceRepository::revoke(&repo, &user_id, &device_id, aionui_common::now_ms())
+            .await
+            .unwrap()
+    );
+    let (status, body) = send(get_with_token("/api/auth/user", &token)).await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::UNAUTHORIZED, json!("DEVICE_REVOKED"))
+    );
+    let (status, body) = refresh_status(&app, &refresh).await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::UNAUTHORIZED, json!("DEVICE_REVOKED"))
+    );
 }

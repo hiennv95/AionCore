@@ -1,4 +1,4 @@
-use aionui_api_types::{SESSION_TOOLS_SCHEMA_VERSION, session_tool_descriptors};
+use aionui_api_types::{SESSION_TOOLS_SCHEMA_VERSION, SessionToolErrorCode, session_tool_descriptors};
 use serde_json::{Value, json};
 
 pub(crate) fn data() -> Value {
@@ -34,18 +34,8 @@ pub(crate) fn data() -> Value {
             "queued": "target not ready yet — busy and unable to take a mid-turn message, waiting on a confirmation card, or restarting its runtime; queued in memory and retried until it frees up"
         },
         "tools": tools,
-        "errors": [
-            "target_not_found",
-            "target_is_team",
-            "sender_is_team",
-            "target_is_self",
-            "queue_full",
-            "rate_limited",
-            "feature_disabled",
-            "runtime_auth_failed",
-            "schema_validation_failed",
-            "transport_unavailable"
-        ]
+        // Serialized from the enum, so every wire value is listed and nothing else.
+        "errors": SessionToolErrorCode::ALL,
     })
 }
 
@@ -85,27 +75,14 @@ mod tests {
     }
 
     #[test]
-    fn every_error_code_the_service_can_return_is_documented() {
-        let data = data();
-        let documented: Vec<&str> = data["errors"]
-            .as_array()
-            .unwrap()
+    fn every_error_code_is_documented_with_its_wire_value() {
+        let documented = data()["errors"].clone();
+        let wire: Vec<Value> = SessionToolErrorCode::ALL
             .iter()
-            .map(|value| value.as_str().unwrap())
+            .map(|code| serde_json::to_value(code).unwrap())
             .collect();
-        for expected in [
-            "target_not_found",
-            "target_is_team",
-            "sender_is_team",
-            "target_is_self",
-            "queue_full",
-            "rate_limited",
-            "feature_disabled",
-            "runtime_auth_failed",
-            "schema_validation_failed",
-            "transport_unavailable",
-        ] {
-            assert!(documented.contains(&expected), "{expected} is undocumented");
-        }
+        assert_eq!(documented, json!(wire));
+        // The refusal the LAN-share helper gets from `session send` and `session list`.
+        assert!(wire.contains(&json!("helper_not_for_lan_share")), "{documented}");
     }
 }

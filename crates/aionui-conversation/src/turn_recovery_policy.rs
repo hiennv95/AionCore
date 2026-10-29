@@ -93,6 +93,7 @@ fn is_provider_turn_error(error_code: Option<AgentErrorCode>, outcome: &RelayOut
                 | AgentErrorCode::UserLlmProviderAwsSsoExpired
                 | AgentErrorCode::UserLlmProviderPermissionDenied
                 | AgentErrorCode::UserLlmProviderBillingRequired
+                | AgentErrorCode::UserLlmProviderUsageLimit
                 | AgentErrorCode::UserLlmProviderConfigError
                 | AgentErrorCode::UserLlmProviderModelNotFound
                 | AgentErrorCode::UserLlmProviderUnsupportedModel
@@ -140,6 +141,34 @@ mod tests {
             attempt: TurnAttemptSummary::default(),
             ..RelayOutcome::default()
         }
+    }
+
+    /// An exhausted usage allowance is not replayed: a retry cannot succeed before the
+    /// provider's reset.
+    #[test]
+    fn a_usage_limit_is_never_auto_replayed() {
+        let mut outcome = retryable_clean_error();
+        outcome.terminal = RelayTerminal::Error {
+            code: Some(AgentErrorCode::UserLlmProviderUsageLimit),
+            retryable: Some(false),
+        };
+        outcome.attempt.terminal_error = Some(AgentStreamErrorData::classified(
+            "The agent has reached its usage limit",
+            AgentErrorCode::UserLlmProviderUsageLimit,
+            AgentErrorOwnership::UserLlmProvider,
+            Some("You've hit your usage limit.".into()),
+            false,
+            false,
+            None,
+        ));
+        let decision = TurnRecoveryPolicy::decide(
+            AgentType::Acp,
+            Some("codex"),
+            &outcome,
+            RuntimeLifecycleState::Active,
+            false,
+        );
+        assert_eq!(decision, TurnRecoveryDecision::None);
     }
 
     #[test]

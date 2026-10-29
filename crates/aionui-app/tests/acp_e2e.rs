@@ -56,8 +56,8 @@ async fn legacy_refresh_agents_endpoint_is_not_found() {
 
 #[tokio::test]
 async fn test_custom_agent_nonexistent_command() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Endpoint was renamed from /api/agents/test to /api/agents/custom/try-connect
     // when the custom-agent CRUD routes were introduced.  The new endpoint always

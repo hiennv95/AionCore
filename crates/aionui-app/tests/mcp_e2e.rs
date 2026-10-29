@@ -17,8 +17,8 @@ use common::{body_json, build_app, get_with_token, json_with_token, setup_and_lo
 
 #[tokio::test]
 async fn connection_test_enoent_command() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -49,8 +49,8 @@ async fn connection_test_enoent_command() {
 
 #[tokio::test]
 async fn connection_test_unreachable_url() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -81,8 +81,8 @@ async fn connection_test_unreachable_url() {
 
 #[tokio::test]
 async fn get_agent_configs() {
-    let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, _csrf) = common::desktop_login(&app, &services).await;
 
     let resp = app
         .clone()
@@ -148,8 +148,8 @@ async fn oauth_authenticated_servers_empty() {
 
 #[tokio::test]
 async fn oauth_logout_idempotent() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",

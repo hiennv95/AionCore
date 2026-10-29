@@ -69,6 +69,7 @@ async fn test_app_with_options_and_hook(
         local,
         aionpro_mode,
         device_repo: Some(Arc::new(aionui_db::SqliteDeviceRepository::new(db.pool().clone()))),
+        desktop_requires_loopback_tls: false,
     };
 
     let app = auth_routes(state);
@@ -1457,4 +1458,93 @@ async fn setup_route_no_longer_claims_the_owner() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// ===========================================================================
+// Audit wave B (2026-10-29): H16 malformed hash, H15 session revocation
+// ===========================================================================
+
+#[tokio::test]
+async fn h16_change_password_with_malformed_hash_is_unauthorized() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "OldP@ssword1").await;
+    let (token, user_id) = login(&mut app, "admin", "OldP@ssword1").await;
+    ctx.user_repo
+        .update_password(&user_id, "not-a-bcrypt-hash")
+        .await
+        .unwrap();
+
+    let req = json_post_with_token(
+        "/api/auth/change-password",
+        r#"{"current_password":"OldP@ssword1","new_password":"NewP@ssword2"}"#,
+        &token,
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn h16_login_with_malformed_hash_is_unauthorized() {
+    let (app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "OldP@ssword1").await;
+    ctx.user_repo
+        .set_system_user_credentials("admin", "not-a-bcrypt-hash")
+        .await
+        .unwrap();
+    let req = json_post("/login", r#"{"username":"admin","password":"OldP@ssword1"}"#);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Logs in, runs `change`, then asserts both the old access and refresh tokens are dead.
+async fn assert_password_change_revokes_sessions(change: Request<Body>, needs_token: bool) {
+    let (app, ctx) = test_app_with_local(true).await;
+    create_test_user(&ctx, "admin", "OldP@ssword1").await;
+    let login_resp = app
+        .clone()
+        .oneshot(json_post("/login", r#"{"username":"admin","password":"OldP@ssword1"}"#))
+        .await
+        .unwrap();
+    let refresh_cookie = extract_refresh_token(&login_resp).expect("refresh cookie");
+    let token = body_json(login_resp).await["token"].as_str().unwrap().to_owned();
+
+    let mut change = change;
+    if needs_token {
+        change
+            .headers_mut()
+            .insert(header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+    }
+    let resp = app.clone().oneshot(change).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(get_with_token("/api/auth/user", &token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "old access token must die");
+    let req = post_with_cookie("/api/auth/refresh", &format!("aionui-refresh={refresh_cookie}"));
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "old refresh token must die");
+}
+
+#[tokio::test]
+async fn h15_auth_change_password_revokes_access_and_refresh() {
+    let req = json_post(
+        "/api/auth/change-password",
+        r#"{"current_password":"OldP@ssword1","new_password":"NewP@ssword2"}"#,
+    );
+    assert_password_change_revokes_sessions(req, true).await;
+}
+
+#[tokio::test]
+async fn h15_webui_change_password_revokes_access_and_refresh() {
+    let req = json_post("/api/webui/change-password", r#"{"new_password":"NewP@ssword2"}"#);
+    assert_password_change_revokes_sessions(req, false).await;
+}
+
+#[tokio::test]
+async fn h15_webui_reset_password_revokes_access_and_refresh() {
+    let req = json_post("/api/webui/reset-password", "{}");
+    assert_password_change_revokes_sessions(req, false).await;
 }

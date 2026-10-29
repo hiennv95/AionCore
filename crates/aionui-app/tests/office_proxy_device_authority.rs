@@ -92,6 +92,7 @@ async fn office_preview_proxies_are_desktop_only() {
         .to_owned();
 
     let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
+    common::ensure_conversation(&services, owner.as_str(), "conv-helper-office").await;
     let helper = services.runtime_token_service.issue(
         owner.as_str(),
         "conv-helper-office",
@@ -117,8 +118,10 @@ async fn office_preview_proxies_are_desktop_only() {
             .unwrap();
         let (_, body) = send(&app, req).await;
         assert!(body.contains("FS_OWNER_ONLY"), "helper on {path}: {body}");
-        // The desktop app is not refused by this gate (no preview is running, so it gets another answer).
-        let (_, body) = send(&app, bearer(path, &desktop)).await;
+        // The desktop app passes this gate, then finds the proxy turned off (Jev 055).
+        let (status, body) = send(&app, bearer(path, &desktop)).await;
         assert!(!body.contains("FS_OWNER_ONLY"), "desktop on {path}: {body}");
+        assert_eq!(status, StatusCode::GONE, "desktop on {path}: {body}");
+        assert!(body.contains("OFFICE_PROXY_DISABLED"), "desktop on {path}: {body}");
     }
 }

@@ -13,6 +13,7 @@ pub mod error_extract;
 mod hooks;
 mod id;
 mod pagination;
+pub mod redact;
 mod timestamp;
 mod types;
 

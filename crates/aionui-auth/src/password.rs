@@ -33,9 +33,18 @@ pub fn hash_password(password: &str) -> Result<String, AuthError> {
 /// Returns `true` if the password matches, `false` otherwise.
 /// bcrypt internally uses constant-time comparison.
 ///
+/// An empty or malformed stored hash can never match, so it is a mismatch
+/// (callers answer 401), not an internal error (audit H16).
+///
 /// **Note**: This is a CPU-intensive blocking operation.
 pub fn verify_password(password: &str, hash: &str) -> Result<bool, AuthError> {
-    bcrypt::verify(password, hash).map_err(|e| AuthError::HashError(e.to_string()))
+    match bcrypt::verify(password, hash) {
+        Ok(valid) => Ok(valid),
+        Err(e) => {
+            tracing::warn!(error = %e, "stored password hash is empty or malformed; treating as mismatch");
+            Ok(false)
+        }
+    }
 }
 
 /// Verify a password with a guaranteed minimum execution time of 50ms.
@@ -185,6 +194,12 @@ mod tests {
         let hash = dummy_password_hash();
         assert!(hash.starts_with("$2b$12$"));
         assert!(!verify_password("random", hash).unwrap());
+    }
+
+    #[test]
+    fn empty_or_malformed_hash_is_a_mismatch_not_an_error() {
+        assert!(!verify_password("anything", "").unwrap());
+        assert!(!verify_password("anything", "not-a-bcrypt-hash").unwrap());
     }
 
     #[test]

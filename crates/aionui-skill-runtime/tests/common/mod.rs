@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use aionui_ai_agent::HelperAccess;
 use aionui_ai_agent::runtime_token::{RuntimeTokenScope, RuntimeTokenService};
 use aionui_api_types::SKILL_RUNTIME_SCHEMA_VERSION;
 use aionui_db::models::ConversationRow;
@@ -68,7 +69,7 @@ impl TestHarness {
         ));
         let router = skill_runtime_routes(SkillRuntimeRouterState {
             service,
-            runtime_token_service: token_service.clone(),
+            helper_access: Arc::new(HelperAccess::new(token_service.clone(), conversation_repo.clone())),
         });
 
         Self {

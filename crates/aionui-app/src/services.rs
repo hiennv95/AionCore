@@ -75,6 +75,9 @@ pub struct AppServices {
     /// When `true`, skip JWT authentication and use a fixed default user.
     pub local: bool,
     pub identity_mode: IdentityMode,
+    /// Desktop-app credentials are accepted only over the loopback TLS listener
+    /// (`--loopback-tls` without local mode, which has no credentials).
+    pub desktop_requires_loopback_tls: bool,
     pub bootstrap_secret: Option<Arc<str>>,
     pub app_version: String,
     /// Resolved skill paths. Shared with the `ConversationService` for
@@ -459,6 +462,7 @@ impl AppServices {
             work_dir,
             local,
             identity_mode,
+            desktop_requires_loopback_tls: config.loopback_tls && !local,
             bootstrap_secret: config.bootstrap_secret.clone().map(Arc::<str>::from),
             app_version,
             skill_paths,

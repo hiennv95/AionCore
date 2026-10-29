@@ -43,6 +43,9 @@ pub enum AgentErrorCode {
     UserLlmProviderAwsSsoExpired,
     UserLlmProviderPermissionDenied,
     UserLlmProviderBillingRequired,
+    /// The agent's account used up its usage allowance (e.g. a ChatGPT plan's Codex limit):
+    /// not retryable until the provider's reset time, which the detail carries.
+    UserLlmProviderUsageLimit,
     UserLlmProviderConfigError,
     UserLlmProviderModelNotFound,
     UserLlmProviderUnsupportedModel,

@@ -6,7 +6,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService};
+use aionui_ai_agent::{
+    AgentRouterState, AgentService, HelperAccess, IWorkerTaskManager, RemoteAgentRouterState, RemoteAgentService,
+};
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
@@ -391,7 +393,7 @@ pub async fn build_module_states(
 /// `spawn_assistant_mcp_binding_watcher`, called from `build_assistant_state`.
 /// Channel A's state. Read-only, so it takes the conversation repo (for the
 /// snapshot allow-list), the skill paths + repo (to resolve and read), and the
-/// runtime token service (to authenticate). Deliberately NOT the skill WRITE
+/// helper access check (to authenticate). Deliberately NOT the skill WRITE
 /// surface's state: this domain can never import, delete, or enable a skill.
 pub fn build_skill_runtime_state(services: &AppServices) -> SkillRuntimeRouterState {
     SkillRuntimeRouterState {
@@ -400,8 +402,17 @@ pub fn build_skill_runtime_state(services: &AppServices) -> SkillRuntimeRouterSt
             services.skill_paths.clone(),
             services.skill_repo.clone(),
         )),
-        runtime_token_service: services.runtime_token_service.clone(),
+        helper_access: helper_access(services),
     }
+}
+
+/// The one helper-credential check (token binding plus the LAN-share rule) for every
+/// route that authenticates an agent's helper.
+pub fn helper_access(services: &AppServices) -> Arc<HelperAccess> {
+    Arc::new(HelperAccess::new(
+        services.runtime_token_service.clone(),
+        services.conversation_repo.clone(),
+    ))
 }
 
 pub fn build_session_message_state(services: &AppServices) -> SessionMessageRouterState {
@@ -412,7 +423,7 @@ pub fn build_session_message_state(services: &AppServices) -> SessionMessageRout
             // `ProjectService` is `#[derive(Clone)]` and cheap to clone.
             Arc::new(services.project_service.clone()),
         )),
-        runtime_token_service: services.runtime_token_service.clone(),
+        helper_access: helper_access(services),
     };
 
     // ONE drainer for the whole process — not one per target, not one per
@@ -582,6 +593,7 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         system_opener,
         clipboard,
         allowed_roots,
+        conversations: services.conversation_repo.clone(),
     })
 }
 
@@ -1211,17 +1223,19 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
     }
 
     let jwt_service = services.jwt_service.clone();
-    let token_validator = Arc::new(move |token: &str| jwt_service.verify(token).is_ok());
+    // Access tokens only: a refresh token is a credential for /api/auth/refresh alone.
+    let token_validator = Arc::new(move |token: &str| jwt_service.verify_access(token).is_ok());
     let jwt_service = services.jwt_service.clone();
     let user_repo = services.user_repo.clone();
     let device_repo = super::device_state::device_repo(services);
     let identity_mode = services.identity_mode;
+    let desktop_requires_loopback_tls = services.desktop_requires_loopback_tls;
     let token_user_resolver: TokenUserResolver = Arc::new(move |token: String| {
         let jwt_service = jwt_service.clone();
         let user_repo = user_repo.clone();
         let device_repo = device_repo.clone();
         Box::pin(async move {
-            let payload = jwt_service.verify(&token).ok()?;
+            let payload = jwt_service.verify_access(&token).ok()?;
             let user = user_repo.find_active_by_id(&payload.user_id).await.ok()??;
             if identity_mode == IdentityMode::AionPro && user.user_type != aionui_db::UserType::Aionpro {
                 return None;
@@ -1229,6 +1243,7 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
             // A device-bound token (ADR-011) needs a live device of this user.
             // Devices other than the desktop app may not send host file frames (ADR-013).
             let mut denied_frames: &'static [&'static str] = &[];
+            let mut requires_loopback_tls = false;
             if let Some(device_id) = payload.device_id.as_deref() {
                 let device = device_repo.find(device_id).await.ok()??;
                 if device.user_id != user.id || device.revoked_at.is_some() {
@@ -1237,10 +1252,14 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
                 if device.kind != aionui_api_types::DeviceKind::DesktopApp.as_str() {
                     denied_frames = HOST_FILE_FRAMES;
                 }
+                // Same rule as REST and refresh; the handler checks the transport.
+                requires_loopback_tls =
+                    !aionui_auth::desktop_transport_allowed(desktop_requires_loopback_tls, &device.kind, false);
             }
             (payload.session_generation == user.session_generation).then_some(WsPrincipal {
                 user_id: user.id,
                 denied_frames,
+                requires_loopback_tls,
             })
         })
     });
@@ -1438,6 +1457,7 @@ mod tests {
             Some(WsPrincipal {
                 user_id: "system_default_user".into(),
                 denied_frames: HOST_FILE_FRAMES,
+                requires_loopback_tls: false,
             }),
             "a paired phone may not send host file frames"
         );

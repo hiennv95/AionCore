@@ -29,6 +29,10 @@ pub enum CronError {
     #[error("Invalid agent config: {0}")]
     InvalidAgentConfig(String),
 
+    /// An agent helper reached past its own conversation or its approval mode (C4).
+    #[error("Cron helper scope: {0}")]
+    HelperScope(String),
+
     #[error("Cross-account reference: {0}")]
     CrossAccountReference(String),
 

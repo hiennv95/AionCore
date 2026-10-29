@@ -73,7 +73,7 @@ async fn custom_agent_full_roundtrip() {
     }
 
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create — use "sh" so which::which resolves it and the registry marks
     // the new row as available (list_all filters out unavailable rows).
@@ -186,7 +186,7 @@ async fn custom_agent_advanced_overrides_persist() {
     }
 
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let (status, json) = create_agent(
         &mut app,
@@ -222,7 +222,7 @@ async fn custom_agent_advanced_overrides_persist() {
 #[tokio::test]
 async fn create_rejects_empty_name() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let (status, json) = create_agent(&mut app, &token, &csrf, json!({ "name": "", "command": "sh" })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -233,7 +233,7 @@ async fn create_rejects_empty_name() {
 #[tokio::test]
 async fn create_rejects_empty_command() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let (status, json) = create_agent(&mut app, &token, &csrf, json!({ "name": "x", "command": "   " })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -249,8 +249,8 @@ async fn update_unknown_id_returns_404() {
         std::env::set_var("AIONUI_BYPASS_PROBE", "1");
     }
 
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "PUT",
@@ -334,7 +334,7 @@ async fn test_on_save_cli_not_found_blocks_upsert() {
     }
 
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let (status, json) = create_agent(
         &mut app,

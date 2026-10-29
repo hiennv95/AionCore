@@ -64,8 +64,8 @@ async fn fs_endpoints_require_auth() {
 
 #[tokio::test]
 async fn get_files_by_dir_returns_directory_contents() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -108,8 +108,8 @@ async fn get_files_by_dir_returns_directory_contents() {
 
 #[tokio::test]
 async fn list_workspace_files_flat_list() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -140,8 +140,8 @@ async fn list_workspace_files_flat_list() {
 async fn get_files_by_dir_accepts_root_outside_default_roots() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     std::fs::write(workspace.path().join("notes.md"), "# notes").unwrap();
     std::fs::create_dir(workspace.path().join("src")).unwrap();
@@ -174,8 +174,8 @@ async fn get_files_by_dir_accepts_root_outside_default_roots() {
 async fn list_workspace_files_accepts_root_outside_default_roots() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     std::fs::write(workspace.path().join("notes.md"), "# notes").unwrap();
 
@@ -204,8 +204,8 @@ async fn list_workspace_files_accepts_root_outside_default_roots() {
 #[tokio::test]
 async fn list_workspace_files_requires_root() {
     let sandbox = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/fs/list", json!({}), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -214,8 +214,8 @@ async fn list_workspace_files_requires_root() {
 
 #[tokio::test]
 async fn get_file_metadata_returns_info() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("test.txt");
@@ -243,8 +243,8 @@ async fn get_file_metadata_returns_info() {
 
 #[tokio::test]
 async fn read_file_returns_content() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("read_me.txt");
@@ -266,8 +266,8 @@ async fn read_file_returns_content() {
 
 #[tokio::test]
 async fn read_file_nonexistent_returns_null() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let fake_path = dir.path().join("nonexistent.txt");
@@ -290,8 +290,8 @@ async fn read_file_nonexistent_returns_null() {
 async fn read_file_with_workspace_field_accepts_non_home_path() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let file_path = workspace.path().join("preview.md");
     std::fs::write(&file_path, "# hello").unwrap();
@@ -317,8 +317,8 @@ async fn read_file_with_workspace_field_accepts_non_home_path() {
 async fn read_file_without_workspace_rejects_non_sandbox_path() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let file_path = workspace.path().join("preview.md");
     std::fs::write(&file_path, "# hello").unwrap();
@@ -340,8 +340,8 @@ async fn read_file_without_workspace_rejects_non_sandbox_path() {
 #[tokio::test]
 async fn read_file_non_existent_within_sandbox_returns_null() {
     let sandbox = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let file_path = sandbox.path().join("missing.md");
 
@@ -363,8 +363,8 @@ async fn read_file_non_existent_within_sandbox_returns_null() {
 async fn image_base64_with_workspace_field_accepts_non_home_path() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let file_path = workspace.path().join("preview.png");
     std::fs::write(&file_path, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
@@ -388,8 +388,8 @@ async fn image_base64_with_workspace_field_accepts_non_home_path() {
 
 #[tokio::test]
 async fn write_file_creates_and_returns_true() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let file_path = dir.path().join("new_file.txt");
@@ -420,8 +420,8 @@ async fn write_file_creates_and_returns_true() {
 async fn write_file_with_workspace_field_accepts_non_sandbox_path() {
     let sandbox = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let file_path = workspace.path().join("created.md");
     let req = json_with_token(
@@ -446,8 +446,8 @@ async fn write_file_with_workspace_field_accepts_non_sandbox_path() {
 
 #[tokio::test]
 async fn copy_files_to_workspace() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let src_dir = tempfile::tempdir().unwrap();
     std::fs::write(src_dir.path().join("source.txt"), "content").unwrap();
@@ -488,8 +488,8 @@ async fn copy_files_to_workspace_accepts_non_sandbox_source_and_target_roots() {
     let sandbox = tempfile::tempdir().unwrap();
     let source_root = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    let (mut app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_file_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     std::fs::create_dir(source_root.path().join("nested")).unwrap();
     let source_file = source_root.path().join("nested").join("source.txt");
@@ -528,8 +528,8 @@ async fn copy_files_to_workspace_accepts_non_sandbox_source_and_target_roots() {
 
 #[tokio::test]
 async fn copy_files_to_workspace_copies_a_directory_recursively() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // A dragged Finder folder with a nested tree.
     let src_root = tempfile::tempdir().unwrap();
@@ -577,8 +577,8 @@ async fn copy_files_to_workspace_copies_a_directory_recursively() {
 
 #[tokio::test]
 async fn copy_files_to_workspace_auto_renames_on_collision_instead_of_failing() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let src_dir = tempfile::tempdir().unwrap();
     std::fs::write(src_dir.path().join("note.txt"), "new").unwrap();
@@ -631,8 +631,8 @@ async fn copy_files_to_workspace_auto_renames_on_collision_instead_of_failing() 
 
 #[tokio::test]
 async fn get_image_base64_returns_data_url() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let img_path = dir.path().join("pixel.png");
@@ -662,8 +662,8 @@ async fn get_image_base64_returns_data_url() {
 
 #[tokio::test]
 async fn fetch_remote_image_non_whitelisted_returns_placeholder_svg() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -689,8 +689,8 @@ async fn fetch_remote_image_non_whitelisted_returns_placeholder_svg() {
 
 #[tokio::test]
 async fn snapshot_init_and_compare_on_plain_dir() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path();
@@ -772,8 +772,8 @@ async fn snapshot_init_and_compare_on_plain_dir() {
 
 #[tokio::test]
 async fn snapshot_init_git_repo() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create a temporary git repo
     let dir = tempfile::tempdir().unwrap();
@@ -837,8 +837,8 @@ async fn snapshot_init_git_repo() {
 
 #[tokio::test]
 async fn path_traversal_rejected() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -1042,8 +1042,8 @@ fn local_ref(path: &std::path::Path) -> serde_json::Value {
 
 #[tokio::test]
 async fn content_read_utf8_local_ref() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let fp = dir.path().join("note.txt");
@@ -1064,8 +1064,8 @@ async fn content_read_utf8_local_ref() {
 
 #[tokio::test]
 async fn content_read_base64_local_ref() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let fp = dir.path().join("blob.bin");
@@ -1091,8 +1091,8 @@ async fn content_read_base64_local_ref() {
 
 #[tokio::test]
 async fn content_read_dataurl_local_ref() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let fp = dir.path().join("pixel.png");
@@ -1123,8 +1123,8 @@ async fn content_read_dataurl_local_ref() {
 
 #[tokio::test]
 async fn content_write_then_read_roundtrip_local_ref() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let fp = dir.path().join("editme.txt");
@@ -1155,8 +1155,8 @@ async fn content_write_then_read_roundtrip_local_ref() {
 
 #[tokio::test]
 async fn content_metadata_local_ref() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let fp = dir.path().join("meta.txt");
@@ -1193,8 +1193,8 @@ fn put_content_if_match(path: &std::path::Path, data: &str, if_match: i64, token
 
 #[tokio::test]
 async fn content_write_if_match_matches_and_conflicts() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let fp = dir.path().join("concurrent.txt");
@@ -1245,8 +1245,8 @@ fn get_with_token(uri: &str, token: &str, csrf: &str, range: Option<&str>) -> Re
 
 #[tokio::test]
 async fn stream_serves_full_file_with_content_type() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let fp = dir.path().join("doc.pdf");
@@ -1274,8 +1274,8 @@ async fn stream_serves_full_file_with_content_type() {
 
 #[tokio::test]
 async fn stream_honors_range_returns_206_partial() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let dir = tempfile::tempdir().unwrap();
     let fp = dir.path().join("range.bin");
@@ -1308,4 +1308,134 @@ async fn stream_requires_auth() {
     // GET has no CSRF layer (unlike the POST endpoints, which 403 on missing
     // CSRF); the auth middleware rejects the missing token with 401.
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// H9: an upload may only target the caller's own conversation. A conversation id of
+/// another user is refused before anything is written; the caller's own conversation
+/// and an unknown (not yet created) id keep working as before.
+#[tokio::test]
+async fn upload_refuses_another_users_conversation() {
+    use aionui_db::IUserRepository;
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let bob = aionui_db::SqliteUserRepository::new(services.database.pool().clone())
+        .create_user("bob", "hash")
+        .await
+        .unwrap()
+        .id;
+    let foreign = format!("conv-h9-bob-{}", std::process::id());
+    common::ensure_conversation(&services, &bob, &foreign).await;
+    let unique = format!("h9-{}.txt", std::process::id());
+    let upload = |conversation: &str| {
+        let (content_type, body) = UploadMultipart::new()
+            .add_file("file", &unique, "text/plain", b"h9")
+            .add_text("conversation_id", conversation)
+            .build();
+        upload_request(&content_type, body, &token, &csrf)
+    };
+
+    let resp = app.clone().oneshot(upload(&foreign)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "foreign conversation upload");
+    let planted = std::env::temp_dir().join("aionui").join(&foreign).join(&unique);
+    assert!(!planted.exists(), "nothing written for a foreign conversation");
+
+    let admin = services.user_repo.find_by_username("admin").await.unwrap().unwrap().id;
+    let own = format!("conv-h9-admin-{}", std::process::id());
+    common::ensure_conversation(&services, &admin, &own).await;
+    for conversation in [own.as_str(), "conv-h9-not-created-yet"] {
+        let resp = app.clone().oneshot(upload(conversation)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "upload to {conversation}");
+        let path = body_json(resp).await["data"].as_str().unwrap().to_owned();
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// H9 follow-up: an upload's bytes belong to the uploader. Another user who learns the
+/// returned path cannot read, write or send it; the uploader still can.
+#[tokio::test]
+async fn upload_bytes_are_bound_to_the_uploader() {
+    use aionui_db::IUserRepository;
+    let (mut app, services) = common::build_app_with_mock_agents().await;
+    let (alice, alice_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let hash = aionui_auth::hash_password("Bob@Pass12345").unwrap();
+    aionui_db::SqliteUserRepository::new(services.database.pool().clone())
+        .create_user("bob", &hash)
+        .await
+        .unwrap();
+    let (bob, bob_csrf) = common::login_existing(&mut app, "bob", "Bob@Pass12345").await;
+
+    let name = format!("h9-owner-{}.txt", std::process::id());
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", &name, "text/plain", b"alice secret")
+        .build();
+    let resp = app
+        .clone()
+        .oneshot(upload_request(&content_type, body, &alice, &alice_csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let path = body_json(resp).await["data"].as_str().unwrap().to_owned();
+    let file = json!({"kind": "upload", "path": path});
+    let call = |method: &str, body: serde_json::Value, token: &str, csrf: &str| {
+        json_with_token(method, "/api/fs/content", body, token, csrf)
+    };
+
+    let read = json!({"file": file, "encoding": "utf8"});
+    let resp = app
+        .clone()
+        .oneshot(call("POST", read.clone(), &bob, &bob_csrf))
+        .await
+        .unwrap();
+    assert!(!resp.status().is_success(), "bob reads alice's upload");
+    let write = json!({"file": file, "data": "bob was here"});
+    let resp = app.clone().oneshot(call("PUT", write, &bob, &bob_csrf)).await.unwrap();
+    assert!(!resp.status().is_success(), "bob writes alice's upload");
+    assert_eq!(std::fs::read(&path).unwrap(), b"alice secret");
+
+    let chat = |token: &str, csrf: &str| {
+        json_with_token(
+            "POST",
+            "/api/conversations",
+            json!({"type": "acp", "name": "h9", "extra": {"backend": "gemini"}}),
+            token,
+            csrf,
+        )
+    };
+    let send_upload = |conversation: &str, token: &str, csrf: &str| {
+        json_with_token(
+            "POST",
+            &format!("/api/conversations/{conversation}/messages"),
+            json!({"content": "see file", "files": [file.clone()]}),
+            token,
+            csrf,
+        )
+    };
+    let bob_chat = body_json(app.clone().oneshot(chat(&bob, &bob_csrf)).await.unwrap()).await;
+    let bob_chat = bob_chat["data"]["id"].as_str().expect("bob chat").to_owned();
+    let resp = app
+        .clone()
+        .oneshot(send_upload(&bob_chat, &bob, &bob_csrf))
+        .await
+        .unwrap();
+    assert!(!resp.status().is_success(), "bob sends alice's upload");
+
+    // `/api/fs/content` is desktop-only (ADR-013); the desktop app acts as the owner.
+    let (desktop, desktop_csrf) = common::desktop_login(&app, &services).await;
+    let resp = app
+        .clone()
+        .oneshot(call("POST", read, &desktop, &desktop_csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "alice reads her upload");
+    assert_eq!(body_json(resp).await["data"], "alice secret");
+    let alice_chat = body_json(app.clone().oneshot(chat(&alice, &alice_csrf)).await.unwrap()).await;
+    let alice_chat = alice_chat["data"]["id"].as_str().expect("alice chat").to_owned();
+    let resp = app
+        .clone()
+        .oneshot(send_upload(&alice_chat, &alice, &alice_csrf))
+        .await
+        .unwrap();
+    let status = resp.status();
+    assert!(status.is_success(), "alice sends her upload: {}", body_json(resp).await);
+    let _ = std::fs::remove_file(&path);
 }

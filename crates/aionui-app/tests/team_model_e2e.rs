@@ -78,7 +78,7 @@ async fn create_team(app: &mut axum::Router, services: &aionui_app::AppServices,
 #[tokio::test]
 async fn update_agent_model_persists_the_team_roster_value() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let team = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = team["id"].as_str().unwrap();
     let slot_id = team["assistants"][1]["slot_id"].as_str().unwrap();
@@ -117,7 +117,7 @@ async fn starting_a_legacy_team_session_repairs_roster_and_seed_from_the_confirm
     // to attach. Spawning a real CLI process would make the status assertion
     // depend on the host, which is what `build_app_with_mock_agents` exists for.
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let team = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = team["id"].as_str().unwrap().to_owned();
     let conversation_id = team["assistants"][1]["conversation_id"].as_str().unwrap().to_owned();
@@ -212,7 +212,7 @@ async fn update_agent_model_requires_authentication() {
 #[tokio::test]
 async fn update_agent_model_requires_csrf() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let team = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = team["id"].as_str().unwrap();
     let slot_id = team["assistants"][1]["slot_id"].as_str().unwrap();
@@ -232,7 +232,7 @@ async fn update_agent_model_requires_csrf() {
 #[tokio::test]
 async fn update_agent_model_rejects_cross_user_access() {
     let (mut app, services) = build_app().await;
-    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (owner_token, owner_csrf) = common::desktop_login(&app, &services).await;
     let team = create_team(&mut app, &services, &owner_token, &owner_csrf).await;
     let team_id = team["id"].as_str().unwrap();
     let slot_id = team["assistants"][1]["slot_id"].as_str().unwrap();
@@ -246,14 +246,15 @@ async fn update_agent_model_rejects_cross_user_access() {
     );
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    assert_eq!(body_json(resp).await["code"], "NOT_FOUND");
+    // Jev 053: a device-less password session is refused before the ownership lookup.
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["code"], "TEAM_DESKTOP_ONLY");
 }
 
 #[tokio::test]
 async fn update_agent_model_rejects_empty_models() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let team = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = team["id"].as_str().unwrap();
     let slot_id = team["assistants"][1]["slot_id"].as_str().unwrap();
@@ -272,7 +273,7 @@ async fn update_agent_model_rejects_empty_models() {
 #[tokio::test]
 async fn update_agent_model_rejects_missing_agents() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let team = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = team["id"].as_str().unwrap();
     let req = json_with_token(
@@ -308,7 +309,7 @@ async fn set_team_config_option_requires_authentication() {
 #[tokio::test]
 async fn set_team_config_option_requires_csrf() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let team = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = team["id"].as_str().unwrap();
     let conversation_id = team["assistants"][1]["conversation_id"].as_str().unwrap();
@@ -330,7 +331,7 @@ async fn set_team_config_option_requires_csrf() {
 #[tokio::test]
 async fn set_team_config_option_rejects_cross_user_access() {
     let (mut app, services) = build_app().await;
-    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (owner_token, owner_csrf) = common::desktop_login(&app, &services).await;
     let team = create_team(&mut app, &services, &owner_token, &owner_csrf).await;
     let team_id = team["id"].as_str().unwrap();
     let conversation_id = team["assistants"][1]["conversation_id"].as_str().unwrap();
@@ -344,6 +345,7 @@ async fn set_team_config_option_rejects_cross_user_access() {
     );
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    assert_eq!(body_json(resp).await["code"], "NOT_FOUND");
+    // Jev 053: a device-less password session is refused before the ownership lookup.
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["code"], "TEAM_DESKTOP_ONLY");
 }

@@ -84,7 +84,9 @@ async fn same_origin_only(request: Request, next: Next) -> Response {
 
 /// The desktop bootstrap (session from the bootstrap secret, and the host proof) is for
 /// the desktop app on loopback only: the LAN has no reason to reach it (audit H14).
-async fn no_desktop_bootstrap(request: Request, next: Next) -> Response {
+/// With `--loopback-tls` the plain HTTP listener refuses it too, so the secret and
+/// the session it buys only travel over TLS.
+pub async fn no_desktop_bootstrap(request: Request, next: Next) -> Response {
     let path = request.uri().path().trim_end_matches('/');
     if path == "/api/devices/app-session" || path == "/api/devices/host-proof" {
         tracing::info!(path, "device listener: desktop bootstrap refused");
@@ -95,7 +97,7 @@ async fn no_desktop_bootstrap(request: Request, next: Next) -> Response {
 
 /// Every cookie issued over this TLS listener is `Secure`, so a browser never
 /// replays the owner session over plain HTTP to another port on this host.
-async fn secure_cookies(request: Request, next: Next) -> Response {
+pub(crate) async fn secure_cookies(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     let cookies: Vec<_> = headers.get_all(header::SET_COOKIE).iter().cloned().collect();

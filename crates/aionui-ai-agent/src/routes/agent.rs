@@ -20,7 +20,9 @@ use aionui_api_types::{
     CustomAgentUpsertRequest, DeleteCustomAgentResponse, ProviderHealthCheckRequest, ProviderHealthCheckResponse,
     SetAgentOverridesRequest, SetEnabledRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device};
+use aionui_auth::{
+    CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller, from_paired_device, is_paired_device,
+};
 use aionui_common::ApiError;
 
 use crate::routes::error_mapping::agent_error_to_api_error;
@@ -56,7 +58,7 @@ fn host_only<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> Method
 /// `*_DESKTOP_ONLY`, so the agent config CLI reports `CONFIG_DESKTOP_ONLY`.
 async fn agents_desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
     let extensions = request.extensions();
-    if is_paired_device(extensions.get::<CurrentDevice>()) || extensions.get::<RuntimeHelperCaller>().is_some() {
+    if from_paired_device(extensions) || extensions.get::<RuntimeHelperCaller>().is_some() {
         return Err(ApiError::coded(
             StatusCode::FORBIDDEN,
             "AGENTS_DESKTOP_ONLY",
@@ -211,6 +213,7 @@ async fn get_agent_overrides(
     State(state): State<AgentRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<AgentOverridesResponse>>, ApiError> {
@@ -219,7 +222,7 @@ async fn get_agent_overrides(
         .get_agent_overrides(&user.id, &id)
         .await
         .map_err(agent_error_to_api_error)?;
-    if helper.is_some() || is_paired_device(device.as_ref().map(|Extension(d)| d)) {
+    if helper.is_some() || deviceless.is_some() || is_paired_device(device.as_ref().map(|Extension(d)| d)) {
         mask_env(&mut overrides.env_override);
     }
     Ok(Json(ApiResponse::ok(overrides)))

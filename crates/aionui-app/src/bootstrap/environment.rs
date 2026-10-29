@@ -41,6 +41,8 @@ pub struct ServerEnvironment {
     pub ws_token_expiry: bool,
     /// Mutual-TLS peer listener address (`--peer-listen`).
     pub peer_listen: Option<std::net::SocketAddr>,
+    /// Port of the desktop loopback TLS listener, 0 for any (`--loopback-tls`).
+    pub loopback_tls: Option<u16>,
 }
 
 /// Layer 1: Logging + config resolution.
@@ -107,6 +109,7 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         bootstrap_secret,
         dump_prompts: cli.dump_prompts,
         recover_corrupted_database: cli.recover_corrupted_database,
+        loopback_tls: cli.loopback_tls,
     };
     info!(
         identity_mode = config.identity_mode.auth_label(),
@@ -210,6 +213,10 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
     if cli.trusted_proxy {
         info!("startup: trusting forwarding headers from loopback peers (--trusted-proxy)");
     }
+    let loopback_tls = cli
+        .loopback_tls
+        .then(|| validate_loopback_tls_port(cli.loopback_tls_port, config.port))
+        .transpose()?;
 
     Ok(ServerEnvironment {
         _log_guard: log_guard,
@@ -222,7 +229,22 @@ pub fn init_environment(cli: &Cli, merged_path: &str) -> Result<ServerEnvironmen
         access_token_ttl,
         ws_token_expiry: cli.ws_token_expiry,
         peer_listen: cli.peer_listen,
+        loopback_tls,
     })
+}
+
+/// An explicit loopback TLS port must be unprivileged and differ from the HTTP port.
+fn validate_loopback_tls_port(port: Option<u16>, http_port: u16) -> Result<u16, BootstrapError> {
+    match port {
+        None => Ok(0),
+        Some(port) if port >= 1024 && port != http_port => Ok(port),
+        Some(port) => Err(BootstrapError::new(
+            BootstrapErrorCode::ConfigInvalid,
+            "config.loopback_tls_port",
+            "invalid startup configuration",
+        )
+        .with_field("loopback_tls_port", port.to_string())),
+    }
 }
 
 fn validate_identity_environment(
@@ -311,6 +333,15 @@ fn database_init_bootstrap_error(error: aionui_db::DatabaseInitError, db_path: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_tls_port_defaults_to_any_and_rejects_privileged_or_the_http_port() {
+        assert_eq!(validate_loopback_tls_port(None, 25808).unwrap(), 0);
+        assert_eq!(validate_loopback_tls_port(Some(25900), 25808).unwrap(), 25900);
+        assert!(validate_loopback_tls_port(Some(25808), 25808).is_err());
+        assert!(validate_loopback_tls_port(Some(443), 25808).is_err());
+        assert!(validate_loopback_tls_port(Some(0), 25808).is_err());
+    }
 
     #[test]
     fn database_stage_comes_from_db_boundary_error() {

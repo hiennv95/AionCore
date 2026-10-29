@@ -151,8 +151,8 @@ async fn au2_unauthenticated_all_office_endpoints() {
 
 #[tokio::test]
 async fn wp4_word_preview_officecli_not_available() {
-    let (mut app, services, tmp) = build_office_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let (app, services, tmp) = build_office_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let file_path = tmp.path().join("test.docx");
     std::fs::write(&file_path, b"docx").unwrap();
@@ -161,12 +161,12 @@ async fn wp4_word_preview_officecli_not_available() {
     let req = json_with_token("POST", "/api/word-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Office preview is off (owner decision, Jev 055): starting a watch only fed the
+    // disabled proxies and could try to install officecli, so the desktop gets 410
+    // before any path check or install attempt.
+    assert_eq!(resp.status(), StatusCode::GONE);
     let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    let url = json["data"]["url"].as_str().unwrap();
-    assert!(url.is_empty(), "url should be empty when officecli unavailable");
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    assert_eq!(json["code"], "OFFICE_PROXY_DISABLED");
 }
 
 #[tokio::test]
@@ -176,8 +176,8 @@ async fn wp5_word_preview_with_workspace_accepts_non_sandbox_path() {
     let file_path = outside.path().join("demo.docx");
     std::fs::write(&file_path, b"docx").unwrap();
 
-    let (mut app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user2", "pass123").await;
+    let (app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({
         "file_path": file_path.to_str().unwrap(),
@@ -186,10 +186,12 @@ async fn wp5_word_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/word-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Office preview is off (owner decision, Jev 055): starting a watch only fed the
+    // disabled proxies and could try to install officecli, so the desktop gets 410
+    // before any path check or install attempt.
+    assert_eq!(resp.status(), StatusCode::GONE);
     let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    assert_eq!(json["code"], "OFFICE_PROXY_DISABLED");
 }
 
 #[tokio::test]
@@ -199,8 +201,8 @@ async fn wp6_word_preview_without_workspace_rejects_non_sandbox_path() {
     let file_path = outside.path().join("demo.docx");
     std::fs::write(&file_path, b"docx").unwrap();
 
-    let (mut app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user3", "pass123").await;
+    let (app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({
         "file_path": file_path.to_str().unwrap()
@@ -208,9 +210,12 @@ async fn wp6_word_preview_without_workspace_rejects_non_sandbox_path() {
     let req = json_with_token("POST", "/api/word-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // Office preview is off (owner decision, Jev 055): starting a watch only fed the
+    // disabled proxies and could try to install officecli, so the desktop gets 410
+    // before any path check or install attempt.
+    assert_eq!(resp.status(), StatusCode::GONE);
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "PATH_OUTSIDE_SANDBOX");
+    assert_eq!(json["code"], "OFFICE_PROXY_DISABLED");
 }
 
 #[tokio::test]
@@ -220,8 +225,8 @@ async fn ep1_excel_preview_with_workspace_accepts_non_sandbox_path() {
     let file_path = outside.path().join("demo.xlsx");
     std::fs::write(&file_path, b"xlsx").unwrap();
 
-    let (mut app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user4", "pass123").await;
+    let (app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({
         "file_path": file_path.to_str().unwrap(),
@@ -230,10 +235,12 @@ async fn ep1_excel_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/excel-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Office preview is off (owner decision, Jev 055): starting a watch only fed the
+    // disabled proxies and could try to install officecli, so the desktop gets 410
+    // before any path check or install attempt.
+    assert_eq!(resp.status(), StatusCode::GONE);
     let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    assert_eq!(json["code"], "OFFICE_PROXY_DISABLED");
 }
 
 #[tokio::test]
@@ -243,8 +250,8 @@ async fn pp1_ppt_preview_with_workspace_accepts_non_sandbox_path() {
     let file_path = outside.path().join("demo.pptx");
     std::fs::write(&file_path, b"pptx").unwrap();
 
-    let (mut app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user5", "pass123").await;
+    let (app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({
         "file_path": file_path.to_str().unwrap(),
@@ -253,10 +260,12 @@ async fn pp1_ppt_preview_with_workspace_accepts_non_sandbox_path() {
     let req = json_with_token("POST", "/api/ppt-preview/start", body, &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Office preview is off (owner decision, Jev 055): starting a watch only fed the
+    // disabled proxies and could try to install officecli, so the desktop gets 410
+    // before any path check or install attempt.
+    assert_eq!(resp.status(), StatusCode::GONE);
     let json = body_json(resp).await;
-    assert_eq!(json["success"], true);
-    assert_eq!(json["data"]["error"], "OFFICECLI_INSTALL_FAILED");
+    assert_eq!(json["code"], "OFFICE_PROXY_DISABLED");
 }
 
 // ── SO-1: Star Office detect route removed ───────────────────────────
@@ -291,8 +300,8 @@ async fn so2_detect_route_removed_with_preferred_url() {
 
 #[tokio::test]
 async fn dc1_excel_to_json() {
-    let (mut app, services, tmp) = build_office_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let (app, services, tmp) = build_office_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let xlsx_path = tmp.path().join("test.xlsx");
     create_test_xlsx(&xlsx_path);
@@ -320,8 +329,8 @@ async fn dc1_excel_to_json() {
 
 #[tokio::test]
 async fn dc4_excel_file_not_found() {
-    let (mut app, services, _tmp) = build_office_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let (app, services, _tmp) = build_office_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({
         "file_path": "/nonexistent/file.xlsx",
@@ -342,8 +351,8 @@ async fn dc5_document_convert_rejects_outside_sandbox() {
     let xlsx_path = outside.path().join("test.xlsx");
     create_test_xlsx(&xlsx_path);
 
-    let (mut app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user6", "pass123").await;
+    let (app, services, _tmp) = build_office_app_with_roots(vec![sandbox.path().to_path_buf()]).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({
         "file_path": xlsx_path.to_str().unwrap(),
@@ -361,8 +370,8 @@ async fn dc5_document_convert_rejects_outside_sandbox() {
 
 #[tokio::test]
 async fn dc9_invalid_conversion_target() {
-    let (mut app, services, _tmp) = build_office_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let (app, services, _tmp) = build_office_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({
         "file_path": "/path/to/file.txt",

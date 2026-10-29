@@ -149,6 +149,7 @@ async fn phones_cannot_choose_host_commands_or_change_remote_agents_and_read_env
 
     // The helper is refused on remote agents and on every custom agent change.
     let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
+    common::ensure_conversation(&services, owner.as_str(), "conv-helper-agents").await;
     let helper = services.runtime_token_service.issue(
         owner.as_str(),
         "conv-helper-agents",
@@ -240,7 +241,7 @@ async fn phones_cannot_choose_host_commands_or_change_remote_agents_and_read_env
 async fn another_user_cannot_see_or_touch_the_owners_custom_and_remote_agents() {
     unsafe { std::env::set_var("AIONUI_BYPASS_PROBE", "1") };
     let (mut app, services) = common::build_app().await;
-    let (owner, oc) = common::setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (owner, oc) = common::desktop_login(&app, &services).await;
     let (bob, bc) = common::setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
     let send = |method: &str, uri: &str, body: Value, token: &str, csrf: &str| {
         let req = json_with_token(method, uri, body, token, csrf);

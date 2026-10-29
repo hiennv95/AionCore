@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tower::ServiceExt;
 
-use common::{body_json, get_with_token, json_with_token, setup_and_login};
+use common::{body_json, get_with_token, json_with_token};
 
 /// Reports `paths` from one finished tool call, then ends the turn.
 struct ReportingAgent {
@@ -137,8 +137,8 @@ async fn a_turn_reporting_files_mints_refs_only_for_files_inside_the_folder() {
             paths,
             agents: Mutex::default(),
         }));
-    let mut app = aionui_app::create_router(&services).await.expect("router");
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let app = aionui_app::create_router(&services).await.expect("router");
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = app
         .clone()

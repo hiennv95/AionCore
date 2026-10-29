@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use aionui_ai_agent::agent_task::{AgentInstance, IAgentTask, IMockAgent};
 use aionui_ai_agent::protocol::events::{AgentStreamEvent, FinishEventData};
 use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
-use aionui_ai_agent::{AgentError, AgentSendError, IWorkerTaskManager, RuntimeTokenService};
+use aionui_ai_agent::{AgentError, AgentSendError, HelperAccess, IWorkerTaskManager, RuntimeTokenService};
 use aionui_api_types::WebSocketMessage;
 use aionui_common::{AgentKillReason, AgentType, Confirmation, ConversationStatus, TimestampMs};
 use aionui_conversation::ConversationService;
@@ -337,7 +337,10 @@ impl Ctx {
         SessionMessageRouterState {
             service: self.service.clone(),
             targets: self.targets.clone(),
-            runtime_token_service: self.runtime_token_service.clone(),
+            helper_access: Arc::new(HelperAccess::new(
+                self.runtime_token_service.clone(),
+                self.conversation_repo.clone(),
+            )),
         }
     }
 

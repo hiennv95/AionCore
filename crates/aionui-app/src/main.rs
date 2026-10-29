@@ -17,6 +17,7 @@ use crate::error::MainError;
 // MainError has been moved to src/error.rs
 
 fn main() -> ExitCode {
+    bootstrap::install_panic_hook();
     match run_main() {
         Ok(exit_code) => exit_code,
         Err(error) => {

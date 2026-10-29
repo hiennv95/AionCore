@@ -402,6 +402,7 @@ impl<'a> SessionContextBuilder<'a> {
         &self,
         conversation_id: &str,
         options: &mut BuildTaskOptions,
+        lan_locked_mode: Option<&str>,
     ) -> Result<(), ConversationError> {
         let user_id = options.context.conversation.user_id.clone();
         let AgentSessionKind::Acp(ctx) = &mut options.context.kind else {
@@ -416,9 +417,14 @@ impl<'a> SessionContextBuilder<'a> {
         if session_id == ctx.session_id {
             return Ok(());
         }
-        let session_snapshot = self
+        let mut session_snapshot = self
             .load_acp_session_snapshot(&user_id, conversation_id, &ctx.config, session_id.as_deref())
             .await?;
+        // The reloaded snapshot is clamped like a rebuild's (audit H18): a LAN share
+        // never resumes in a mode other than the share's.
+        if let Some(locked) = lan_locked_mode {
+            clamp_to_lan_mode(&mut ctx.config, session_snapshot.as_mut(), locked);
+        }
         info!(
             conversation_id,
             had_anchor = ctx.session_id.is_some(),
@@ -1042,6 +1048,84 @@ mod tests {
     /// A LAN share fixes the mode (ADR-009): a persisted snapshot written by
     /// another path (cron, a backend-reported change) must not override it on
     /// rebuild (audit run-2 SEC-F, Jev 031).
+    /// H18: the replay's anchor refresh reloads the snapshot; for a LAN share it is
+    /// clamped to the share's mode exactly like a rebuild.
+    #[tokio::test]
+    async fn lan_share_replay_refresh_keeps_the_share_mode() {
+        let repos = setup().await;
+        upsert_builtin(&repos, "builtin-codex-test", "codex").await;
+        let row = row(
+            "acp",
+            serde_json::json!({
+                "backend": "codex",
+                "lan_remote": true,
+                "session_mode": "read-only",
+                "current_mode_id": "read-only"
+            }),
+            None,
+        );
+        repos.insert_conversation(&row).await;
+        repos
+            .acp_session_repo
+            .create(&CreateAcpSessionParams {
+                user_id: "user-1",
+                conversation_id: "conv-1",
+                agent_source: "builtin",
+                agent_id: "builtin-codex-test",
+            })
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .update_session_id_for_user("user-1", "conv-1", "sess-1")
+            .await
+            .unwrap();
+        let mut options = repos.builder().build_options(&row, None).await.unwrap();
+
+        // Mid-turn another path re-anchors the session and persists a drifted mode.
+        repos
+            .acp_session_repo
+            .update_session_id_for_user("user-1", "conv-1", "sess-2")
+            .await
+            .unwrap();
+        repos
+            .acp_session_repo
+            .save_runtime_state_for_user(
+                "user-1",
+                "conv-1",
+                &SaveRuntimeStateParams {
+                    current_mode_id: Some(Some("agent-full-access")),
+                    current_model_id: None,
+                    config_selections_json: Some(Some(r#"{"mode":"agent-full-access"}"#)),
+                    context_usage_json: None,
+                },
+            )
+            .await
+            .unwrap();
+        repos
+            .builder()
+            .refresh_resume_anchor("conv-1", &mut options, Some("read-only"))
+            .await
+            .unwrap();
+
+        let acp = acp_context(options.context);
+        assert_eq!(acp.session_id.as_deref(), Some("sess-2"));
+        let snapshot = acp
+            .session_snapshot
+            .expect("a re-anchored session has a resume snapshot");
+        assert_eq!(
+            snapshot.current_mode_id.map(|m| m.as_str().to_owned()).as_deref(),
+            Some("read-only")
+        );
+        assert!(
+            snapshot
+                .config_selections
+                .values()
+                .all(|v| v.as_str() != "agent-full-access"),
+            "no persisted full-access selection survives the refresh"
+        );
+    }
+
     #[tokio::test]
     async fn lan_share_rebuild_starts_in_the_share_mode_whatever_was_persisted() {
         let repos = setup().await;
@@ -1576,7 +1660,7 @@ mod tests {
             .unwrap();
         repos
             .builder()
-            .refresh_resume_anchor("conv-1", &mut options)
+            .refresh_resume_anchor("conv-1", &mut options, None)
             .await
             .unwrap();
 
@@ -1623,7 +1707,7 @@ mod tests {
 
         repos
             .builder()
-            .refresh_resume_anchor("conv-1", &mut options)
+            .refresh_resume_anchor("conv-1", &mut options, None)
             .await
             .unwrap();
 

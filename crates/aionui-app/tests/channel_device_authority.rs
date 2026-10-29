@@ -84,6 +84,7 @@ async fn only_the_desktop_changes_which_assistant_answers_a_chat_platform() {
     let (app, services, _) = build_app_with_skill_paths(tmp.path()).await;
     let (desktop, phone) = desktop_and_phone(&app, tmp.path()).await;
     let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
+    common::ensure_conversation(&services, owner.as_str(), "conv-helper-channel").await;
     let helper = services.runtime_token_service.issue(
         owner.as_str(),
         "conv-helper-channel",

@@ -105,6 +105,7 @@ async fn host_with_revoke_failures(revoke_failures: usize) -> Host {
         identity_mode: AuthIdentityMode::UserSession,
         runtime_token_verifier: None,
         device_repo: Some(devices.clone()),
+        desktop_requires_loopback_tls: false,
     };
     let owner_routes = device_owner_routes(state.clone());
     let app = device_public_routes(state.clone())

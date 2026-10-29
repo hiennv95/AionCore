@@ -1,4 +1,4 @@
-use aionui_api_types::{CONVERSATION_TOOLS_SCHEMA_VERSION, conversation_tool_descriptors};
+use aionui_api_types::{CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationToolErrorCode, conversation_tool_descriptors};
 use serde_json::{Value, json};
 
 pub(crate) fn data() -> Value {
@@ -34,17 +34,8 @@ pub(crate) fn data() -> Value {
             "inheritance": "workspace and assistant default to THIS conversation's; the new conversation is a clean instance of the same assistant, not a copy of this conversation's runtime state"
         },
         "tools": tools,
-        "errors": [
-            "caller_is_team",
-            "workspace_not_absolute",
-            "workspace_unavailable",
-            "assistant_not_found",
-            "assistant_disabled",
-            "assistant_model_unresolved",
-            "runtime_auth_failed",
-            "schema_validation_failed",
-            "transport_unavailable"
-        ]
+        // Serialized from the enum, so every wire value is listed and nothing else.
+        "errors": ConversationToolErrorCode::ALL,
     })
 }
 
@@ -81,31 +72,15 @@ mod tests {
     }
 
     #[test]
-    fn every_error_code_the_service_can_return_is_documented() {
+    fn every_error_code_is_documented_with_its_wire_value() {
         use aionui_api_types::ConversationToolErrorCode as Code;
-        let documented: Vec<String> = data()["errors"]
-            .as_array()
-            .unwrap()
+        let documented = data()["errors"].clone();
+        let wire: Vec<Value> = Code::ALL
             .iter()
-            .map(|value| value.as_str().unwrap().to_owned())
+            .map(|code| serde_json::to_value(code).unwrap())
             .collect();
-        for code in [
-            Code::CallerIsTeam,
-            Code::WorkspaceNotAbsolute,
-            Code::WorkspaceUnavailable,
-            Code::AssistantNotFound,
-            Code::AssistantDisabled,
-            Code::AssistantModelUnresolved,
-            Code::RuntimeAuthFailed,
-            Code::SchemaValidationFailed,
-            Code::TransportUnavailable,
-        ] {
-            assert!(
-                documented.contains(&code.as_str().to_owned()),
-                "{} is undocumented",
-                code.as_str()
-            );
-        }
-        assert_eq!(documented.len(), 9, "no stray codes: {documented:?}");
+        assert_eq!(documented, json!(wire));
+        // The refusal the LAN-share helper gets from `conversation create`.
+        assert!(wire.contains(&json!("helper_not_for_lan_share")), "{documented}");
     }
 }

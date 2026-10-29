@@ -873,6 +873,7 @@ impl crate::traits::IFileService for FileService {
 
     async fn create_upload_file(
         &self,
+        user_id: &str,
         file_name: &str,
         data: &[u8],
         conversation_id: Option<&str>,
@@ -907,12 +908,17 @@ impl crate::traits::IFileService for FileService {
             _ => None,
         };
 
+        let user_dir = aionui_common::user_dir_name(user_id)
+            .map_err(|e| FileError::BadRequest(format!("invalid user for upload: {e}")))?;
         let name = file_name.to_owned();
         let bytes = data.to_vec();
 
         tokio::task::spawn_blocking(move || {
             let root = std::env::temp_dir().join("aionui");
-            let dir = root.join(conv_id.as_deref().unwrap_or("general"));
+            // Per-user namespace: the chat-file resolver only hands an upload to its owner.
+            let users = root.join(aionui_project::UPLOAD_USERS_DIR);
+            let user_root = users.join(&user_dir);
+            let dir = user_root.join(conv_id.as_deref().unwrap_or("general"));
             // New Unix dirs are requested 0700: upload refs are refused from directories
             // other accounts can write (`aionui-project` `upload_path_in_root`).
             let mut builder = std::fs::DirBuilder::new();
@@ -924,7 +930,7 @@ impl crate::traits::IFileService for FileService {
                 .map_err(|e| FileError::Internal(format!("cannot create upload directory: {e}")))?;
             // Directories made by an earlier version under a 002 umask are 0775: tighten
             // the ones this user owns, or their uploads would be refused.
-            for path in [&root, &dir] {
+            for path in [&root, &users, &user_root, &dir] {
                 tighten_own_dir(path);
             }
 

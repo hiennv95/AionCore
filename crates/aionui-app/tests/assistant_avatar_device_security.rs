@@ -164,6 +164,7 @@ async fn assistant_avatar_host_file_copy_is_desktop_only() {
 
     // 4. Establish Runtime Helper token
     let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
+    common::ensure_conversation(&services, owner.as_str(), "conv-agent-helper").await;
     let issue = services.runtime_token_service.issue(
         owner.as_str(),
         "conv-agent-helper",

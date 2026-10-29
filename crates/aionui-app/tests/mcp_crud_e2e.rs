@@ -53,8 +53,8 @@ fn sse_server_json(name: &str) -> serde_json::Value {
 
 #[tokio::test]
 async fn create_stdio_server() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/mcp/servers", stdio_server_json("test-mcp"), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -75,8 +75,8 @@ async fn create_stdio_server() {
 
 #[tokio::test]
 async fn create_http_server() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/mcp/servers", http_server_json("http-mcp"), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -89,8 +89,8 @@ async fn create_http_server() {
 
 #[tokio::test]
 async fn create_sse_server_with_headers() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/mcp/servers", sse_server_json("sse-mcp"), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -107,8 +107,8 @@ async fn create_sse_server_with_headers() {
 
 #[tokio::test]
 async fn create_same_name_upserts() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create initial
     let req = json_with_token(
@@ -143,8 +143,8 @@ async fn create_same_name_upserts() {
 
 #[tokio::test]
 async fn create_missing_name_returns_400() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -159,8 +159,8 @@ async fn create_missing_name_returns_400() {
 
 #[tokio::test]
 async fn create_missing_transport_returns_400() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/mcp/servers", json!({ "name": "test" }), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -169,8 +169,8 @@ async fn create_missing_transport_returns_400() {
 
 #[tokio::test]
 async fn create_invalid_transport_type_returns_400() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -186,8 +186,8 @@ async fn create_invalid_transport_type_returns_400() {
 // C-8: stdio transport missing command field
 #[tokio::test]
 async fn create_stdio_missing_command_returns_400() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -203,8 +203,8 @@ async fn create_stdio_missing_command_returns_400() {
 // C-9: http/sse transport missing url field
 #[tokio::test]
 async fn create_http_missing_url_returns_400() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -219,8 +219,8 @@ async fn create_http_missing_url_returns_400() {
 
 #[tokio::test]
 async fn create_sse_missing_url_returns_400() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -239,8 +239,8 @@ async fn create_sse_missing_url_returns_400() {
 
 #[tokio::test]
 async fn get_existing_server() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create
     let req = json_with_token(
@@ -280,8 +280,8 @@ async fn get_nonexistent_server_returns_404() {
 
 #[tokio::test]
 async fn list_servers_returns_all() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create two servers
     for name in ["list-a", "list-b"] {
@@ -320,8 +320,8 @@ async fn list_servers_empty() {
 
 #[tokio::test]
 async fn update_server_name_is_rejected() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create
     let req = json_with_token("POST", "/api/mcp/servers", stdio_server_json("old-name"), &token, &csrf);
@@ -345,8 +345,8 @@ async fn update_server_name_is_rejected() {
 
 #[tokio::test]
 async fn update_server_transport() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create as stdio
     let req = json_with_token(
@@ -377,8 +377,8 @@ async fn update_server_transport() {
 
 #[tokio::test]
 async fn update_server_description() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -406,8 +406,8 @@ async fn update_server_description() {
 
 #[tokio::test]
 async fn update_nonexistent_server_returns_404() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "PUT",
@@ -422,8 +422,8 @@ async fn update_nonexistent_server_returns_404() {
 
 #[tokio::test]
 async fn update_name_to_existing_is_rejected() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create A and B
     let req = json_with_token("POST", "/api/mcp/servers", stdio_server_json("server-a"), &token, &csrf);
@@ -452,8 +452,8 @@ async fn update_name_to_existing_is_rejected() {
 
 #[tokio::test]
 async fn delete_server() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create
     let req = json_with_token(
@@ -483,8 +483,8 @@ async fn delete_server() {
 
 #[tokio::test]
 async fn delete_nonexistent_server_returns_404() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = delete_with_token("/api/mcp/servers/nonexistent", &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -497,8 +497,8 @@ async fn delete_nonexistent_server_returns_404() {
 
 #[tokio::test]
 async fn toggle_server_enables_then_disables() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create (starts disabled)
     let req = json_with_token(
@@ -541,8 +541,8 @@ async fn toggle_server_enables_then_disables() {
 
 #[tokio::test]
 async fn toggle_nonexistent_server_returns_404() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/mcp/servers/nonexistent/toggle", json!({}), &token, &csrf);
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -555,8 +555,8 @@ async fn toggle_nonexistent_server_returns_404() {
 
 #[tokio::test]
 async fn batch_import_creates_multiple() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -579,8 +579,8 @@ async fn batch_import_creates_multiple() {
 
 #[tokio::test]
 async fn batch_import_upserts_existing() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create one first
     let req = json_with_token("POST", "/api/mcp/servers", stdio_server_json("existing"), &token, &csrf);
@@ -616,8 +616,8 @@ async fn batch_import_upserts_existing() {
 
 #[tokio::test]
 async fn batch_import_empty_list() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -635,8 +635,8 @@ async fn batch_import_empty_list() {
 // B-4: Batch import with invalid config rejects the whole request
 #[tokio::test]
 async fn batch_import_with_invalid_config_returns_400() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",

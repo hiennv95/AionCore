@@ -23,6 +23,8 @@ tokio = { workspace = true }
 # claude's `--session-id`/`--resume` require a bare valid UUID; the seam mints
 # one when the logical id is not a UUID (claude_conn::claude_session_id_for).
 uuid = { workspace = true, features = ["v4"] }
+getrandom.workspace = true
+hex.workspace = true
 
 [features]
 # Exposes the in-crate test doubles (FakeAgentIo / FakeSpawner) to integration

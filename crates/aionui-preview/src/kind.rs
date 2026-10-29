@@ -6,6 +6,8 @@ use aionui_api_types::PreviewKind;
 pub const TEXT_CAP: u64 = 1024 * 1024;
 /// Image previews stop at 20 MB.
 pub const IMAGE_CAP: u64 = 20 * 1024 * 1024;
+/// PDF previews stop at 20 MB (ADR-025).
+pub const PDF_CAP: u64 = 20 * 1024 * 1024;
 /// Bytes read to decide the kind.
 pub const SNIFF_LEN: usize = 8192;
 
@@ -13,6 +15,7 @@ const OCTET_STREAM: &str = "application/octet-stream";
 const TEXT: &str = "text/plain; charset=utf-8";
 const MARKDOWN: &str = "text/markdown; charset=utf-8";
 pub const SVG: &str = "image/svg+xml";
+const PDF: &str = "application/pdf";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Kind {
@@ -32,6 +35,7 @@ impl Kind {
         match self.preview {
             PreviewKind::Text | PreviewKind::Markdown => Some(TEXT_CAP),
             PreviewKind::Image => Some(IMAGE_CAP),
+            PreviewKind::Pdf => Some(PDF_CAP),
             PreviewKind::Unsupported => None,
         }
     }
@@ -167,7 +171,8 @@ const TEXT_NAMES: &[&str] = &[
     "codeowners",
 ];
 
-/// Raster images are recognised by their magic bytes, never by extension alone. SVG, Markdown and
+/// Raster images are recognised by their magic bytes, never by extension alone; PDF needs both its
+/// magic and the `.pdf` extension. SVG, Markdown and
 /// text go by an allow-listed name and must also be UTF-8 without NUL bytes. Everything else is
 /// unsupported.
 pub fn classify(rel_path: &str, head: &[u8]) -> Kind {
@@ -179,6 +184,10 @@ pub fn classify(rel_path: &str, head: &[u8]) -> Kind {
             preview: PreviewKind::Image,
             mime,
         }),
+        "pdf" if head.starts_with(b"%PDF-") => Kind {
+            preview: PreviewKind::Pdf,
+            mime: PDF,
+        },
         "svg" if text() => Kind {
             preview: PreviewKind::Image,
             mime: SVG,
@@ -210,7 +219,7 @@ fn raster(head: &[u8]) -> Option<&'static str> {
 }
 
 /// UTF-8 without NUL bytes. A multi-byte character cut by the end of the sniffed bytes is fine.
-fn is_text(head: &[u8]) -> bool {
+pub(crate) fn is_text(head: &[u8]) -> bool {
     if head.contains(&0) {
         return false;
     }
@@ -243,7 +252,15 @@ mod tests {
         assert_eq!(classify("src/main.RS", b"fn main() {}").preview, PreviewKind::Text);
         // Text needs an allow-listed name as well as UTF-8 (spec 4.4).
         assert_eq!(classify("notes", b"plain").preview, PreviewKind::Unsupported);
-        assert_eq!(classify("a.pdf", b"%PDF-1.7").preview, PreviewKind::Unsupported);
+        // PDF needs the magic and the extension together (ADR-025).
+        assert_eq!(classify("a.pdf", b"%PDF-1.7\n").mime, "application/pdf");
+        assert_eq!(classify("A.PDF", b"%PDF-1.4").preview, PreviewKind::Pdf);
+        assert_eq!(classify("a.pdf", b"not a pdf").preview, PreviewKind::Unsupported);
+        assert_eq!(classify("a.pdf", b"").preview, PreviewKind::Unsupported);
+        assert_eq!(classify("a.txt", b"%PDF-1.7").preview, PreviewKind::Text);
+        assert_eq!(classify("a.bin", b"%PDF-1.7").preview, PreviewKind::Unsupported);
+        assert_eq!(classify("pdf", b"%PDF-1.7").preview, PreviewKind::Unsupported);
+        assert_eq!(classify("a.pdf", b"%PDF-1.7").cap(), Some(20 * 1024 * 1024));
         assert_eq!(classify("a.exe", b"MZ").preview, PreviewKind::Unsupported);
         assert_eq!(classify("a.bin", &[0xff, 0xfe, 0, 1]).preview, PreviewKind::Unsupported);
         assert_eq!(classify("a.txt", b"a\0b").preview, PreviewKind::Unsupported);

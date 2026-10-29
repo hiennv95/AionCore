@@ -15,7 +15,9 @@ use aionui_api_types::{
     SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
     UpdateProviderRequest, UpdateSettingsRequest,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device};
+use aionui_auth::{
+    CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller, from_paired_device, is_paired_device,
+};
 use aionui_common::ApiError;
 
 use crate::client_pref::ClientPrefService;
@@ -110,7 +112,7 @@ pub fn system_routes(state: SystemRouterState) -> Router {
 /// runtime; those stay with the desktop app (same rule as MCP servers, Jev 047).
 async fn providers_desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
     let extensions = request.extensions();
-    if is_paired_device(extensions.get::<CurrentDevice>()) || extensions.get::<RuntimeHelperCaller>().is_some() {
+    if from_paired_device(extensions) || extensions.get::<RuntimeHelperCaller>().is_some() {
         return Err(ApiError::coded(
             StatusCode::FORBIDDEN,
             "PROVIDERS_DESKTOP_ONLY",
@@ -243,10 +245,11 @@ async fn list_providers(
     State(state): State<SystemRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
 ) -> Result<Json<ApiResponse<Vec<ProviderResponse>>>, ApiError> {
     let providers = state.provider_service.list(&user.id).await.map_err(ApiError::from)?;
-    let masked = helper.is_some() || is_paired_device(device.as_ref().map(|Extension(d)| d));
+    let masked = helper.is_some() || deviceless.is_some() || is_paired_device(device.as_ref().map(|Extension(d)| d));
     if masked {
         return Ok(Json(ApiResponse::ok(providers.into_iter().map(mask_secrets).collect())));
     }

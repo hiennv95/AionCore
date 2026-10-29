@@ -491,9 +491,13 @@ JSON
 After a successful create or update, explain the task name and schedule in
 normal user-facing language. Do not show `cron_...` ids unless needed.
 
-For global cron job administration, use `config cron jobs`.
+`config cron jobs` is scoped to the current conversation: list and get show
+only its jobs, and create, update, run, delete and skill commands work only on
+them. Jobs run in this conversation's own permission mode; you cannot set
+`execution_mode` or `agent_config`, and jobs the user armed in full-auto mode
+are changed or run from the desktop app.
 
-List all cron jobs:
+List the current conversation's cron jobs:
 
 ```bash
 "$AIONUI_HELPER_BIN" config cron jobs list

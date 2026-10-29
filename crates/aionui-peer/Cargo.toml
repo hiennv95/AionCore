@@ -8,6 +8,7 @@ axum.workspace = true
 hex.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+libc.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 serde.workspace = true

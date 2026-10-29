@@ -61,8 +61,8 @@ async fn get_plugins_unauthenticated() {
 // EP-3: Enable missing pluginId fails
 #[tokio::test]
 async fn enable_plugin_missing_plugin_id() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -78,8 +78,8 @@ async fn enable_plugin_missing_plugin_id() {
 // EP-4: Enable missing config fails
 #[tokio::test]
 async fn enable_plugin_missing_config() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -95,8 +95,8 @@ async fn enable_plugin_missing_config() {
 // EP-5: Enable invalid plugin type returns error in response body
 #[tokio::test]
 async fn enable_plugin_invalid_type() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -153,8 +153,8 @@ async fn disable_plugin_not_registered() {
 // TP-4: Test plugin missing pluginId fails
 #[tokio::test]
 async fn test_plugin_missing_plugin_id() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -170,8 +170,8 @@ async fn test_plugin_missing_plugin_id() {
 // TP-5: Test plugin missing token fails
 #[tokio::test]
 async fn test_plugin_missing_token() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -206,8 +206,8 @@ async fn get_pairings_empty() {
 // AP-6: Approve missing code fails
 #[tokio::test]
 async fn approve_pairing_missing_code() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/channel/pairings/approve", json!({}), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -217,8 +217,8 @@ async fn approve_pairing_missing_code() {
 // AP-3: Approve non-existent code returns 404
 #[tokio::test]
 async fn approve_pairing_not_found() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -347,8 +347,8 @@ async fn get_channel_settings_defaults_to_generated_aionrs_assistant() {
 
 #[tokio::test]
 async fn put_channel_assistant_setting_persists_binding() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "PUT",
@@ -379,8 +379,8 @@ async fn put_channel_assistant_setting_persists_binding() {
 
 #[tokio::test]
 async fn put_channel_default_model_setting_persists_model_ref() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "PUT",
@@ -411,8 +411,8 @@ async fn put_channel_default_model_setting_persists_model_ref() {
 
 #[tokio::test]
 async fn put_channel_assistant_setting_clears_active_sessions() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let repo: std::sync::Arc<dyn IChannelRepository> =
         std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
 
@@ -469,8 +469,8 @@ async fn put_channel_assistant_setting_clears_active_sessions() {
 
 #[tokio::test]
 async fn put_channel_default_model_setting_clears_active_sessions() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let repo: std::sync::Arc<dyn IChannelRepository> =
         std::sync::Arc::new(SqliteChannelRepository::new(services.database.pool().clone()));
 
@@ -524,8 +524,8 @@ async fn put_channel_default_model_setting_clears_active_sessions() {
 // SS-1: Sync valid platform clears sessions
 #[tokio::test]
 async fn sync_settings_valid() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -545,8 +545,8 @@ async fn sync_settings_valid() {
 // SS-2: Sync missing platform fails deserialization
 #[tokio::test]
 async fn sync_settings_missing_platform() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/channel/settings/sync", json!({}), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -556,8 +556,8 @@ async fn sync_settings_missing_platform() {
 // SS-3: Sync invalid platform fails validation
 #[tokio::test]
 async fn sync_settings_invalid_platform() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -578,8 +578,8 @@ async fn sync_settings_invalid_platform() {
 /// that normally come from IM platform (pairing request).
 #[tokio::test]
 async fn pairing_approve_creates_user() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create a pairing request directly via the pairing service
     let pool = services.database.pool().clone();
@@ -728,8 +728,8 @@ async fn pairing_reject_removes_from_pending() {
 /// appears in the plugin list, then disable it.
 #[tokio::test]
 async fn enable_disable_plugin_lifecycle() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Enable Telegram plugin (will fail connecting to real API, but
     // the error is captured in response, not an HTTP error)

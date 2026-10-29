@@ -71,9 +71,18 @@ impl AllowedOrigins {
     /// The default for a non-local host started without `--allowed-origin` (C4, Jev 045):
     /// only this machine's loopback origins on the bound port, as the AionX launchers pass.
     pub fn bound_loopback(port: u16) -> Self {
+        Self::loopback_on("http", port)
+    }
+
+    /// The loopback TLS listener's own origins (`--loopback-tls`).
+    pub fn bound_loopback_tls(port: u16) -> Self {
+        Self::loopback_on("https", port)
+    }
+
+    fn loopback_on(scheme: &str, port: u16) -> Self {
         let origins = ["127.0.0.1", "localhost", "[::1]"]
             .iter()
-            .filter_map(|host| normalize_origin(&format!("http://{host}:{port}")))
+            .filter_map(|host| normalize_origin(&format!("{scheme}://{host}:{port}")))
             .collect();
         Self {
             origins: Arc::new(origins),

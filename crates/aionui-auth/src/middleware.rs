@@ -33,9 +33,23 @@ pub const RUNTIME_CONVERSATION_ID_HEADER: &str = "x-aionui-conversation-id";
 /// Implemented in the composition layer over the agent runtime's token
 /// service; `aionui-auth` must not depend on `aionui-ai-agent` directly.
 /// A verifier must confirm the token is a live, conversation-helper-scoped
-/// token bound to exactly this (user_id, conversation_id) pair.
+/// token bound to exactly this (user_id, conversation_id) pair, and apply the
+/// policy of the bound conversation on every request.
+#[async_trait::async_trait]
 pub trait IRuntimeTokenVerifier: Send + Sync {
-    fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool;
+    async fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> HelperVerdict;
+}
+
+/// Outcome of [`IRuntimeTokenVerifier::verify_conversation_helper`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HelperVerdict {
+    Allowed,
+    /// No live token for this pair, or its conversation is gone: 401.
+    Invalid,
+    /// The bound conversation is a LAN share, whose helper only reads skills: 403.
+    LanShare,
+    /// The policy could not be checked: refused with 500.
+    Unavailable,
 }
 
 /// Authenticated user injected into request extensions by the auth middleware.
@@ -72,6 +86,13 @@ impl CurrentUser {
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeHelperCaller;
 
+/// Marks a JWT session bound to no device (password, QR-code or external
+/// account login). It is a network client that never proved it is the desktop
+/// app, so host-filesystem routes refuse it like a paired device (Jev 053).
+/// Local mode and the helper channel never carry it.
+#[derive(Debug, Clone, Copy)]
+pub struct DevicelessSession;
+
 /// Shared state for the authentication middleware.
 #[derive(Clone)]
 pub struct AuthState {
@@ -82,6 +103,9 @@ pub struct AuthState {
     /// (`aioncore config` / `diagnose`), which cannot carry a JWT or cookies.
     /// `None` disables the channel (requests without a JWT are rejected).
     pub runtime_token_verifier: Option<Arc<dyn IRuntimeTokenVerifier>>,
+    /// `--loopback-tls` is running: credentials of a `desktop_app` device are accepted
+    /// only on requests that listener accepted ([`desktop_transport_allowed`]).
+    pub desktop_requires_loopback_tls: bool,
     /// Client devices (ADR-011). When set, a token bound to a device is only
     /// accepted while that device exists, belongs to the token's user and is not
     /// revoked. `None` rejects every device-bound token.
@@ -97,8 +121,30 @@ pub struct CurrentDevice {
     pub kind: String,
 }
 
+/// While the desktop loopback TLS listener runs, a desktop app's credentials (access
+/// token, refresh token, WebSocket) only work on requests that listener accepted.
+/// `via_loopback_tls` must come from the server-injected [`ViaLoopbackTls`] extension,
+/// never from anything the client sent. Other devices and device-less sessions are
+/// not affected.
+///
+/// [`ViaLoopbackTls`]: aionui_api_types::ViaLoopbackTls
+pub fn desktop_transport_allowed(required: bool, device_kind: &str, via_loopback_tls: bool) -> bool {
+    !required || via_loopback_tls || device_kind != aionui_api_types::DeviceKind::DesktopApp.as_str()
+}
+
+/// The refusal for [`desktop_transport_allowed`]: 403, so the client does not retry the
+/// same credential as if it had expired.
+pub fn desktop_requires_loopback_tls() -> ApiError {
+    ApiError::coded(
+        StatusCode::FORBIDDEN,
+        "DESKTOP_REQUIRES_LOOPBACK_TLS",
+        "The desktop app's session is only accepted over its loopback TLS connection.",
+        None,
+    )
+}
+
 /// The live device `device_id` of `user_id`, if any. Fails closed.
-async fn active_device(
+pub(crate) async fn active_device(
     repo: Option<&Arc<dyn IDeviceRepository>>,
     device_id: &str,
     user_id: &str,
@@ -108,15 +154,6 @@ async fn active_device(
         .find(device_id)
         .await?
         .filter(|device| device.user_id == user_id && device.revoked_at.is_none()))
-}
-
-/// Whether `device_id` names a live device of `user_id`. Fails closed.
-pub(crate) async fn device_is_active(
-    repo: Option<&Arc<dyn IDeviceRepository>>,
-    device_id: &str,
-    user_id: &str,
-) -> Result<bool, aionui_db::DbError> {
-    Ok(active_device(repo, device_id, user_id).await?.is_some())
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -192,10 +229,17 @@ pub async fn auth_middleware(
                 None,
             ));
         };
+        let via_loopback_tls = request.extensions().get::<aionui_api_types::ViaLoopbackTls>().is_some();
+        if !desktop_transport_allowed(state.desktop_requires_loopback_tls, &device.kind, via_loopback_tls) {
+            tracing::info!(device_id = %device.id, "desktop credential refused outside the loopback TLS listener");
+            return Err(desktop_requires_loopback_tls());
+        }
         request.extensions_mut().insert(CurrentDevice {
             id: device.id,
             kind: device.kind,
         });
+    } else {
+        request.extensions_mut().insert(DevicelessSession);
     }
 
     request.extensions_mut().insert(CurrentUser {
@@ -234,8 +278,21 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
         return Err(ApiError::Unauthorized("Authentication required".into()));
     };
 
-    if !verifier.verify_conversation_helper(&token, &user_id, &conversation_id) {
-        return Err(ApiError::Unauthorized("Invalid runtime token".into()));
+    match verifier
+        .verify_conversation_helper(&token, &user_id, &conversation_id)
+        .await
+    {
+        HelperVerdict::Allowed => {}
+        HelperVerdict::Invalid => return Err(ApiError::Unauthorized("Invalid runtime token".into())),
+        HelperVerdict::LanShare => {
+            return Err(ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "HELPER_NOT_FOR_LAN_SHARE",
+                "An agent in a LAN share can only read skills.",
+                None,
+            ));
+        }
+        HelperVerdict::Unavailable => return Err(ApiError::Internal("Authentication service unavailable".into())),
     }
 
     let user = state
@@ -277,10 +334,11 @@ pub async fn local_auth_middleware(mut request: Request, next: Next) -> Response
     next.run(request).await
 }
 
-/// Whether the request comes from a paired phone or browser (a device other
-/// than the desktop app).
-fn from_paired_device(extensions: &axum::http::Extensions) -> bool {
-    is_paired_device(extensions.get::<CurrentDevice>())
+/// Whether the request comes from a network client that is not the desktop
+/// app: a paired phone or browser, or a device-less session. Route gates use
+/// this rather than [`is_paired_device`], which does not see device-less sessions.
+pub fn from_paired_device(extensions: &axum::http::Extensions) -> bool {
+    is_paired_device(extensions.get::<CurrentDevice>()) || extensions.get::<DevicelessSession>().is_some()
 }
 
 /// Whether this session's device is a paired phone or browser. Desktop-app
@@ -299,8 +357,8 @@ fn fs_owner_only() -> ApiError {
 }
 
 /// Host file effects (read, write, open, reveal, link, attach roots) are for
-/// the desktop app only (ADR-013). Paired phones and browsers, and agents'
-/// helper CLIs, are refused; desktop and device-less sessions pass. Route
+/// the desktop app only (ADR-013). Paired phones and browsers, device-less
+/// sessions and agents' helper CLIs are refused; desktop and local mode pass. Route
 /// groups add this as a route layer after `auth_middleware`.
 pub async fn desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
     let extensions = request.extensions();
@@ -320,18 +378,19 @@ pub async fn no_paired_devices(request: Request, next: Next) -> Result<Response,
 }
 
 /// A `Local` file ref names any path on the host, so only callers with host file
-/// authority may send one (ADR-013): the desktop app and device-less sessions. Paired
-/// phones and browsers, and agents' helper CLIs, get the same 403 whatever the path, so
+/// authority may send one (ADR-013): the desktop app and local mode. Paired phones and
+/// browsers, device-less sessions and agents' helper CLIs get the same 403 whatever the path, so
 /// the refusal never says whether a file exists. Call before the path is looked at.
 pub fn ensure_no_local_files<'a>(
     files: impl IntoIterator<Item = &'a aionui_api_types::ChatFileRef>,
     device: Option<&CurrentDevice>,
+    deviceless: Option<&DevicelessSession>,
     helper: Option<&RuntimeHelperCaller>,
 ) -> Result<(), ApiError> {
     let has_local = files
         .into_iter()
         .any(|file| matches!(file, aionui_api_types::ChatFileRef::Local { .. }));
-    if has_local && (helper.is_some() || is_paired_device(device)) {
+    if has_local && (helper.is_some() || deviceless.is_some() || is_paired_device(device)) {
         return Err(fs_owner_only());
     }
     Ok(())

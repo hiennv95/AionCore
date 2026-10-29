@@ -6,6 +6,7 @@
 
 mod common;
 
+use aionui_api_types::{ConversationToolErrorCode, SessionToolErrorCode};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
@@ -41,8 +42,20 @@ fn as_helper(
     }
 }
 
-#[tokio::test]
-async fn a_lan_share_agent_helper_only_reads_skills() {
+/// Both conversations, and the helper token each one's (mock) agent was built with.
+struct Shares {
+    _tmp: tempfile::TempDir,
+    app: axum::Router,
+    services: aionui_app::AppServices,
+    desktop: String,
+    owner: String,
+    lan: String,
+    mine: String,
+    lan_token: String,
+    my_token: String,
+}
+
+async fn shares() -> Shares {
     let tmp = tempfile::tempdir().unwrap();
     let (app, services, captured) = build_app_with_capturing_mock_agents_at(tmp.path()).await;
     let (desktop, _phone) = desktop_and_phone(&app, tmp.path()).await;
@@ -103,6 +116,31 @@ async fn a_lan_share_agent_helper_only_reads_skills() {
     };
     let lan_token = token_of(&lan);
     let my_token = token_of(&mine);
+    Shares {
+        _tmp: tmp,
+        app,
+        services,
+        desktop,
+        owner: owner.to_string(),
+        lan,
+        mine,
+        lan_token,
+        my_token,
+    }
+}
+
+#[tokio::test]
+async fn a_lan_share_agent_helper_only_reads_skills() {
+    let Shares {
+        app,
+        desktop,
+        owner,
+        lan,
+        mine,
+        lan_token,
+        my_token,
+        ..
+    } = shares().await;
 
     let assistant = json!({"id": "from-helper", "name": "From helper", "agent_id": "632f31d2", "avatar": "🤖"});
     let writes_and_reads = [
@@ -158,4 +196,245 @@ async fn a_lan_share_agent_helper_only_reads_skills() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "owner helper lists skills: {resp}");
+}
+
+/// The routes that authenticate the helper themselves, outside the auth middleware,
+/// apply the same rule.
+#[tokio::test]
+async fn self_authenticating_helper_routes_refuse_a_lan_share() {
+    let Shares {
+        app,
+        owner,
+        lan,
+        mine,
+        lan_token,
+        my_token,
+        ..
+    } = shares().await;
+    let create = json!({"name": "spawned by helper"});
+    let message = json!({"to": mine, "message": "hello"});
+    // The codes the agent's `capabilities` document (serialized from the same enums).
+    let conversation_code = serde_json::to_value(ConversationToolErrorCode::HelperNotForLanShare).unwrap();
+    let session_code = serde_json::to_value(SessionToolErrorCode::HelperNotForLanShare).unwrap();
+    let routes = [
+        (
+            "POST",
+            "/api/runtime/conversations/create",
+            Some(&create),
+            &conversation_code,
+        ),
+        (
+            "POST",
+            "/api/runtime/session-messages/send",
+            Some(&message),
+            &session_code,
+        ),
+        ("GET", "/api/runtime/session-messages/targets", None, &session_code),
+    ];
+    for (method, uri, body, code) in routes {
+        let (status, resp) = send(&app, as_helper(method, uri, body, &lan_token, owner.as_str(), &lan)).await;
+        assert_eq!(
+            (status, resp["error"]["code"].clone()),
+            (StatusCode::FORBIDDEN, code.clone()),
+            "LAN-share helper {method} {uri}: {resp}"
+        );
+    }
+
+    // The owner conversation's helper still lists targets.
+    let (status, resp) = send(
+        &app,
+        as_helper(
+            "GET",
+            "/api/runtime/session-messages/targets",
+            None,
+            &my_token,
+            owner.as_str(),
+            &mine,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner helper lists targets: {resp}");
+}
+
+/// The token is bound to its own conversation: the headers cannot move it to another
+/// one, in either direction, on any helper channel.
+#[tokio::test]
+async fn helper_headers_cannot_rebind_a_token() {
+    let Shares {
+        app,
+        owner,
+        lan,
+        mine,
+        lan_token,
+        my_token,
+        ..
+    } = shares().await;
+    for (token, conversation) in [(&lan_token, &mine), (&my_token, &lan)] {
+        let (status, _) = send(
+            &app,
+            as_helper("GET", "/api/assistants", None, token, owner.as_str(), conversation),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "middleware channel");
+        for uri in ["/api/runtime/skills", "/api/runtime/session-messages/targets"] {
+            let (status, resp) = send(&app, as_helper("GET", uri, None, token, owner.as_str(), conversation)).await;
+            assert_eq!(
+                (status, resp["error"]["code"].clone()),
+                (StatusCode::UNAUTHORIZED, json!("runtime_auth_failed")),
+                "{uri}: {resp}"
+            );
+        }
+    }
+}
+
+/// Reads stay limited to the skill routes and to this conversation's enabled skills.
+#[tokio::test]
+async fn a_lan_share_reads_only_its_enabled_skills() {
+    let Shares {
+        app,
+        owner,
+        lan,
+        lan_token,
+        ..
+    } = shares().await;
+    // The ordinary skill API is not a runtime skill route.
+    let (status, resp) = send(
+        &app,
+        as_helper("GET", "/api/skills", None, &lan_token, owner.as_str(), &lan),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].clone()),
+        (StatusCode::FORBIDDEN, json!(REFUSED)),
+        "GET /api/skills: {resp}"
+    );
+    for uri in [
+        "/api/runtime/skills/not-enabled",
+        "/api/runtime/skills/not-enabled/file?path=../../etc/passwd",
+    ] {
+        let (status, resp) = send(&app, as_helper("GET", uri, None, &lan_token, owner.as_str(), &lan)).await;
+        assert_ne!(status, StatusCode::OK, "{uri}");
+        assert_eq!(resp["error"]["code"], json!("skill_not_enabled"), "{uri}: {resp}");
+    }
+}
+
+/// The rule is checked on every request, so a token the agent already holds follows
+/// what its conversation is now.
+#[tokio::test]
+async fn an_issued_token_follows_its_conversation_becoming_a_share() {
+    let Shares {
+        app,
+        services,
+        owner,
+        mine,
+        my_token,
+        ..
+    } = shares().await;
+    let list = || as_helper("GET", "/api/assistants", None, &my_token, owner.as_str(), &mine);
+    let (status, resp) = send(&app, list()).await;
+    assert_eq!(status, StatusCode::OK, "before: {resp}");
+
+    services
+        .conversation_repo
+        .update(
+            owner.as_str(),
+            &mine,
+            &aionui_db::ConversationRowUpdate {
+                extra: Some(json!({"backend": "gemini", "lan_remote": true}).to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (status, resp) = send(&app, list()).await;
+    assert_eq!(
+        (status, resp["code"].clone()),
+        (StatusCode::FORBIDDEN, json!(REFUSED)),
+        "after: {resp}"
+    );
+}
+
+/// A LAN share reads the skills its conversation enabled, and the skill routes keep
+/// their containment for it: no `..`, no link out of the skill directory.
+#[tokio::test]
+async fn a_lan_share_reads_an_enabled_skill_inside_its_directory_only() {
+    let Shares {
+        _tmp: tmp,
+        app,
+        services,
+        owner,
+        ..
+    } = shares().await;
+    let skill = services
+        .skill_paths
+        .builtin_skills_dir
+        .join("auto-inject")
+        .join("lan-skill");
+    std::fs::create_dir_all(skill.join("refs")).unwrap();
+    std::fs::write(
+        skill.join("SKILL.md"),
+        "---\nname: lan-skill\ndescription: d\n---\nlan skill body",
+    )
+    .unwrap();
+    std::fs::write(skill.join("refs").join("note.md"), "inside the skill").unwrap();
+    let outside = tmp.path().join("outside-secret.txt");
+    std::fs::write(&outside, "host secret").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, skill.join("link.txt")).unwrap();
+
+    let share = "conv-lan-skill";
+    let extra = json!({"backend": "gemini", "lan_remote": true, "skills": ["lan-skill"]});
+    common::ensure_conversation(&services, &owner, share).await;
+    services
+        .conversation_repo
+        .update(
+            &owner,
+            share,
+            &aionui_db::ConversationRowUpdate {
+                extra: Some(extra.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let token = services
+        .runtime_token_service
+        .issue(
+            owner.as_str(),
+            share,
+            aionui_ai_agent::TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [aionui_ai_agent::RuntimeTokenScope::ConversationHelper],
+        )
+        .token;
+    let get = |uri: &str| as_helper("GET", uri, None, &token, owner.as_str(), share);
+
+    let (status, resp) = send(&app, get("/api/runtime/skills/lan-skill")).await;
+    assert_eq!(status, StatusCode::OK, "show: {resp}");
+    assert!(resp.to_string().contains("lan skill body"), "{resp}");
+    let (status, resp) = send(&app, get("/api/runtime/skills/lan-skill/file?path=refs/note.md")).await;
+    assert_eq!(status, StatusCode::OK, "file: {resp}");
+    assert!(resp.to_string().contains("inside the skill"), "{resp}");
+
+    let mut refused = vec!["/api/runtime/skills/lan-skill/file?path=../../outside-secret.txt"];
+    if cfg!(unix) {
+        refused.push("/api/runtime/skills/lan-skill/file?path=link.txt");
+    }
+    for uri in refused {
+        let (status, resp) = send(&app, get(uri)).await;
+        assert_ne!(status, StatusCode::OK, "{uri}");
+        assert_eq!(resp["error"]["code"], json!("invalid_path"), "{uri}: {resp}");
+        assert!(!resp.to_string().contains("host secret"), "{uri}: {resp}");
+    }
+
+    // The same token still writes nothing.
+    let (status, resp) = send(
+        &app,
+        as_helper("GET", "/api/assistants", None, &token, owner.as_str(), share),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].clone()),
+        (StatusCode::FORBIDDEN, json!(REFUSED)),
+        "{resp}"
+    );
 }

@@ -10,8 +10,8 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use tower::ServiceExt;
 
 use aionui_auth::{
-    AuthIdentityMode, AuthState, CookieConfig, CurrentUser, IRuntimeTokenVerifier, JwtService, RateLimiter,
-    TokenPayload, api_rate_limit_middleware, auth_middleware, auth_rate_limit_middleware,
+    AuthIdentityMode, AuthState, CookieConfig, CurrentUser, HelperVerdict, IRuntimeTokenVerifier, JwtService,
+    RateLimiter, TokenPayload, api_rate_limit_middleware, auth_middleware, auth_rate_limit_middleware,
     authenticated_action_rate_limit_middleware, csrf_middleware, security_headers_middleware,
 };
 use aionui_db::{IUserRepository, SqliteUserRepository, UserStatus, UserType, init_database_memory};
@@ -184,6 +184,7 @@ fn protected_auth_app_with_mode_and_verifier(
         identity_mode,
         runtime_token_verifier,
         device_repo: None,
+        desktop_requires_loopback_tls: false,
     };
 
     Router::new()
@@ -205,6 +206,7 @@ fn identity_echo_app(
         identity_mode,
         runtime_token_verifier,
         device_repo: None,
+        desktop_requires_loopback_tls: false,
     };
 
     Router::new()
@@ -625,9 +627,60 @@ struct MatchVerifier {
     conversation_id: &'static str,
 }
 
+#[async_trait::async_trait]
 impl IRuntimeTokenVerifier for MatchVerifier {
-    fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool {
-        token == self.token && user_id == self.user_id && conversation_id == self.conversation_id
+    async fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> HelperVerdict {
+        if token == self.token && user_id == self.user_id && conversation_id == self.conversation_id {
+            HelperVerdict::Allowed
+        } else {
+            HelperVerdict::Invalid
+        }
+    }
+}
+
+/// Answers every helper request with the same verdict.
+struct FixedVerifier(HelperVerdict);
+
+#[async_trait::async_trait]
+impl IRuntimeTokenVerifier for FixedVerifier {
+    async fn verify_conversation_helper(&self, _: &str, _: &str, _: &str) -> HelperVerdict {
+        self.0
+    }
+}
+
+#[tokio::test]
+async fn runtime_token_channel_refuses_lan_share_and_unavailable_verdicts() {
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    for (verdict, status, code) in [
+        (
+            HelperVerdict::LanShare,
+            StatusCode::FORBIDDEN,
+            Some("HELPER_NOT_FOR_LAN_SHARE"),
+        ),
+        (HelperVerdict::Unavailable, StatusCode::INTERNAL_SERVER_ERROR, None),
+        (HelperVerdict::Invalid, StatusCode::UNAUTHORIZED, None),
+    ] {
+        let app = identity_echo_app(
+            Arc::new(JwtService::new("middleware_test_secret".into())),
+            repo.clone(),
+            AuthIdentityMode::UserSession,
+            Some(Arc::new(FixedVerifier(verdict))),
+        );
+        let resp = app
+            .oneshot(helper_request(Some("tok-1"), "system_default_user", "conv-1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), status, "{verdict:?}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        if let Some(code) = code {
+            assert_eq!(body["code"], code, "{verdict:?}: {body}");
+        }
+        assert!(
+            !body.to_string().contains("system_default_user"),
+            "the handler never ran"
+        );
     }
 }
 

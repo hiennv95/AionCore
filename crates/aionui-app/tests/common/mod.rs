@@ -13,9 +13,20 @@ use aionui_extension::{ExternalPathsManager, SkillPaths, SkillRouterState};
 use aionui_file::FileService;
 use aionui_system::VersionCheckService;
 
+/// Default config with a per-test data dir, so each app writes its own desktop
+/// bootstrap token (see [`desktop_login`]). The dir is kept for the process lifetime.
+pub fn scratch_config() -> AppConfig {
+    let dir = tempfile::tempdir().unwrap().keep();
+    AppConfig {
+        data_dir: dir.clone(),
+        work_dir: dir,
+        ..Default::default()
+    }
+}
+
 pub async fn build_app() -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = AppServices::from_config(db, &scratch_config()).await.unwrap();
     let router = create_router(&services).await.expect("build router");
     (router, services)
 }
@@ -94,7 +105,7 @@ pub async fn sync_skill_catalog_for_test(services: &AppServices, paths: &SkillPa
 
 pub async fn build_app_with_noop_opener() -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = AppServices::from_config(db, &scratch_config()).await.unwrap();
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
     states.shell.shell_service = std::sync::Arc::new(aionui_shell::ShellService::new(std::sync::Arc::new(
         aionui_shell::NoopSystemOpener,
@@ -105,7 +116,7 @@ pub async fn build_app_with_noop_opener() -> (axum::Router, AppServices) {
 
 pub async fn build_app_with_file_roots(allowed_roots: Vec<std::path::PathBuf>) -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = AppServices::from_config(db, &scratch_config()).await.unwrap();
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
     states.file.file_service = std::sync::Arc::new(FileService::new(services.event_bus.clone(), allowed_roots));
     let router = create_router_with_states(&services, states);
@@ -117,7 +128,7 @@ pub async fn build_app_with_mock_version(
     mock_server: &MockServer,
 ) -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = AppServices::from_config(db, &scratch_config()).await.unwrap();
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
     states.system.version_check_service =
         VersionCheckService::with_api_base(reqwest::Client::new(), current_version.to_owned(), mock_server.uri());
@@ -130,7 +141,7 @@ pub async fn build_app_with_mock_version(
 /// Use for tests that exercise runtime preparation paths (team ensure_session,
 /// send_message) where spawning a real CLI process is not feasible.
 pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
-    build_app_with_mock_agents_config(&AppConfig::default()).await
+    build_app_with_mock_agents_config(&scratch_config()).await
 }
 
 /// [`build_app_with_mock_agents`] with a data dir, so the desktop bootstrap file exists
@@ -420,30 +431,47 @@ async fn send_json(app: &axum::Router, req: Request<Body>) -> serde_json::Value 
     serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
 }
 
-/// A desktop app session (bootstrap token under `root`, as `build_app_with_skill_paths`
-/// writes it) and a phone paired and approved from it. Returns their access tokens; both
-/// requests and the CSRF pair use `"c"` with `json_with_token`.
-pub async fn desktop_and_phone(app: &axum::Router, root: &std::path::Path) -> (String, String) {
-    let public = |uri: &str, body: serde_json::Value| {
-        Request::builder()
-            .method("POST")
-            .uri(uri)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap()
-    };
+fn public_post(uri: &str, body: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap()
+}
+
+/// The desktop app session of the system user, from the bootstrap token the app wrote
+/// under its data dir `root`. The owner's full-authority session (Jev 053: a device-less
+/// password login no longer is); use CSRF `"c"` with `json_with_token`.
+pub async fn desktop_session(app: &axum::Router, root: &std::path::Path) -> String {
     let bootstrap = std::fs::read_to_string(root.join("app-bootstrap.token")).unwrap();
-    let desktop = send_json(
+    let resp = send_json(
         app,
-        public(
+        public_post(
             "/api/devices/app-session",
             serde_json::json!({"bootstrap_token": bootstrap, "device_name": "Test Mac"}),
         ),
     )
-    .await["data"]["access_token"]
+    .await;
+    resp["data"]["access_token"]
         .as_str()
-        .unwrap()
-        .to_owned();
+        .expect("desktop app session")
+        .to_owned()
+}
+
+/// The desktop app session of an app built by this module's builders (bootstrap file
+/// under `services.data_dir`): the owner with full host authority. Returns (token, csrf).
+/// Since Jev 053 a password login ([`setup_and_login`]) is device-less and refused on
+/// owner/host routes, so tests acting as "the owner" use this instead.
+pub async fn desktop_login(app: &axum::Router, services: &AppServices) -> (String, String) {
+    (desktop_session(app, &services.data_dir).await, "c".to_owned())
+}
+
+/// A desktop app session (bootstrap token under `root`, as `build_app_with_skill_paths`
+/// writes it) and a phone paired and approved from it. Returns their access tokens; both
+/// requests and the CSRF pair use `"c"` with `json_with_token`.
+pub async fn desktop_and_phone(app: &axum::Router, root: &std::path::Path) -> (String, String) {
+    let desktop = desktop_session(app, root).await;
     let pairing = send_json(
         app,
         json_with_token("POST", "/api/devices/pairings", serde_json::json!({}), &desktop, "c"),
@@ -451,7 +479,7 @@ pub async fn desktop_and_phone(app: &axum::Router, root: &std::path::Path) -> (S
     .await;
     let paired = send_json(
         app,
-        public(
+        public_post(
             "/api/devices/pair",
             serde_json::json!({"secret": pairing["data"]["secret"], "device_name": "Phone", "device_kind": "mobile"}),
         ),
@@ -471,7 +499,7 @@ pub async fn desktop_and_phone(app: &axum::Router, root: &std::path::Path) -> (S
     .await;
     let claimed = send_json(
         app,
-        public(
+        public_post(
             "/api/devices/pair/claim",
             serde_json::json!({"pairing_id": pairing_id, "claim_token": paired["data"]["claim_token"]}),
         ),
@@ -573,4 +601,38 @@ pub async fn foreign_route_hits(
         }
     }
     (probed, hits)
+}
+
+/// A real conversation row for `user_id`, for tests that mint a helper token
+/// directly: the helper is refused when its bound conversation does not exist.
+/// Leaves an existing conversation as it is.
+pub async fn ensure_conversation(services: &AppServices, user_id: &str, conversation_id: &str) {
+    if services
+        .conversation_repo
+        .get(user_id, conversation_id)
+        .await
+        .unwrap()
+        .is_some()
+    {
+        return;
+    }
+    let row = aionui_db::models::ConversationRow {
+        id: conversation_id.to_owned(),
+        user_id: user_id.to_owned(),
+        name: conversation_id.to_owned(),
+        r#type: "acp".to_owned(),
+        extra: "{}".to_owned(),
+        model: None,
+        status: Some("finished".to_owned()),
+        source: None,
+        channel_chat_id: None,
+        pinned: false,
+        pinned_at: None,
+        created_at: 1,
+        updated_at: 1,
+        project_id: None,
+        folder_id: None,
+        name_source: None,
+    };
+    services.conversation_repo.create(&row).await.unwrap();
 }

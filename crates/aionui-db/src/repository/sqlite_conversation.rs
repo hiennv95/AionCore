@@ -426,6 +426,48 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
+    async fn delete_unready_handoff(&self, user_id: &str, id: &str, attempt: &str) -> Result<bool, DbError> {
+        const UNREADY: &str = "user_id = ? AND id = ? \
+             AND json_extract(extra, '$.handoff.ready') = 0 \
+             AND json_extract(extra, '$.handoff.attempt') = ?";
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&format!(
+            "DELETE FROM acp_session WHERE conversation_id = ? \
+             AND EXISTS (SELECT 1 FROM conversations WHERE {UNREADY})"
+        ))
+        .bind(id)
+        .bind(user_id)
+        .bind(id)
+        .bind(attempt)
+        .execute(&mut *tx)
+        .await?;
+        let deleted = sqlx::query(&format!("DELETE FROM conversations WHERE {UNREADY}"))
+            .bind(user_id)
+            .bind(id)
+            .bind(attempt)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(deleted == 1)
+    }
+
+    async fn mark_handoff_ready(&self, user_id: &str, id: &str, attempt: &str) -> Result<bool, DbError> {
+        let updated = sqlx::query(
+            "UPDATE conversations SET extra = json_set(extra, '$.handoff.ready', json('true')) \
+             WHERE user_id = ? AND id = ? \
+               AND json_extract(extra, '$.handoff.ready') = 0 \
+               AND json_extract(extra, '$.handoff.attempt') = ?",
+        )
+        .bind(user_id)
+        .bind(id)
+        .bind(attempt)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
     async fn list_paginated(
         &self,
         user_id: &str,

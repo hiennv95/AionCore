@@ -659,6 +659,7 @@ fn is_visible(meta: &AgentMetadata) -> bool {
 fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>) -> AgentManagementRow {
     let status = derive_management_status(&meta, reason);
     let diagnostics = derive_management_diagnostics(&meta, status, reason);
+    let installed = is_installed(&meta);
     let handshake = meta.handshake;
     AgentManagementRow {
         id: meta.id,
@@ -672,7 +673,7 @@ fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>)
         agent_source: meta.agent_source,
         agent_source_info: meta.agent_source_info,
         enabled: meta.enabled,
-        installed: meta.available,
+        installed,
         command: meta.command,
         args: meta.args,
         env: Vec::new(),
@@ -700,6 +701,25 @@ fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>)
         has_command_override: meta.has_command_override,
         env_override_key_count: meta.env_override_key_count,
     }
+}
+
+/// Whether the agent's CLI is installed, independent of `enabled`.
+/// `available` is forced false for disabled rows (they are never probed),
+/// so for those we evaluate the row as if enabled: trust the persisted
+/// snapshot when one exists, else fall back to the PATH-only lookup the
+/// per-user management reads already use for unsnapshotted rows.
+fn is_installed(meta: &AgentMetadata) -> bool {
+    if meta.enabled {
+        return meta.available;
+    }
+    let mut probe = meta.clone();
+    probe.enabled = true;
+    if has_availability_snapshot(&probe) {
+        apply_cached_availability(&mut probe);
+    } else {
+        apply_probe_availability(&mut probe);
+    }
+    probe.available
 }
 
 fn overlay_hydrated_availability(

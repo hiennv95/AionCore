@@ -16,7 +16,7 @@ use aionui_api_types::{
     AddPeerRequest, ApiResponse, CreateShareRequest, InboundRequestView, NetworkStatusResponse, OutboundRequestView,
     PeerView, RemoteAgentView, SendRemoteRequest, ShareView, UpdateNetworkSettingsRequest,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller};
+use aionui_auth::{CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller};
 use aionui_common::ApiError;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -60,8 +60,12 @@ fn to_api_error(error: NetworkError) -> ApiError {
 /// may not change LAN trust.
 fn ensure_manager(
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
 ) -> Result<(), ApiError> {
+    if deviceless.is_some() {
+        return Err(to_api_error(NetworkError::OwnerOnly));
+    }
     match (device, helper) {
         (_, Some(_)) => Err(to_api_error(NetworkError::OwnerOnly)),
         (Some(Extension(device)), None) if device.kind != DeviceKind::DesktopApp.as_str() => {
@@ -88,10 +92,11 @@ async fn update_settings(
     State(state): State<NetworkRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Json(req): Json<UpdateNetworkSettingsRequest>,
 ) -> ApiResult<NetworkStatusResponse> {
-    ensure_manager(device, helper)?;
+    ensure_manager(device, deviceless, helper)?;
     ok(state
         .service
         .update_settings(&user.id, req)
@@ -110,10 +115,11 @@ async fn add_peer(
     State(state): State<NetworkRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Json(req): Json<AddPeerRequest>,
 ) -> ApiResult<PeerView> {
-    ensure_manager(device, helper)?;
+    ensure_manager(device, deviceless, helper)?;
     ok(state.service.add_peer(&user.id, req).await.map_err(to_api_error)?)
 }
 
@@ -121,10 +127,11 @@ async fn approve_peer(
     State(state): State<NetworkRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
 ) -> ApiResult<PeerView> {
-    ensure_manager(device, helper)?;
+    ensure_manager(device, deviceless, helper)?;
     ok(state.service.approve_peer(&user.id, &id).await.map_err(to_api_error)?)
 }
 
@@ -132,10 +139,11 @@ async fn revoke_peer(
     State(state): State<NetworkRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
 ) -> ApiResult<PeerView> {
-    ensure_manager(device, helper)?;
+    ensure_manager(device, deviceless, helper)?;
     ok(state.service.revoke_peer(&user.id, &id).await.map_err(to_api_error)?)
 }
 
@@ -143,10 +151,11 @@ async fn forget_peer(
     State(state): State<NetworkRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
 ) -> ApiResult<()> {
-    ensure_manager(device, helper)?;
+    ensure_manager(device, deviceless, helper)?;
     ok(state.service.forget_peer(&user.id, &id).await.map_err(to_api_error)?)
 }
 
@@ -169,10 +178,11 @@ async fn create_share(
     State(state): State<NetworkRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Json(req): Json<CreateShareRequest>,
 ) -> ApiResult<ShareView> {
-    ensure_manager(device, helper)?;
+    ensure_manager(device, deviceless, helper)?;
     ok(state.service.create_share(&user.id, req).await.map_err(to_api_error)?)
 }
 
@@ -180,10 +190,11 @@ async fn unshare(
     State(state): State<NetworkRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
 ) -> ApiResult<()> {
-    ensure_manager(device, helper)?;
+    ensure_manager(device, deviceless, helper)?;
     ok(state.service.unshare(&user.id, &id).await.map_err(to_api_error)?)
 }
 

@@ -373,7 +373,19 @@ impl ConversationService {
             .find(|option| option.category.as_deref() == Some("mode"))
             .and_then(|option| option.current_value.as_deref());
         match live {
-            Some(mode) if mode != locked => {
+            Some(mode) if mode == locked => Ok(()),
+            // A missing live mode cannot prove the shared mode, so it fails closed (audit H17).
+            None => {
+                warn!(
+                    conversation_id,
+                    "LAN share agent reports no mode; refusing the peer turn"
+                );
+                Err(ConversationError::Forbidden {
+                    reason: "this LAN share's agent does not report its mode, so the shared mode cannot be confirmed"
+                        .into(),
+                })
+            }
+            Some(_) => {
                 warn!(
                     conversation_id,
                     "LAN share agent is not in the shared mode; refusing the peer turn"
@@ -382,13 +394,16 @@ impl ConversationService {
                     reason: "this LAN share's agent is not in the shared mode".into(),
                 })
             }
-            _ => Ok(()),
         }
     }
 
     /// Ownership check that also returns the fixed mode of a LAN remote
     /// conversation (`extra.lan_remote`), whose mode must stay what the share set.
-    async fn lan_locked_mode(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>, ConversationError> {
+    pub(crate) async fn lan_locked_mode(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<String>, ConversationError> {
         let row = self
             .conversation_repo()
             .get(user_id, conversation_id)

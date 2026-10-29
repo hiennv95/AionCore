@@ -869,7 +869,7 @@ pub struct CodexSessionBackend {
     /// the sync `pending_permission_requests()` trait method reads it without await —
     /// mirrors claude's `pending_perms`. Behind an Arc so the reader (cloned into
     /// every post-wake reader via `reader_state`) shares the one registry.
-    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: SharedApprovals,
     /// GAP-A: rpc-id → [`PendingSend`] correlation for in-flight `turn/start`
     /// (and review/compact/logout) requests. codex IS a bidirectional JSON-RPC
     /// client: `turn/start` gets a synchronous response
@@ -1000,7 +1000,7 @@ struct CodexReaderState {
     thread_binding: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
-    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: SharedApprovals,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
@@ -1026,6 +1026,7 @@ fn start_codex_reader(
     state: &CodexReaderState,
     stdout: Option<aionui_process::BoxedStdout>,
     io: Arc<dyn AgentIo>,
+    incarnation: Option<String>,
 ) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
     tokio::spawn(async move {
@@ -1039,6 +1040,7 @@ fn start_codex_reader(
             state.active_turn_id,
             state.pending_auth_id,
             state.pending_tool_approvals,
+            incarnation,
             state.pending_sends,
             state.pending_discovery,
             state.pending_set,
@@ -1248,7 +1250,13 @@ impl CodexSessionBackend {
         let thread_binding = Arc::new(Mutex::new(None));
         let active_turn_id = Arc::new(Mutex::new(None));
         let pending_auth_id = Arc::new(Mutex::new(None));
-        let pending_tool_approvals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        // The first process's incarnation; each wake draws a new one (`wake_handle`).
+        let incarnation = new_incarnation();
+        let pending_tool_approvals = Arc::new(std::sync::Mutex::new(OpenApprovals {
+            incarnation: incarnation.clone(),
+            titles: HashMap::new(),
+            answered: HashMap::new(),
+        }));
         let current_model = Arc::new(Mutex::new(None));
         let pending_sends = Arc::new(Mutex::new(HashMap::new()));
         let pending_discovery = Arc::new(Mutex::new(HashMap::new()));
@@ -1287,7 +1295,7 @@ impl CodexSessionBackend {
             turn_in_flight: turn_in_flight.clone(),
             title_gen: title_gen.clone(),
         };
-        let reader = start_codex_reader(&reader_state, stdout, io.clone());
+        let reader = start_codex_reader(&reader_state, stdout, io.clone(), incarnation);
 
         let suspend = Arc::new(SuspendController::active(
             ProcHandle::new(reader, io),
@@ -1348,22 +1356,7 @@ impl CodexSessionBackend {
 
     /// Write one JSON-RPC frame (request or response) to stdin as a single line.
     async fn write_frame(&self, frame: Value) -> Result<(), BackendError> {
-        let mut guard = self.stdin.lock().await;
-        let stdin = guard
-            .as_mut()
-            .ok_or_else(|| BackendError::Transport("codex stdin unavailable".into()))?;
-        let mut line = serde_json::to_vec(&frame).map_err(|e| BackendError::Transport(e.to_string()))?;
-        line.push(b'\n');
-        use tokio::io::AsyncWriteExt;
-        stdin
-            .write_all(&line)
-            .await
-            .map_err(|e| BackendError::Transport(e.to_string()))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| BackendError::Transport(e.to_string()))?;
-        Ok(())
+        write_frame_to(&mut *self.stdin.lock().await, frame).await
     }
 
     fn next_rpc_id(&self) -> u64 {
@@ -1547,18 +1540,25 @@ impl CodexSessionBackend {
             Some((stdin, stdout)) => (Some(stdin), Some(stdout)),
             None => (None, None),
         };
-        *self.stdin.lock().await = stdin;
+        // Replace the process atomically for approvals: under the stdin guard (the
+        // one AnswerPermission holds through its check and write), give the fresh
+        // process a new incarnation, drop the old process's approvals (it cannot
+        // answer them, and its ids restart at 0), swap stdin and start the reader
+        // that tags with the new incarnation.
+        let incarnation = new_incarnation();
+        let mut stdin_slot = self.stdin.lock().await;
+        install_process(
+            &mut stdin_slot,
+            &self.pending_tool_approvals,
+            stdin,
+            incarnation.clone(),
+        );
         // The pre-suspend turn id is dead — a fresh process has no active turn yet.
         // Clearing it prevents a steer/interrupt right after wake from targeting a
         // stale turn id (the reader re-binds active_turn_id on the next turn/started).
         *self.active_turn_id.lock().await = None;
-        // Approvals belong to the process that raised them: the fresh process cannot
-        // answer them, and it must not inherit them (its own ids restart at 0).
-        self.pending_tool_approvals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        let reader = start_codex_reader(&self.reader_state, stdout, io.clone());
+        let reader = start_codex_reader(&self.reader_state, stdout, io.clone(), incarnation);
+        drop(stdin_slot);
         // Replay the handshake against the bound threadId (resume re-attach). On a
         // handshake failure, abort the just-started reader so its AgentIo clone
         // releases and the freshly-spawned child is reaped (kill_on_drop) — else it
@@ -1594,7 +1594,10 @@ async fn reader_task(
     thread_binding: Arc<Mutex<Option<String>>>,
     active_turn_id: Arc<Mutex<Option<String>>>,
     pending_auth_id: Arc<Mutex<Option<Value>>>,
-    pending_tool_approvals: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: SharedApprovals,
+    // This reader's own process incarnation, fixed when it was started: it tags only
+    // the approvals of that process and never reads a newer one.
+    incarnation: Option<String>,
     pending_sends: Arc<Mutex<HashMap<u64, PendingSend>>>,
     pending_discovery: Arc<Mutex<HashMap<u64, DiscoveryKind>>>,
     pending_set: Arc<Mutex<HashMap<u64, String>>>,
@@ -1722,6 +1725,7 @@ async fn reader_task(
                             &event_tx,
                             &pending_auth_id,
                             &pending_tool_approvals,
+                            incarnation.as_deref(),
                             &stdin,
                         )
                         .await;
@@ -1817,32 +1821,49 @@ async fn reader_task(
                         // bookkeeping notif alone, so resolve against the pending
                         // auth id if it matches, else default Tool (the common case).
                         if m == "serverRequest/resolved" {
-                            let req_id = params.get("request_id").or_else(|| params.get("requestId")).cloned();
-                            let kind = {
-                                let pending = pending_auth_id.lock().await;
-                                match (pending.as_ref(), req_id.as_ref()) {
-                                    (Some(p), Some(r)) if p == r => crate::event::PermissionKind::Auth,
-                                    _ => crate::event::PermissionKind::Tool,
-                                }
-                            };
-                            if matches!(kind, crate::event::PermissionKind::Auth) {
-                                *pending_auth_id.lock().await = None;
+                            // A replaced process's late notice settles nothing of the new
+                            // one. For tool approvals this is linearized with the
+                            // replacement (decided and emitted under the approvals mutex in
+                            // `settle_resolved_approval`). The auth-refresh branch only
+                            // checks the incarnation up front and is not linearized; auth
+                            // ids are outside this change.
+                            if !is_current_incarnation(&pending_tool_approvals, incarnation.as_deref()) {
+                                continue;
                             }
-                            let resolved_id = req_id.map(|v| v.to_string()).unwrap_or_default();
-                            // Drop the recovered-card entry: codex resolved this approval
-                            // (answered elsewhere or retracted), so it is no longer a
-                            // pending confirmation for REST recovery. The registry keys
-                            // by the surfaced request_id (raw for tool/file approvals,
-                            // ELICIT_PREFIX-tagged for elicitation), matching the id shape
-                            // stored on the requestApproval emit below.
-                            remove_pending_tool_approval(&pending_tool_approvals, &resolved_id);
-                            emit(
-                                &event_tx,
-                                &session_id,
-                                cur,
-                                SessionEvent::PermissionResolved {
-                                    request_id: resolved_id,
-                                    kind,
+                            let Some(req_id) = params.get("request_id").or_else(|| params.get("requestId")).cloned()
+                            else {
+                                continue;
+                            };
+                            let is_auth = pending_auth_id.lock().await.as_ref() == Some(&req_id);
+                            if is_auth {
+                                *pending_auth_id.lock().await = None;
+                                emit(
+                                    &event_tx,
+                                    &session_id,
+                                    cur,
+                                    SessionEvent::PermissionResolved {
+                                        request_id: req_id.to_string(),
+                                        kind: crate::event::PermissionKind::Auth,
+                                    },
+                                );
+                                continue;
+                            }
+                            settle_resolved_approval(
+                                &pending_tool_approvals,
+                                incarnation.as_deref(),
+                                &req_id,
+                                |request_id| {
+                                    #[cfg(test)]
+                                    emit_gate::pause(&session_id);
+                                    emit(
+                                        &event_tx,
+                                        &session_id,
+                                        cur,
+                                        SessionEvent::PermissionResolved {
+                                            request_id,
+                                            kind: crate::event::PermissionKind::Tool,
+                                        },
+                                    );
                                 },
                             );
                             continue;
@@ -1870,9 +1891,9 @@ async fn reader_task(
                                 turn_in_flight.store(false, Ordering::SeqCst);
                                 let message = params
                                     .get("error")
-                                    .and_then(|e| e.get("message").and_then(Value::as_str).or_else(|| e.as_str()))
-                                    .unwrap_or("codex reported a fatal error")
-                                    .to_string();
+                                    .map(turn_error_text)
+                                    .filter(|m| !m.is_empty())
+                                    .unwrap_or_else(|| "codex reported a fatal error".to_string());
                                 tracing::warn!(
                                     conversation_id = %session_id,
                                     turn_gen = cur,
@@ -2563,25 +2584,187 @@ fn rollback_to_turn(result: &Value) -> u64 {
         .unwrap_or(0)
 }
 
-/// Remove `request_id` (the exact stored key: raw for tool/file, `ELICIT_PREFIX`-tagged
-/// for elicitation) from the open approvals, returning its entry when it was open.
-/// `dispatch(AnswerPermission)` uses it before writing an answer.
-fn take_pending_tool_approval(
-    pending: &Arc<std::sync::Mutex<HashMap<String, String>>>,
-    request_id: &str,
-) -> Option<String> {
-    pending.lock().unwrap_or_else(|e| e.into_inner()).remove(request_id)
+/// Make a fresh codex process current for approvals. The caller holds the stdin guard
+/// (`slot`), which `AnswerPermission` also holds from its check through its write; the
+/// lock order is stdin, then approvals, everywhere. So an answer either completes on the
+/// old process before this runs, or sees the new incarnation and is refused.
+fn install_process(
+    slot: &mut Option<aionui_process::BoxedStdin>,
+    pending: &SharedApprovals,
+    stdin: Option<aionui_process::BoxedStdin>,
+    incarnation: Option<String>,
+) {
+    let mut open = pending.lock().unwrap_or_else(|e| e.into_inner());
+    open.incarnation = incarnation;
+    open.titles.clear();
+    open.answered.clear();
+    *slot = stdin;
 }
 
-/// Remove a resolved approval from the recovery registry. `serverRequest/resolved`
-/// carries the RAW wire id, but an elicitation was stored under the
-/// `ELICIT_PREFIX`-tagged key — so try the raw id first, then the prefixed form, so a
-/// resolved notification clears either entry shape.
-fn remove_pending_tool_approval(pending: &Arc<std::sync::Mutex<HashMap<String, String>>>, request_id: &str) {
-    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
-    if map.remove(request_id).is_none() {
-        map.remove(&format!("{ELICIT_PREFIX}{request_id}"));
+/// Write one JSON-RPC line to the stdin held by the caller's guard.
+async fn write_frame_to(slot: &mut Option<aionui_process::BoxedStdin>, frame: Value) -> Result<(), BackendError> {
+    let stdin = slot
+        .as_mut()
+        .ok_or_else(|| BackendError::Transport("codex stdin unavailable".into()))?;
+    let mut line = serde_json::to_vec(&frame).map_err(|e| BackendError::Transport(e.to_string()))?;
+    line.push(b'\n');
+    use tokio::io::AsyncWriteExt;
+    stdin
+        .write_all(&line)
+        .await
+        .map_err(|e| BackendError::Transport(e.to_string()))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|e| BackendError::Transport(e.to_string()))?;
+    Ok(())
+}
+
+/// Test-only pause between deciding a resolution and emitting it, keyed by session id,
+/// so a test can try to interleave a process replacement exactly there.
+#[cfg(test)]
+mod emit_gate {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+
+    /// Per session: where to report "reached", and where to wait for "go".
+    type Gate = (Sender<()>, Receiver<()>);
+
+    static GATES: Mutex<Option<HashMap<String, Gate>>> = Mutex::new(None);
+
+    /// Arm a one-shot gate for `session`: returns (reached, go).
+    pub(super) fn arm(session: &str) -> (Receiver<()>, Sender<()>) {
+        let (reached_tx, reached_rx) = channel();
+        let (go_tx, go_rx) = channel();
+        GATES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(session.to_owned(), (reached_tx, go_rx));
+        (reached_rx, go_tx)
     }
+
+    pub(super) fn pause(session: &str) {
+        let gate = GATES.lock().unwrap().as_mut().and_then(|gates| gates.remove(session));
+        if let Some((reached, go)) = gate {
+            let _ = reached.send(());
+            let _ = go.recv();
+        }
+    }
+}
+
+/// The open tool/file/elicitation approvals of the codex process running now.
+///
+/// Codex numbers its requests per process (the captured first approvals are all `0`),
+/// so the raw wire id cannot name an approval across processes. Every process start
+/// (open, and each wake) draws a fresh 128-bit OS-random `incarnation`, and approvals
+/// are surfaced as `"{incarnation}.{wire id}"` (`ELICIT_PREFIX` in front for
+/// elicitation). A card from an earlier process, of this backend, of another backend
+/// built for the same conversation, or from before a Core restart, can therefore match
+/// a new approval only with negligible probability (2^-128 per pair).
+#[derive(Debug, Default)]
+struct OpenApprovals {
+    /// The running process's incarnation; `None` if none could be drawn, in which case
+    /// approvals are refused (no counter fallback).
+    incarnation: Option<String>,
+    /// Public request id → safe title (the approval class, never the command body).
+    titles: HashMap<String, String>,
+    /// Approvals we answered that codex has not confirmed yet: `"{incarnation}.{wire}"`
+    /// → the exact public id the card had (elicitation keeps its prefix), so the later
+    /// `serverRequest/resolved` names the same card. Cleared with the process.
+    answered: HashMap<String, String>,
+}
+
+type SharedApprovals = Arc<std::sync::Mutex<OpenApprovals>>;
+
+/// 128 OS-random bits as 32 hex characters, or `None` if the OS gives none.
+fn new_incarnation() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    match getrandom::getrandom(&mut bytes) {
+        Ok(()) => Some(hex::encode(bytes)),
+        Err(error) => {
+            tracing::error!(%error, "codex: no randomness for approval ids; approvals will be refused");
+            None
+        }
+    }
+}
+
+/// The id a codex approval is surfaced and answered under. `wire_id` keeps its JSON
+/// form (`0` and `"0"` stay distinct through `Value::to_string`).
+fn public_approval_id(incarnation: &str, wire_id: &Value) -> String {
+    format!("{incarnation}.{wire_id}")
+}
+
+/// The wire id behind `public` if it belongs to `incarnation`; the JSON type is restored
+/// from its text form, exactly as it was surfaced.
+fn wire_approval_id(public: &str, incarnation: &str) -> Option<Value> {
+    let rest = public.strip_prefix(incarnation)?.strip_prefix('.')?;
+    Some(serde_json::from_str(rest).unwrap_or_else(|_| Value::String(rest.to_owned())))
+}
+
+/// Settle codex's `serverRequest/resolved` for `wire_id`, read by the reader of
+/// `incarnation`, and run `emit` with the exact public id of the card it resolves while
+/// still holding the approvals mutex. `install_process` takes the same mutex, so the
+/// resolution is linearized with a replacement: it is emitted before the new process's
+/// first event, or not at all.
+///
+/// Nothing is emitted (returns `false`) for a replaced process (a late reader) or for an
+/// approval that is neither open nor answered (a duplicate, or one never surfaced): the
+/// reducer counts resolutions by kind, not by id, so that would settle some other card.
+fn settle_resolved_approval(
+    pending: &SharedApprovals,
+    incarnation: Option<&str>,
+    wire_id: &Value,
+    emit: impl FnOnce(String),
+) -> bool {
+    let Some(incarnation) = incarnation else { return false };
+    let mut open = pending.lock().unwrap_or_else(|e| e.into_inner());
+    if open.incarnation.as_deref() != Some(incarnation) {
+        return false;
+    }
+    let public = public_approval_id(incarnation, wire_id);
+    let elicit = format!("{ELICIT_PREFIX}{public}");
+    let settled = if open.titles.remove(&public).is_some() {
+        Some(public)
+    } else if open.titles.remove(&elicit).is_some() {
+        Some(elicit)
+    } else {
+        open.answered.remove(&public)
+    };
+    match settled {
+        Some(id) => {
+            emit(id);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether `incarnation` is the process running now (a reader started for a replaced
+/// process is not).
+fn is_current_incarnation(pending: &SharedApprovals, incarnation: Option<&str>) -> bool {
+    incarnation.is_some() && pending.lock().unwrap_or_else(|e| e.into_inner()).incarnation.as_deref() == incarnation
+}
+
+/// Register an approval raised by the process of `incarnation` and run `emit` (its
+/// `Permission` event) under the approvals mutex, unless that process was replaced
+/// meanwhile. Holding the mutex across the emit linearizes it with `install_process`:
+/// an old process's card can never appear after the replacement.
+fn open_pending_tool_approval(
+    pending: &SharedApprovals,
+    incarnation: &str,
+    public: &str,
+    title: &str,
+    emit: impl FnOnce(),
+) -> bool {
+    let mut open = pending.lock().unwrap_or_else(|e| e.into_inner());
+    if open.incarnation.as_deref() != Some(incarnation) {
+        return false;
+    }
+    open.titles.insert(public.to_owned(), title.to_owned());
+    emit();
+    true
 }
 
 /// Reverse-RPC handler (A2/A3). The blocking ServerRequest MUST eventually get a
@@ -2603,7 +2786,8 @@ async fn handle_reverse_rpc(
     turn_gen: &Arc<AtomicU64>,
     event_tx: &broadcast::Sender<SessionEnvelope>,
     pending_auth_id: &Arc<Mutex<Option<Value>>>,
-    pending_tool_approvals: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pending_tool_approvals: &SharedApprovals,
+    incarnation: Option<&str>,
     stdin: &Arc<Mutex<Option<aionui_process::BoxedStdin>>>,
 ) {
     let cur = turn_gen.load(Ordering::SeqCst);
@@ -2661,7 +2845,11 @@ async fn handle_reverse_rpc(
         // clean -32601 reject below (unblocks the channel; the escalation just
         // can't be granted — strictly better than a malformed answer or a deadlock).
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            let request_id = id.to_string();
+            let Some(incarnation) = incarnation else {
+                write_reverse_error(stdin, &id, -32603, "approval ids unavailable").await;
+                return;
+            };
+            let request_id = public_approval_id(incarnation, &id);
             // Register for REST recovery (`GET /confirmations`): a tool/file approval
             // raised before the client subscribed (or after a page reload) must be
             // rebuildable, else the turn hangs waiting for an answer that can never be
@@ -2674,30 +2862,31 @@ async fn handle_reverse_rpc(
             } else {
                 "CommandExecution"
             };
-            pending_tool_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(request_id.clone(), title.to_string());
-            emit(
-                event_tx,
-                session_id,
-                cur,
-                SessionEvent::Permission {
-                    request_id,
-                    kind: crate::event::PermissionKind::Tool,
-                    // G3 auto-approval is ACP-only (acp_conn). The native codex
-                    // app-server command/file approval is not a team-MCP path.
-                    metadata: None,
-                    // The approval class as the card title, and the request `params`
-                    // as an UNPARSED passthrough so the card can show the approver
-                    // what they are approving (AionUi issue #3779 — approving blind).
-                    // No shape is asserted: the frontend reads `command` when present
-                    // and falls back to the title otherwise, so an unprobed params
-                    // shape degrades to the previous title-only card.
-                    tool_name: Some(title.to_string()),
-                    input: frame.get("params").cloned(),
-                },
-            );
+            // A request read after its process was replaced is not surfaced: nobody can
+            // answer it on the new process. The card is emitted under the approvals mutex.
+            let public = request_id.clone();
+            open_pending_tool_approval(pending_tool_approvals, incarnation, &public, title, || {
+                emit(
+                    event_tx,
+                    session_id,
+                    cur,
+                    SessionEvent::Permission {
+                        request_id,
+                        kind: crate::event::PermissionKind::Tool,
+                        // G3 auto-approval is ACP-only (acp_conn). The native codex
+                        // app-server command/file approval is not a team-MCP path.
+                        metadata: None,
+                        // The approval class as the card title, and the request `params`
+                        // as an UNPARSED passthrough so the card can show the approver
+                        // what they are approving (AionUi issue #3779 — approving blind).
+                        // No shape is asserted: the frontend reads `command` when present
+                        // and falls back to the title otherwise, so an unprobed params
+                        // shape degrades to the previous title-only card.
+                        tool_name: Some(title.to_string()),
+                        input: frame.get("params").cloned(),
+                    },
+                )
+            });
         }
         // MCP elicitation (LIVE-confirmed 0.139.0, missing-wire-probe): codex bridges
         // both an MCP tool-call APPROVAL and a real MCP server form `elicitation/create`
@@ -2711,7 +2900,11 @@ async fn handle_reverse_rpc(
         // a transparent dispatch-side discriminator. `serverRequest/resolved` already
         // emits the matching PermissionResolved{Tool} on answer.
         "mcpServer/elicitation/request" => {
-            let request_id = format!("{ELICIT_PREFIX}{id}");
+            let Some(incarnation) = incarnation else {
+                write_reverse_error(stdin, &id, -32603, "approval ids unavailable").await;
+                return;
+            };
+            let request_id = format!("{ELICIT_PREFIX}{}", public_approval_id(incarnation, &id));
             // Carry the elicitation context so the conversation can render a form /
             // approval prompt: the message, the requested schema, and the mode.
             let input = json!({
@@ -2723,22 +2916,21 @@ async fn handle_reverse_rpc(
             // Register for REST recovery, keyed by the ELICIT_PREFIX-tagged request_id
             // (the same id we surface + dispatch(AnswerPermission) answers). Title is
             // the safe approval class, not the elicitation message body (TIO-13).
-            pending_tool_approvals
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(request_id.clone(), "Elicitation".to_string());
-            emit(
-                event_tx,
-                session_id,
-                cur,
-                SessionEvent::Permission {
-                    request_id,
-                    kind: crate::event::PermissionKind::Tool,
-                    metadata: None,
-                    tool_name: None,
-                    input: Some(input),
-                },
-            );
+            let public = request_id.clone();
+            open_pending_tool_approval(pending_tool_approvals, incarnation, &public, "Elicitation", || {
+                emit(
+                    event_tx,
+                    session_id,
+                    cur,
+                    SessionEvent::Permission {
+                        request_id,
+                        kind: crate::event::PermissionKind::Tool,
+                        metadata: None,
+                        tool_name: None,
+                        input: Some(input),
+                    },
+                )
+            });
         }
         // Any other reverse-RPC → unblock with a -32601 error (never let an unknown
         // blocking request hang the turn) + opaque diagnostic. This matches the
@@ -3721,6 +3913,30 @@ fn synth_clean_terminal() -> SessionEvent {
 /// only exists so a hypothetical unfollowed systemError cannot hang the FSM.
 const SYSTEM_ERROR_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// The text of a codex `TurnError` (`{message, codexErrorInfo, …}`, schema: codex-cli 0.163.0
+/// `generate-json-schema` ServerNotification.json TurnError), as the turn's error text.
+///
+/// Errors are classified from this text downstream (`classify_upstream_detail`). For the one
+/// structured cause the text must not be left to wording, `codexErrorInfo: "usageLimitExceeded"`,
+/// the canonical phrase "usage limit" is guaranteed in the text, so the agent's exhausted
+/// allowance is reported as such (not retried) whatever codex's message says.
+fn turn_error_text(error: &Value) -> String {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
+        .unwrap_or("")
+        .to_string();
+    let usage_limit = error.get("codexErrorInfo").and_then(Value::as_str) == Some("usageLimitExceeded");
+    if usage_limit && !message.to_ascii_lowercase().contains("usage limit") {
+        if message.is_empty() {
+            return "codex usage limit reached".to_string();
+        }
+        return format!("{message} (codex usage limit reached)");
+    }
+    message
+}
+
 fn synth_error_terminal(message: String) -> SessionEvent {
     SessionEvent::TurnResult {
         is_error: true,
@@ -3837,11 +4053,7 @@ fn map_turn_completed(params: &Value) -> SessionEvent {
         ),
     };
     let error = turn.get("error");
-    let result_text = error
-        .and_then(|e| e.get("message"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let result_text = error.map(turn_error_text).unwrap_or_default();
     // C-3 (correctness): httpStatusCode is NOT top-level on turn.error — it is
     // NESTED inside the externally-tagged `CodexErrorInfo` variant object on
     // `error.codexErrorInfo`, e.g. {"httpConnectionFailed":{"httpStatusCode":500}}
@@ -4432,17 +4644,42 @@ impl SessionBackend for CodexSessionBackend {
                 selected: _, // codex approval is accept/decline; no pick-one label
                 answers: _,  // codex has no AskUserQuestion; per-question answers N/A
             } => {
-                // Only an approval that is open on this backend is answered, exactly once:
-                // a repeated answer, or one for an approval of a process that was replaced
-                // (a wake clears them), is refused and never written. Not
-                // covered yet: codex numbers requests per process (captured first
-                // approvals are all id "0"), so after a restart an old card's id can match
-                // a new open approval (per-process id tagging is the planned next slice).
-                // Same rule as claude's `answer_permission`.
-                let Some(taken) = take_pending_tool_approval(&self.pending_tool_approvals, &request_id) else {
-                    return Err(BackendError::Transport(format!(
-                        "no pending permission for request_id {request_id}"
-                    )));
+                // Only an approval open on the process running NOW is answered, exactly
+                // once, and only on that process's stdin:
+                // - the stdin guard is held from the check through the write; a wake
+                //   holds the same guard while it swaps stdin and replaces the
+                //   incarnation (lock order stdin -> approvals in both places), so the
+                //   answer can never land on a process that did not raise it;
+                // - the public id must carry the current incarnation and still be open;
+                //   otherwise the answer is refused and nothing is written.
+                // Same refusal as claude's `answer_permission`.
+                let mut stdin = self.stdin.lock().await;
+                let (incarnation, title, elicit, wire_id) = {
+                    let mut open = self.pending_tool_approvals.lock().unwrap_or_else(|e| e.into_inner());
+                    let (elicit, public) = match request_id.strip_prefix(ELICIT_PREFIX) {
+                        Some(public) => (true, public),
+                        None => (false, request_id.as_str()),
+                    };
+                    let current = open.incarnation.clone();
+                    let wire_id = current.as_deref().and_then(|inc| wire_approval_id(public, inc));
+                    match (current, wire_id, open.titles.remove(&request_id)) {
+                        (Some(inc), Some(wire_id), Some(title)) => {
+                            // Book the answer BEFORE it is visible upstream: codex may send
+                            // `serverRequest/resolved` while our write is still flushing, and
+                            // it must find the card's exact id here.
+                            open.answered
+                                .insert(public_approval_id(&inc, &wire_id), request_id.clone());
+                            (inc, title, elicit, wire_id)
+                        }
+                        (_, _, taken) => {
+                            if let Some(title) = taken {
+                                open.titles.insert(request_id.clone(), title);
+                            }
+                            return Err(BackendError::Transport(format!(
+                                "no pending permission for request_id {request_id}"
+                            )));
+                        }
+                    }
                 };
                 let approved = matches!(
                     decision,
@@ -4458,37 +4695,41 @@ impl SessionBackend for CodexSessionBackend {
                     super::types::PermissionDecision::Approved => "accept",
                     super::types::PermissionDecision::Denied => "decline",
                 };
-                // An elicitation request (ELICIT_PREFIX) needs `{action, content}`;
-                // a command/file approval needs `{decision}`. Both keyed by the same
-                // wire id we surfaced as Permission.request_id (prefix stripped for
-                // elicitation). The reducer never read the request_id, so the prefix
-                // is purely a dispatch-side wire-shape selector.
-                let frame = if let Some(raw_id) = request_id.strip_prefix(ELICIT_PREFIX) {
-                    let id: Value = serde_json::from_str(raw_id).unwrap_or(Value::String(raw_id.to_string()));
+                // An elicitation (ELICIT_PREFIX) needs `{action, content}`; a
+                // command/file approval needs `{decision}`. Both answer the raw wire id
+                // codex sent, with its JSON type.
+                let wire_id_for_resolve = wire_id.clone();
+                let frame = if elicit {
                     // Elicitation has only accept/decline (no per-session variant);
                     // accept executes the tool / submits the form; decline cancels.
                     // We have no form values to fill (the conversation layer would
                     // supply them when a real form UI exists), so content is empty.
                     json!({
-                        "jsonrpc": "2.0", "id": id,
+                        "jsonrpc": "2.0", "id": wire_id,
                         "result": { "action": if approved { "accept" } else { "decline" }, "content": {} }
                     })
                 } else {
-                    let id: Value = serde_json::from_str(&request_id).unwrap_or(Value::String(request_id.clone()));
                     json!({
-                        "jsonrpc": "2.0", "id": id,
+                        "jsonrpc": "2.0", "id": wire_id,
                         "result": { "decision": decision_str }
                     })
                 };
                 // The entry was taken above, so a later GET /confirmations no longer
-                // resurfaces a card the user already resolved. A failed write puts it back.
-                if let Err(error) = self.write_frame(frame).await {
-                    self.pending_tool_approvals
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(request_id, taken);
-                    return Err(error);
+                // resurfaces a card the user already resolved. A failed write puts it
+                // back; the stdin guard is still held, so no wake replaced the process.
+                let written = write_frame_to(&mut stdin, frame).await;
+                if written.is_err() {
+                    // Reopen the card only if codex has not resolved it meanwhile (the
+                    // resolution consumes the booking); a resolved card is never resurrected.
+                    let mut open = self.pending_tool_approvals.lock().unwrap_or_else(|e| e.into_inner());
+                    let plain = public_approval_id(&incarnation, &wire_id_for_resolve);
+                    if open.incarnation.as_deref() == Some(incarnation.as_str())
+                        && open.answered.remove(&plain).is_some()
+                    {
+                        open.titles.insert(request_id, title);
+                    }
                 }
+                written?;
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -4627,6 +4868,7 @@ impl SessionBackend for CodexSessionBackend {
         self.pending_tool_approvals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .titles
             .iter()
             .map(|(request_id, title)| PendingPermissionView {
                 request_id: request_id.clone(),
@@ -5716,7 +5958,13 @@ mod tests {
             })
             .expect("commandExecution/requestApproval surfaces as Permission");
         assert_eq!(kind, PermissionKind::Tool, "command approval is a Tool permission");
-        assert_eq!(request_id, "11", "request_id is the reverse-RPC wire id (un-prefixed)");
+        // "{incarnation}.{wire id}": 32 hex characters of this process, then the wire id.
+        let (incarnation, wire) = request_id.split_once('.').expect("incarnation-tagged id");
+        assert!(
+            incarnation.len() == 32 && incarnation.bytes().all(|b| b.is_ascii_hexdigit()),
+            "{request_id}"
+        );
+        assert_eq!(wire, "11", "the reverse-RPC wire id follows the incarnation");
         assert!(
             !request_id.starts_with(ELICIT_PREFIX),
             "a command approval must NOT be elicit-prefixed (it answers with {{decision}}), got {request_id}"
@@ -5739,14 +5987,10 @@ mod tests {
             let captured = fake.captured_stdin();
             let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
             // Answers are written only for an approval this process has open.
-            backend
-                .pending_tool_approvals
-                .lock()
-                .unwrap()
-                .insert("11".into(), "CommandExecution".into());
+            let request_id = open_approval(&backend, json!(11), false, "CommandExecution");
             backend
                 .dispatch(Command::AnswerPermission {
-                    request_id: "11".into(),
+                    request_id,
                     decision,
                     selected: None,
                     answers: vec![],
@@ -6303,6 +6547,65 @@ mod tests {
         );
     }
 
+    /// A codex `error` notification for an exhausted allowance (shape: codex-cli 0.163.0
+    /// generate-json-schema ErrorNotification/TurnError; message verified live) ends the turn
+    /// with text that says "usage limit", so it is classified as such downstream. When
+    /// codex's wording lacks the phrase, the structured `codexErrorInfo` still guarantees it.
+    #[tokio::test]
+    async fn a_usage_limit_error_ends_the_turn_saying_so() {
+        for (message, expect) in [
+            (
+                "You\u{2019}ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Oct 29th, 2026 9:12 AM.",
+                "usage limit",
+            ),
+            (
+                "Quota reached for this plan.",
+                "Quota reached for this plan. (codex usage limit reached)",
+            ),
+        ] {
+            let frame = json!({
+                "jsonrpc": "2.0",
+                "method": "error",
+                "params": {
+                    "threadId": "th1",
+                    "turnId": "t1",
+                    "willRetry": false,
+                    "error": { "message": message, "codexErrorInfo": "usageLimitExceeded", "additionalDetails": null }
+                }
+            })
+            .to_string();
+            let fake =
+                FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![format!("{frame}\n").into_bytes()]);
+            let release = fake.segment_releaser();
+            let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+            backend.mark_turn_in_flight_for_test();
+            let mut events = backend.events();
+            release();
+            let text = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                use futures_util::StreamExt;
+                while let Some(env) = events.next().await {
+                    if let SessionEvent::TurnResult {
+                        is_error: true,
+                        result_text,
+                        ..
+                    } = env.event
+                    {
+                        return result_text;
+                    }
+                }
+                String::new()
+            })
+            .await
+            .expect("an error terminal");
+            assert!(text.contains(expect), "{text}");
+        }
+        // Other causes keep codex's text as it is.
+        assert_eq!(
+            turn_error_text(&json!({"message": "boom", "codexErrorInfo": "serverOverloaded"})),
+            "boom"
+        );
+    }
+
     #[tokio::test]
     async fn failed_turn_without_http_status_is_none_not_panic() {
         // C-3 boundary: a CodexErrorInfo variant WITHOUT httpStatusCode → api_error_status
@@ -6480,6 +6783,551 @@ mod tests {
         fake
     }
 
+    /// Open an approval as this backend's current reader surfaces it, and return the
+    /// public request id a client would answer.
+    fn open_approval(backend: &CodexSessionBackend, wire: Value, elicit: bool, title: &str) -> String {
+        let mut open = backend.pending_tool_approvals.lock().unwrap();
+        let incarnation = open.incarnation.clone().expect("an incarnation was drawn");
+        let public = public_approval_id(&incarnation, &wire);
+        let id = if elicit {
+            format!("{ELICIT_PREFIX}{public}")
+        } else {
+            public
+        };
+        open.titles.insert(id.clone(), title.into());
+        id
+    }
+
+    fn answer(request_id: &str) -> Command {
+        Command::AnswerPermission {
+            request_id: request_id.to_owned(),
+            decision: super::super::types::PermissionDecision::Approved,
+            selected: None,
+            answers: vec![],
+        }
+    }
+
+    /// Codex restarts its ids at 0 in every process. A card from one backend's process
+    /// must not answer another backend's approval with the same wire id.
+    #[tokio::test]
+    async fn a_card_from_another_backend_cannot_answer_a_reused_wire_id() {
+        let fake_a = fake_with_binding("th-a", None);
+        let a = CodexSessionBackend::build_with_io("codex-a", Box::new(fake_a)).await;
+        let fake_b = fake_with_binding("th-b", None);
+        let captured_b = fake_b.captured_stdin();
+        let b = CodexSessionBackend::build_with_io("codex-b", Box::new(fake_b)).await;
+        let card_a = open_approval(&a, json!(0), false, "CommandExecution");
+        let card_b = open_approval(&b, json!(0), false, "CommandExecution");
+        assert_ne!(card_a, card_b, "independent backends never share an approval id");
+
+        assert!(b.dispatch(answer(&card_a)).await.is_err(), "a foreign card is refused");
+        assert!(
+            !captured_str_allow_empty(&captured_b).await.contains("\"result\""),
+            "nothing written for the foreign card"
+        );
+        assert_eq!(b.pending_permission_requests().len(), 1, "B's own approval stays open");
+        b.dispatch(answer(&card_b)).await.expect("B's own card answers");
+        let written = captured_str(&captured_b).await;
+        assert!(
+            written.contains(r#""id":0"#) && written.contains(r#""decision":"accept""#),
+            "{written}"
+        );
+    }
+
+    /// A replaced process (wake) gets a new incarnation: the old card is refused and
+    /// nothing reaches the new process, whose own approval with the same wire id is
+    /// answered on the new stdin.
+    #[tokio::test]
+    async fn after_a_process_is_replaced_its_cards_are_refused() {
+        let fake = fake_with_binding("th-1", None);
+        let captured_old = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let old_card = open_approval(&backend, json!(0), false, "CommandExecution");
+
+        let (new_stdin, mut new_stdout) = tokio::io::duplex(4096);
+        {
+            let mut slot = backend.stdin.lock().await;
+            install_process(
+                &mut slot,
+                &backend.pending_tool_approvals,
+                Some(Box::new(new_stdin)),
+                new_incarnation(),
+            );
+        }
+        assert!(
+            backend.pending_permission_requests().is_empty(),
+            "old approvals dropped"
+        );
+        assert!(backend.dispatch(answer(&old_card)).await.is_err(), "old card refused");
+
+        let new_card = open_approval(&backend, json!(0), false, "CommandExecution");
+        assert_ne!(new_card, old_card, "the reused wire id 0 has a new public id");
+        backend.dispatch(answer(&new_card)).await.expect("new card answers");
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            use tokio::io::AsyncReadExt;
+            new_stdout.read(&mut buf).await.unwrap()
+        })
+        .await
+        .unwrap();
+        let written = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert_eq!(
+            written.matches("\"result\"").count(),
+            1,
+            "exactly the new answer: {written}"
+        );
+        assert!(written.contains(r#""id":0"#), "{written}");
+        assert!(
+            !captured_str_allow_empty(&captured_old).await.contains("\"result\""),
+            "nothing reached the old process"
+        );
+    }
+
+    /// A late reader of a replaced process cannot open or resolve approvals of the new one.
+    #[tokio::test]
+    async fn a_late_reader_of_a_replaced_process_touches_nothing_new() {
+        let fake = fake_with_binding("th-1", None);
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let old = backend
+            .pending_tool_approvals
+            .lock()
+            .unwrap()
+            .incarnation
+            .clone()
+            .unwrap();
+        {
+            let mut slot = backend.stdin.lock().await;
+            install_process(&mut slot, &backend.pending_tool_approvals, None, new_incarnation());
+        }
+        let new_card = open_approval(&backend, json!(0), false, "CommandExecution");
+        let stale = public_approval_id(&old, &json!(0));
+        assert!(!open_pending_tool_approval(
+            &backend.pending_tool_approvals,
+            &old,
+            &stale,
+            "CommandExecution",
+            || panic!("nothing is emitted for a replaced process"),
+        ));
+        assert!(!settle_resolved_approval(
+            &backend.pending_tool_approvals,
+            Some(&old),
+            &json!(0),
+            |_| panic!("the old reader's resolved notice does not close the new approval")
+        ),);
+        let open: Vec<_> = backend
+            .pending_permission_requests()
+            .into_iter()
+            .map(|v| v.request_id)
+            .collect();
+        assert_eq!(open, vec![new_card]);
+    }
+
+    /// Collect events until `stop` matches one (bounded), returning those before it.
+    async fn events_until(
+        events: &mut (impl futures_util::Stream<Item = SessionEnvelope> + Unpin),
+        stop: impl Fn(&SessionEvent) -> bool,
+    ) -> Vec<SessionEvent> {
+        use futures_util::StreamExt;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut seen = Vec::new();
+            while let Some(env) = events.next().await {
+                if stop(&env.event) {
+                    return seen;
+                }
+                seen.push(env.event);
+            }
+            seen
+        })
+        .await
+        .expect("the stop event arrives")
+    }
+
+    const SENTINEL: &str =
+        r#"{"jsonrpc":"2.0","method":"turn/diff/updated","params":{"threadId":"th1","turnId":"t1","diff":"sentinel"}}"#;
+
+    fn line(frame: &str) -> Vec<u8> {
+        format!("{frame}\n").into_bytes()
+    }
+
+    /// Through the real reader: a resolved notice read by the reader of a replaced
+    /// process emits nothing (the reducer counts by kind, so it would settle the new
+    /// card), and the new approval stays open.
+    #[tokio::test]
+    async fn a_replaced_readers_resolved_notice_settles_nothing() {
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![
+            line(r#"{"jsonrpc":"2.0","id":0,"method":"item/commandExecution/requestApproval","params":{}}"#),
+            [
+                line(r#"{"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"requestId":0}}"#),
+                line(SENTINEL),
+            ]
+            .concat(),
+        ]);
+        let release = fake.segment_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut events = backend.events();
+        release();
+        events_until(&mut events, |e| matches!(e, SessionEvent::Permission { .. })).await;
+
+        // The process is replaced while its reader is still draining; the new process
+        // opens its own approval with the same wire id.
+        {
+            let mut slot = backend.stdin.lock().await;
+            let stdin = slot.take();
+            install_process(&mut slot, &backend.pending_tool_approvals, stdin, new_incarnation());
+        }
+        let new_card = open_approval(&backend, json!(0), false, "CommandExecution");
+        release();
+        let before = events_until(&mut events, |e| matches!(e, SessionEvent::TurnDiffUpdated { .. })).await;
+        assert!(
+            !before
+                .iter()
+                .any(|e| matches!(e, SessionEvent::PermissionResolved { .. })),
+            "no resolution from the replaced process: {before:?}"
+        );
+        let open: Vec<_> = backend
+            .pending_permission_requests()
+            .into_iter()
+            .map(|v| v.request_id)
+            .collect();
+        assert_eq!(open, vec![new_card]);
+    }
+
+    /// Request → answer → resolved names the exact card id (the elicitation prefix
+    /// included), and a duplicate resolved notice emits nothing.
+    #[tokio::test]
+    async fn an_answered_cards_resolution_keeps_its_exact_id_once() {
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![
+            line(r#"{"jsonrpc":"2.0","id":5,"method":"mcpServer/elicitation/request","params":{"message":"m"}}"#),
+            [
+                line(r#"{"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"requestId":5}}"#),
+                line(r#"{"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"requestId":5}}"#),
+                line(SENTINEL),
+            ]
+            .concat(),
+        ]);
+        let release = fake.segment_releaser();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let mut events = backend.events();
+        release();
+        let seen = events_until(&mut events, |e| matches!(e, SessionEvent::Permission { .. })).await;
+        assert!(
+            seen.is_empty()
+                || !seen
+                    .iter()
+                    .any(|e| matches!(e, SessionEvent::PermissionResolved { .. }))
+        );
+        let card = backend.pending_permission_requests()[0].request_id.clone();
+        assert!(card.starts_with(ELICIT_PREFIX), "{card}");
+        backend.dispatch(answer(&card)).await.expect("answered");
+        release();
+        let after = events_until(&mut events, |e| matches!(e, SessionEvent::TurnDiffUpdated { .. })).await;
+        let resolved: Vec<_> = after
+            .iter()
+            .filter_map(|e| match e {
+                SessionEvent::PermissionResolved { request_id, .. } => Some(request_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resolved, vec![card], "one resolution, with the card's exact id");
+    }
+
+    /// Poll `fut` exactly once.
+    async fn poll_once<F: std::future::Future + Unpin>(fut: &mut F) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(std::pin::Pin::new(&mut *fut).poll(cx))).await
+    }
+
+    /// The critical seam, one side: an answer whose write is blocked (a 1-byte pipe) holds
+    /// stdin, so a replacement cannot take it; the answer lands on the process that raised
+    /// the approval, and only then does the replacement run. Ordering is forced by
+    /// polling each future once, not by timing.
+    #[tokio::test]
+    async fn a_replacement_waits_for_an_answer_in_flight() {
+        let fake = fake_with_binding("th-1", None);
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let (old_stdin, mut old_out) = tokio::io::duplex(1);
+        *backend.stdin.lock().await = Some(Box::new(old_stdin));
+        let card = open_approval(&backend, json!(0), false, "CommandExecution");
+
+        let mut answering = Box::pin(backend.dispatch(answer(&card)));
+        assert!(
+            poll_once(&mut answering).await.is_pending(),
+            "the write blocks while holding stdin"
+        );
+        let mut replacing = Box::pin(async {
+            let mut slot = backend.stdin.lock().await;
+            install_process(&mut slot, &backend.pending_tool_approvals, None, new_incarnation());
+        });
+        assert!(
+            poll_once(&mut replacing).await.is_pending(),
+            "the replacement waits for stdin"
+        );
+        assert_eq!(
+            backend.pending_permission_requests().len(),
+            0,
+            "the answered card was taken"
+        );
+
+        let drain = async {
+            use tokio::io::AsyncReadExt;
+            let mut got = Vec::new();
+            let mut byte = [0u8; 1];
+            while old_out.read(&mut byte).await.unwrap_or(0) == 1 {
+                got.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+            }
+            String::from_utf8(got).unwrap()
+        };
+        let (answered, written) = tokio::join!(answering, drain);
+        answered.expect("the answer completes on its own process");
+        replacing.await;
+        assert!(
+            written.contains(r#""id":0"#) && written.contains(r#""decision":"accept""#),
+            "{written}"
+        );
+    }
+
+    /// The other side: an answer that arrives while a replacement holds stdin is decided
+    /// only after it gets the guard, so it sees the new incarnation, is refused, and
+    /// nothing reaches the new process. (Deciding before taking the guard would let the
+    /// old card be written to the new process.)
+    #[tokio::test]
+    async fn an_answer_racing_a_replacement_never_reaches_the_new_process() {
+        let fake = fake_with_binding("th-1", None);
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        let card = open_approval(&backend, json!(0), false, "CommandExecution");
+
+        let mut slot = backend.stdin.lock().await; // a replacement in progress
+        let mut answering = Box::pin(backend.dispatch(answer(&card)));
+        assert!(
+            poll_once(&mut answering).await.is_pending(),
+            "the answer waits for stdin"
+        );
+        let (new_stdin, mut new_out) = tokio::io::duplex(4096);
+        install_process(
+            &mut slot,
+            &backend.pending_tool_approvals,
+            Some(Box::new(new_stdin)),
+            new_incarnation(),
+        );
+        drop(slot);
+
+        assert!(
+            answering.await.is_err(),
+            "the old card is refused after the replacement"
+        );
+        drop(backend);
+        let mut rest = Vec::new();
+        use tokio::io::AsyncReadExt;
+        new_out.read_to_end(&mut rest).await.unwrap();
+        assert!(
+            rest.is_empty(),
+            "nothing was written to the new process: {:?}",
+            String::from_utf8_lossy(&rest)
+        );
+    }
+
+    /// Emission is linearized with a replacement: a resolution decided for the old process
+    /// is emitted before the new process's card, never after it (the reducer counts
+    /// resolutions by kind). A test gate pauses the reader between deciding and emitting;
+    /// if the approvals mutex were not held there, the replacement and the new card would
+    /// get in first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resolution_is_never_emitted_after_the_replacements_new_card() {
+        let session = "codex-gate";
+        let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![
+            line(r#"{"jsonrpc":"2.0","id":0,"method":"item/commandExecution/requestApproval","params":{}}"#),
+            [
+                line(r#"{"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"requestId":0}}"#),
+                line(SENTINEL),
+            ]
+            .concat(),
+        ]);
+        let release = fake.segment_releaser();
+        let backend = CodexSessionBackend::build_with_io(session, Box::new(fake)).await;
+        let mut events = backend.events();
+        release();
+        events_until(&mut events, |e| matches!(e, SessionEvent::Permission { .. })).await;
+
+        let (reached, go) = emit_gate::arm(session);
+        release();
+        tokio::task::spawn_blocking(move || reached.recv_timeout(std::time::Duration::from_secs(3)))
+            .await
+            .unwrap()
+            .expect("the reader reaches the gate");
+
+        let new_inc = new_incarnation().unwrap();
+        let new_card = public_approval_id(&new_inc, &json!(0));
+        let emit_new = |pending: &SharedApprovals| {
+            open_pending_tool_approval(pending, &new_inc, &new_card, "CommandExecution", || {
+                emit(
+                    &backend.event_tx,
+                    session,
+                    0,
+                    SessionEvent::Permission {
+                        request_id: new_card.clone(),
+                        kind: PermissionKind::Tool,
+                        metadata: None,
+                        tool_name: None,
+                        input: None,
+                    },
+                )
+            })
+        };
+        let replace = |open: &mut OpenApprovals| {
+            open.incarnation = Some(new_inc.clone());
+            open.titles.clear();
+            open.answered.clear();
+        };
+        // If the reader does not hold the mutex at the gate, replace and emit the new card
+        // right now, then let it continue; otherwise let it finish first.
+        let replaced_first = match backend.pending_tool_approvals.try_lock() {
+            Ok(mut open) => {
+                replace(&mut open);
+                drop(open);
+                assert!(emit_new(&backend.pending_tool_approvals));
+                true
+            }
+            Err(_) => false,
+        };
+        go.send(()).unwrap();
+        if !replaced_first {
+            {
+                let mut slot = backend.stdin.lock().await;
+                let stdin = slot.take();
+                install_process(&mut slot, &backend.pending_tool_approvals, stdin, Some(new_inc.clone()));
+            }
+            assert!(emit_new(&backend.pending_tool_approvals));
+        }
+
+        // Collect until both the reader's sentinel (after its resolution) and the new card
+        // have been seen, in whatever order they came.
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            use futures_util::StreamExt;
+            let (mut sentinel, mut card) = (false, false);
+            let mut seen = Vec::new();
+            while !(sentinel && card) {
+                let Some(env) = events.next().await else { break };
+                sentinel |= matches!(env.event, SessionEvent::TurnDiffUpdated { .. });
+                card |= matches!(&env.event, SessionEvent::Permission { request_id, .. } if *request_id == new_card);
+                seen.push(env.event);
+            }
+            seen
+        })
+        .await
+        .expect("sentinel and new card arrive");
+        let new_at = seen
+            .iter()
+            .position(|e| matches!(e, SessionEvent::Permission { request_id, .. } if *request_id == new_card))
+            .expect("the new card was emitted");
+        assert!(
+            !seen[new_at..]
+                .iter()
+                .any(|e| matches!(e, SessionEvent::PermissionResolved { .. })),
+            "a resolution emitted after the new card would settle it: {seen:?}"
+        );
+        assert!(!replaced_first, "the reader held the approvals mutex at the gate");
+    }
+
+    /// codex may resolve an approval while our answer is still being written: the
+    /// resolution must find the card (one exact `PermissionResolved`), and a write that
+    /// then fails must not reopen it.
+    #[tokio::test]
+    async fn a_resolution_during_the_answer_write_is_kept_and_not_resurrected() {
+        for fail_write in [false, true] {
+            let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_segments(vec![
+                line(r#"{"jsonrpc":"2.0","id":0,"method":"item/commandExecution/requestApproval","params":{}}"#),
+                [
+                    line(r#"{"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"requestId":0}}"#),
+                    line(SENTINEL),
+                ]
+                .concat(),
+            ]);
+            let release = fake.segment_releaser();
+            let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+            let mut events = backend.events();
+            release();
+            events_until(&mut events, |e| matches!(e, SessionEvent::Permission { .. })).await;
+            let card = backend.pending_permission_requests()[0].request_id.clone();
+            let (slow_stdin, mut slow_out) = tokio::io::duplex(1);
+            *backend.stdin.lock().await = Some(Box::new(slow_stdin));
+
+            let mut answering = Box::pin(backend.dispatch(answer(&card)));
+            assert!(poll_once(&mut answering).await.is_pending(), "the answer is mid-write");
+            release(); // codex resolves it now
+            let seen = events_until(&mut events, |e| matches!(e, SessionEvent::TurnDiffUpdated { .. })).await;
+            let resolved: Vec<_> = seen
+                .iter()
+                .filter_map(|e| match e {
+                    SessionEvent::PermissionResolved { request_id, .. } => Some(request_id.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(resolved, vec![card.clone()], "one resolution with the exact id");
+
+            if fail_write {
+                drop(slow_out);
+                assert!(answering.await.is_err(), "the write fails");
+            } else {
+                let drain = async {
+                    use tokio::io::AsyncReadExt;
+                    let mut byte = [0u8; 1];
+                    while slow_out.read(&mut byte).await.unwrap_or(0) == 1 && byte[0] != b'\n' {}
+                };
+                let (answered, ()) = tokio::join!(answering, drain);
+                answered.expect("the answer completes");
+            }
+            assert!(
+                backend.pending_permission_requests().is_empty(),
+                "the card is not reopened"
+            );
+            assert!(
+                backend.pending_tool_approvals.lock().unwrap().answered.is_empty(),
+                "no orphan booking"
+            );
+        }
+    }
+
+    /// The wire id keeps its JSON type: `0` and `"0"` are different approvals and each
+    /// is answered with its own type.
+    #[tokio::test]
+    async fn numeric_and_string_wire_ids_stay_distinct() {
+        for (wire, expected) in [(json!(0), r#""id":0"#), (json!("0"), r#""id":"0""#)] {
+            let fake = fake_with_binding("th-1", None);
+            let captured = fake.captured_stdin();
+            let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+            let card = open_approval(&backend, wire.clone(), false, "CommandExecution");
+            backend.dispatch(answer(&card)).await.expect("answered");
+            let written = captured_str(&captured).await;
+            assert!(written.contains(expected), "{wire} answered as {expected}: {written}");
+        }
+        let inc = "00";
+        assert_ne!(public_approval_id(inc, &json!(0)), public_approval_id(inc, &json!("0")));
+    }
+
+    /// Without randomness, no approval is opened and none can be answered.
+    #[tokio::test]
+    async fn without_an_incarnation_approvals_are_refused() {
+        let fake = fake_with_binding("th-1", None);
+        let captured = fake.captured_stdin();
+        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
+        {
+            let mut slot = backend.stdin.lock().await;
+            let stdin = slot.take();
+            install_process(&mut slot, &backend.pending_tool_approvals, stdin, None);
+        }
+        assert!(!open_pending_tool_approval(
+            &backend.pending_tool_approvals,
+            "x",
+            "x.0",
+            "CommandExecution",
+            || panic!("nothing is emitted without an incarnation"),
+        ));
+        assert!(backend.dispatch(answer("x.0")).await.is_err());
+        assert!(!captured_str_allow_empty(&captured).await.contains("\"result\""));
+    }
+
     /// Drain the captured-stdin buffer to a String after dispatch settles. Polls
     /// briefly because the duplex→capture copy is on a background task.
     async fn captured_str(captured: &Arc<tokio::sync::Mutex<Vec<u8>>>) -> String {
@@ -6504,14 +7352,10 @@ mod tests {
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
         // Answers are written only for an approval this process has open.
-        backend
-            .pending_tool_approvals
-            .lock()
-            .unwrap()
-            .insert(format!("{ELICIT_PREFIX}5"), "Elicitation".into());
+        let request_id = open_approval(&backend, json!(5), true, "Elicitation");
         backend
             .dispatch(Command::AnswerPermission {
-                request_id: format!("{ELICIT_PREFIX}5"),
+                request_id,
                 decision: super::super::types::PermissionDecision::Approved,
                 selected: None,
                 answers: vec![],
@@ -7794,10 +8638,24 @@ mod tests {
         // serverRequest/resolved → PermissionResolved so the reducer decrements the
         // matching waiting_on_* counter (R9/R15). Default kind=Tool (the common
         // approval case) when no pending auth id matches.
+        // The approval is surfaced first: a resolution only settles a card we raised.
         let events = drive_codex(&[
+            r#"{"jsonrpc":"2.0","id":7,"method":"item/commandExecution/requestApproval","params":{}}"#,
             r#"{"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"threadId":"th1","request_id":7}}"#,
         ])
         .await;
+        // A resolution for an id never surfaced (or already settled) emits nothing:
+        // the reducer would decrement a counter it never incremented.
+        let unknown = drive_codex(&[
+            r#"{"jsonrpc":"2.0","method":"serverRequest/resolved","params":{"threadId":"th1","request_id":8}}"#,
+        ])
+        .await;
+        assert!(
+            !unknown
+                .iter()
+                .any(|e| matches!(e, SessionEvent::PermissionResolved { .. })),
+            "{unknown:?}"
+        );
         assert!(
             events.iter().any(|e| matches!(
                 e,

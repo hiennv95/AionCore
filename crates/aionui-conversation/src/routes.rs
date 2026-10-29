@@ -10,11 +10,12 @@ use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, HandoffConversationRequest,
+    HandoffPreviewResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, ensure_no_local_files};
+use aionui_auth::{CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller, ensure_no_local_files};
 use aionui_common::ApiError;
 
 use crate::ConversationError;
@@ -120,6 +121,8 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/fork", post(fork))
+        .route("/api/conversations/{id}/handoff/preview", post(handoff_preview))
+        .route("/api/conversations/{id}/handoff", post(handoff))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         // MUST precede the `{messageId}` wildcard below: registered after it,
@@ -154,7 +157,8 @@ async fn create(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CreateConversationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
+    let Json(mut req) = body.map_err(ApiError::from)?;
+    crate::service::strip_server_owned_extra(&mut req.extra);
     let conversation = state.service.create(&user.id, req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
 }
@@ -173,7 +177,8 @@ async fn clone(
     Extension(user): Extension<CurrentUser>,
     body: Result<Json<CloneConversationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
+    let Json(mut req) = body.map_err(ApiError::from)?;
+    crate::service::strip_server_owned_extra(&mut req.conversation.extra);
     let conversation = state
         .service
         .clone_create(&user.id, req)
@@ -233,6 +238,47 @@ async fn fork(
     let Json(req) = body.map_err(ApiError::from)?;
     let conversation = state.service.fork(&user.id, &id, req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
+}
+
+/// A handoff is the owner's choice: an agent's helper CLI may not start one.
+fn refuse_helper(helper: Option<Extension<RuntimeHelperCaller>>) -> Result<(), ApiError> {
+    match helper {
+        Some(_) => Err(ApiError::Forbidden("Agents cannot hand off conversations".into())),
+        None => Ok(()),
+    }
+}
+
+async fn handoff_preview(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<HandoffPreviewResponse>>, ApiError> {
+    refuse_helper(helper)?;
+    let preview = state
+        .service
+        .handoff_preview(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(preview)))
+}
+
+async fn handoff(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    Path(id): Path<String>,
+    body: Result<Json<HandoffConversationRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<ConversationResponse>>), ApiError> {
+    refuse_helper(helper)?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    let (target, created) = state
+        .service
+        .handoff(&user.id, &id, req)
+        .await
+        .map_err(ApiError::from)?;
+    let status = if created { StatusCode::CREATED } else { StatusCode::OK };
+    Ok((status, Json(ApiResponse::ok(target))))
 }
 
 async fn associated(
@@ -305,12 +351,13 @@ async fn send_msg(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    ensure_no_local_files(&req.files, device.as_deref(), helper.as_deref())?;
+    ensure_no_local_files(&req.files, device.as_deref(), deviceless.as_deref(), helper.as_deref())?;
     let response = state
         .service
         .send_message(&user.id, &id, req, &state.task_manager)

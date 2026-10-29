@@ -201,7 +201,7 @@ async fn call(
 #[tokio::test]
 async fn another_user_cannot_see_or_touch_the_owners_providers_and_mcp_servers() {
     let (mut app, services) = common::build_app().await;
-    let (owner, oc) = common::setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (owner, oc) = common::desktop_login(&app, &services).await;
     let secret = "sk-owner-secret-key-123";
     let (status, body) = call(
         &app,
@@ -297,7 +297,7 @@ async fn another_user_cannot_see_or_touch_the_owners_providers_and_mcp_servers()
 #[tokio::test]
 async fn the_diagnostics_report_never_returns_another_users_rows() {
     let (mut app, services) = common::build_app().await;
-    let (owner, oc) = common::setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (owner, oc) = common::desktop_login(&app, &services).await;
     let workspace = tempfile::tempdir().unwrap();
     let (_, body) = call(
         &app,
@@ -368,7 +368,7 @@ async fn the_diagnostics_report_never_returns_another_users_rows() {
 #[tokio::test]
 async fn another_user_cannot_read_or_replace_the_owners_assistant_rules() {
     let (mut app, services) = common::build_app().await;
-    let (owner, oc) = common::setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (owner, oc) = common::desktop_login(&app, &services).await;
     let (bob, bc) = common::setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
     let assistant = serde_json::json!({"id": "owner-a", "name": "owner-assistant", "agent_id": "632f31d2"});
     let (status, body) = call(&app, Method::POST, "/api/assistants", &owner, &oc, assistant.clone()).await;
@@ -469,7 +469,7 @@ async fn another_user_cannot_read_or_replace_the_owners_assistant_rules() {
 #[tokio::test]
 async fn another_user_cannot_use_any_cron_or_project_route_of_the_owner() {
     let (mut app, services) = common::build_app().await;
-    let (owner, oc) = common::setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (owner, oc) = common::desktop_login(&app, &services).await;
     let (bob, bc) = common::setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;
     let (status, body) = call(
         &app,

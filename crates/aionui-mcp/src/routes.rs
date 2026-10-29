@@ -13,7 +13,9 @@ use aionui_api_types::{
     McpConnectionTestErrorCode, McpServerResponse, McpTransport, OAuthCheckStatusRequest, OAuthLoginRequest,
     OAuthLoginResponse, OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device};
+use aionui_auth::{
+    CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller, from_paired_device, is_paired_device,
+};
 use aionui_common::ApiError;
 
 use crate::connection_test::McpConnectionTestService;
@@ -73,7 +75,7 @@ fn mcp_desktop_only_error() -> ApiError {
 
 async fn mcp_desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
     let extensions = request.extensions();
-    if is_paired_device(extensions.get::<CurrentDevice>()) || extensions.get::<RuntimeHelperCaller>().is_some() {
+    if from_paired_device(extensions) || extensions.get::<RuntimeHelperCaller>().is_some() {
         return Err(mcp_desktop_only_error());
     }
     Ok(next.run(request).await)
@@ -121,6 +123,7 @@ async fn list_servers(
     State(state): State<McpRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
 ) -> Result<Json<ApiResponse<Vec<McpServerResponse>>>, ApiError> {
     let servers = state
@@ -128,7 +131,11 @@ async fn list_servers(
         .list_servers(&user.id)
         .await
         .map_err(ApiError::from)?;
-    let masked = masks_secrets(device.as_ref().map(|Extension(d)| d), helper.is_some());
+    let masked = masks_secrets(
+        device.as_ref().map(|Extension(d)| d),
+        deviceless.is_some(),
+        helper.is_some(),
+    );
     Ok(Json(ApiResponse::ok(
         servers.into_iter().map(|s| project(s, masked)).collect(),
     )))
@@ -139,6 +146,7 @@ async fn get_server(
     State(state): State<McpRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<McpServerResponse>>, ApiError> {
@@ -147,14 +155,18 @@ async fn get_server(
         .get_server(&user.id, &id)
         .await
         .map_err(ApiError::from)?;
-    let masked = masks_secrets(device.as_ref().map(|Extension(d)| d), helper.is_some());
+    let masked = masks_secrets(
+        device.as_ref().map(|Extension(d)| d),
+        deviceless.is_some(),
+        helper.is_some(),
+    );
     Ok(Json(ApiResponse::ok(project(server, masked))))
 }
 
 /// Paired phones and browsers and the agent helper read MCP servers with every
 /// secret-bearing field masked (Jev 047); the desktop app keeps full values to edit them.
-fn masks_secrets(device: Option<&CurrentDevice>, helper: bool) -> bool {
-    helper || is_paired_device(device)
+fn masks_secrets(device: Option<&CurrentDevice>, deviceless: bool, helper: bool) -> bool {
+    helper || deviceless || is_paired_device(device)
 }
 
 const MASK: &str = "***";

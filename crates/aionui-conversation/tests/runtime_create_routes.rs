@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use aionui_ai_agent::agent_task::AgentInstance;
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_ai_agent::{AgentError, IWorkerTaskManager, RuntimeTokenScope, RuntimeTokenService};
+use aionui_ai_agent::{AgentError, HelperAccess, IWorkerTaskManager, RuntimeTokenScope, RuntimeTokenService};
 use aionui_api_types::WebSocketMessage;
 use aionui_common::{AgentKillReason, TimestampMs};
 use aionui_conversation::skill_resolver::{ResolvedAgentSkill, SkillResolver};
@@ -142,7 +142,7 @@ async fn setup() -> Ctx {
     let tokens = Arc::new(RuntimeTokenService::new());
     let router = conversation_runtime_routes(ConversationRuntimeRouterState {
         service,
-        runtime_token_service: tokens.clone(),
+        helper_access: Arc::new(HelperAccess::new(tokens.clone(), repo.clone())),
     });
     let workspace = std::env::temp_dir().join("aionui-runtime-create-routes-workspace");
     std::fs::create_dir_all(&workspace).unwrap();

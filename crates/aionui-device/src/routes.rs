@@ -14,7 +14,7 @@ use aionui_api_types::{
     DeviceSession, DeviceView, HostProofRequest, HostProofResponse, PairRequest, PairResponse, PairingView,
     UpdateDeviceListenerRequest,
 };
-use aionui_auth::{CookieConfig, CurrentDevice, CurrentUser, RuntimeHelperCaller};
+use aionui_auth::{CookieConfig, CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller};
 use aionui_common::ApiError;
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
@@ -119,9 +119,16 @@ async fn claim(State(state): State<DeviceRouterState>, Json(req): Json<ClaimRequ
 /// Who makes this request, as auth_middleware established it: an agent's
 /// helper CLI, else the session's device if it is device-bound. The token is
 /// never re-verified here, so a disagreement cannot fail open to the manager.
-fn caller(device: Option<Extension<CurrentDevice>>, helper: Option<Extension<RuntimeHelperCaller>>) -> Caller {
+fn caller(
+    device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+) -> Caller {
     if helper.is_some() {
         return Caller::RuntimeHelper;
+    }
+    if deviceless.is_some() {
+        return Caller::Deviceless;
     }
     device.map_or(Caller::Session, |Extension(device)| Caller::Device(device.id))
 }
@@ -131,8 +138,9 @@ async fn list(
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
 ) -> ApiResult<Vec<DeviceView>> {
-    let caller = caller(device, helper);
+    let caller = caller(device, deviceless, helper);
     ok(state.service.list(&user.id, &caller).await.map_err(to_api_error)?)
 }
 
@@ -141,9 +149,10 @@ async fn revoke(
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     Path(id): Path<String>,
 ) -> ApiResult<()> {
-    let caller = caller(device, helper);
+    let caller = caller(device, deviceless, helper);
     ok(state
         .service
         .revoke(&user.id, &caller, &id)
@@ -156,8 +165,9 @@ async fn create_pairing(
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
 ) -> ApiResult<CreatePairingResponse> {
-    let caller = caller(device, helper);
+    let caller = caller(device, deviceless, helper);
     ok(state
         .service
         .create_pairing(&user.id, &caller)
@@ -170,9 +180,10 @@ async fn pairing(
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     Path(id): Path<String>,
 ) -> ApiResult<PairingView> {
-    let caller = caller(device, helper);
+    let caller = caller(device, deviceless, helper);
     ok(state
         .service
         .pairing(&user.id, &caller, &id)
@@ -185,9 +196,10 @@ async fn approve(
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     Path(id): Path<String>,
 ) -> ApiResult<PairingView> {
-    let caller = caller(device, helper);
+    let caller = caller(device, deviceless, helper);
     ok(state
         .service
         .approve(&user.id, &caller, &id)
@@ -200,9 +212,10 @@ async fn reject(
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     Path(id): Path<String>,
 ) -> ApiResult<PairingView> {
-    let caller = caller(device, helper);
+    let caller = caller(device, deviceless, helper);
     ok(state
         .service
         .reject(&user.id, &caller, &id)
@@ -215,8 +228,9 @@ async fn listener_status(
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
 ) -> ApiResult<DeviceListenerStatus> {
-    let caller = caller(device, helper);
+    let caller = caller(device, deviceless, helper);
     ok(state
         .service
         .listener_status(&user.id, &caller)
@@ -229,9 +243,10 @@ async fn update_listener(
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     Json(req): Json<UpdateDeviceListenerRequest>,
 ) -> ApiResult<DeviceListenerStatus> {
-    let caller = caller(device, helper);
+    let caller = caller(device, deviceless, helper);
     ok(state
         .service
         .update_listener(&user.id, &caller, req)

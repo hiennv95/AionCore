@@ -222,6 +222,7 @@ async fn a_paired_device_cannot_mutate_or_test_mcp_servers() {
     }
 
     // 6. Agent helper token must also be refused on mutation & test endpoints
+    common::ensure_conversation(&services, owner.as_str(), "conv-helper-mcp").await;
     let helper_issue = services.runtime_token_service.issue(
         owner.as_str(),
         "conv-helper-mcp",

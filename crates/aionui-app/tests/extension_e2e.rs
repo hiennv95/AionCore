@@ -667,10 +667,10 @@ async fn eq19_channel_status_merges_extension_meta_for_persisted_row() {
 async fn eq20_enable_extension_channel_persists_config_and_exposes_status() {
     let tmp = TempDir::new().unwrap();
     let ext_root = write_legacy_extension_fixture(&tmp);
-    let (mut app, services) = build_app_with_extension_root(&ext_root).await;
+    let (app, services) = build_app_with_extension_root(&ext_root).await;
     let repo = SqliteChannelRepository::new(services.database.pool().clone());
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
-    let owner_user_id = services.user_repo.find_by_username("user1").await.unwrap().unwrap().id;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
+    let owner_user_id = services.user_repo.find_by_username("admin").await.unwrap().unwrap().id;
 
     let enable_resp = app
         .clone()
@@ -788,8 +788,8 @@ async fn eq21_disable_extension_channel_updates_status() {
 
 #[tokio::test]
 async fn em3_enable_nonexistent_returns_not_found() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let resp = app
         .oneshot(json_with_token(
@@ -806,8 +806,8 @@ async fn em3_enable_nonexistent_returns_not_found() {
 
 #[tokio::test]
 async fn em4_disable_nonexistent_returns_not_found() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let resp = app
         .oneshot(json_with_token(
@@ -827,7 +827,8 @@ async fn extension_enablement_and_contributions_are_isolated_by_user() {
     let tmp = TempDir::new().unwrap();
     let ext_root = write_legacy_extension_fixture(&tmp);
     let (mut app, services) = build_app_with_extension_root(&ext_root).await;
-    let (token_a, csrf_a) = setup_and_login(&mut app, &services, "extension-user-a", "pass-a").await;
+    // User A is the owner (desktop app session); B is a second password account.
+    let (token_a, csrf_a) = common::desktop_login(&app, &services).await;
     let (token_b, csrf_b) = setup_and_login(&mut app, &services, "extension-user-b", "pass-b").await;
 
     let missing_csrf = Request::builder()
@@ -918,7 +919,9 @@ async fn extension_enablement_and_contributions_are_isolated_by_user() {
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    // Jev 053: B's password session is device-less, so it may not toggle extensions.
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["code"], "FS_OWNER_ONLY");
 
     let extensions_a = body_json(app.oneshot(get_with_token("/api/extensions", &token_a)).await.unwrap()).await;
     assert_eq!(extensions_a["data"][0]["enabled"], false);
@@ -947,8 +950,8 @@ async fn hm1_get_hub_extensions() {
 
 #[tokio::test]
 async fn hm3_install_nonexistent_returns_error() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let resp = app
         .oneshot(json_with_token(
@@ -1012,8 +1015,8 @@ async fn sm11_get_skill_paths() {
 
 #[tokio::test]
 async fn sm9_detect_paths() {
-    let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services) = build_app().await;
+    let (token, _csrf) = common::desktop_login(&app, &services).await;
 
     let resp = app
         .oneshot(get_with_token("/api/skills/detect-paths", &token))
@@ -1032,8 +1035,8 @@ async fn sm9_detect_paths() {
 
 #[tokio::test]
 async fn cp1_get_external_paths_empty() {
-    let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services) = build_app().await;
+    let (token, _csrf) = common::desktop_login(&app, &services).await;
 
     let resp = app
         .oneshot(get_with_token("/api/skills/external-paths", &token))
@@ -1236,8 +1239,8 @@ async fn sk3_read_builtin_skill_rejects_path_traversal() {
 #[tokio::test]
 async fn si1_read_skill_info_from_directory_path() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let skill_dir = tmp.path().join("my-skill");
     std::fs::create_dir_all(&skill_dir).unwrap();
@@ -1268,8 +1271,8 @@ async fn si1_read_skill_info_from_directory_path() {
 #[tokio::test]
 async fn si2_read_skill_info_falls_back_to_directory_name_when_name_empty() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let skill_dir = tmp.path().join("fallback-dir");
     std::fs::create_dir_all(&skill_dir).unwrap();
@@ -1300,8 +1303,8 @@ async fn si2_read_skill_info_falls_back_to_directory_name_when_name_empty() {
 #[tokio::test]
 async fn si3_read_skill_info_returns_not_found_for_missing_path() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let missing = tmp.path().join("no-such-skill");
 
@@ -1324,8 +1327,8 @@ async fn si3_read_skill_info_returns_not_found_for_missing_path() {
 #[tokio::test]
 async fn skill_import_returns_specific_code_for_oversized_file() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let skill_dir = tmp.path().join("huge-skill");
     std::fs::create_dir_all(&skill_dir).unwrap();
@@ -1368,8 +1371,8 @@ async fn skill_import_returns_specific_code_for_oversized_file() {
 #[tokio::test]
 async fn skill_batch_import_reports_partial_failures_without_rolling_back_successes() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let parent_dir = tmp.path().join("parent-pack");
     let alpha_dir = parent_dir.join("alpha-skill");
@@ -1420,7 +1423,7 @@ async fn skill_batch_import_reports_partial_failures_without_rolling_back_succes
     // scoped storage under `users/{dir}/`, never in the legacy shared root.
     let user = services
         .user_repo
-        .find_by_username("user1")
+        .find_by_username("admin")
         .await
         .unwrap()
         .expect("test user should exist");
@@ -1478,12 +1481,12 @@ fn write_skill(dir: &std::path::Path, name: &str, description: &str) {
 #[tokio::test]
 async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let builtin_dir = paths.builtin_skills_dir.clone();
     write_skill(&builtin_dir, "review", "Built-in review skill");
-    sync_skill_catalog_for_test(&services, &paths, "user1").await;
+    sync_skill_catalog_for_test(&services, &paths, "admin").await;
 
     // Real users get custom skills through the import API, which stores
     // files under the user's scoped storage (never the legacy shared root).
@@ -1533,12 +1536,12 @@ async fn sl1_list_skills_tags_builtin_and_custom_with_source_field() {
 #[tokio::test]
 async fn sl2_list_skills_user_custom_overrides_builtin() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let builtin_dir = paths.builtin_skills_dir.clone();
     write_skill(&builtin_dir, "review", "Built-in review");
-    sync_skill_catalog_for_test(&services, &paths, "user1").await;
+    sync_skill_catalog_for_test(&services, &paths, "admin").await;
 
     // A user-imported skill with the same name shadows the builtin row in
     // the user's listing. The source dir name differs; the skill NAME in
@@ -1670,8 +1673,8 @@ async fn de1_detect_external_populates_custom_source_slug() {
     // paths MUST produce slugs prefixed with `custom-` per the e2e contract
     // in `tests/e2e/features/settings/skills/edge-cases.e2e.ts`.
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let ext_dir = tmp.path().join("external-skills");
     let skill_dir = ext_dir.join("my-ext-skill");
@@ -1722,8 +1725,8 @@ async fn de1_detect_external_populates_custom_source_slug() {
 #[tokio::test]
 async fn de2_detect_external_source_slugs_are_unique() {
     let tmp = TempDir::new().unwrap();
-    let (mut app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass1").await;
+    let (app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let mk = |p: &std::path::Path, skill: &str| {
         let dir = p.join(skill);

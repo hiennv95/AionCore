@@ -79,16 +79,23 @@ pub struct PeerCaller {
 /// Accept peer connections forever. Handshake failures are logged per connection and never
 /// stop the listener.
 pub async fn serve_peer_listener(listener: TcpListener, tls: Arc<ServerConfig>, router: Router) {
-    serve_tls(listener, tls, router, true).await;
+    serve_tls(listener, tls, router, true, true).await;
 }
 
 /// Accept server-authenticated TLS connections (no client certificate) forever, for client
 /// devices that pin this host's fingerprint and authenticate with their own tokens.
 pub async fn serve_device_listener(listener: TcpListener, tls: Arc<ServerConfig>, router: Router) {
-    serve_tls(listener, tls, router, false).await;
+    serve_tls(listener, tls, router, false, true).await;
 }
 
-async fn serve_tls(listener: TcpListener, tls: Arc<ServerConfig>, router: Router, mutual: bool) {
+/// Like [`serve_device_listener`], for a listener bound to loopback. Every client there
+/// has the same address, so a per-address limit would let any local process take the
+/// desktop app's share; only the overall limit applies.
+pub async fn serve_loopback_listener(listener: TcpListener, tls: Arc<ServerConfig>, router: Router) {
+    serve_tls(listener, tls, router, false, false).await;
+}
+
+async fn serve_tls(listener: TcpListener, tls: Arc<ServerConfig>, router: Router, mutual: bool, limit_per_ip: bool) {
     let acceptor = TlsAcceptor::from(tls);
     // Connection tasks live in this set: dropping (aborting) the listener future
     // closes every open connection too, so turning the listener off cuts
@@ -113,10 +120,15 @@ async fn serve_tls(listener: TcpListener, tls: Arc<ServerConfig>, router: Router
             drop(tcp);
             continue;
         }
-        let Some(ip_slot) = per_ip.acquire(remote_addr.ip()) else {
-            debug!(%remote_addr, "TLS listener at its per-address limit; closing the new connection");
-            drop(tcp);
-            continue;
+        let ip_slot = if limit_per_ip {
+            let Some(slot) = per_ip.acquire(remote_addr.ip()) else {
+                debug!(%remote_addr, "TLS listener at its per-address limit; closing the new connection");
+                drop(tcp);
+                continue;
+            };
+            Some(slot)
+        } else {
+            None
         };
         let acceptor = acceptor.clone();
         let router = router.clone();

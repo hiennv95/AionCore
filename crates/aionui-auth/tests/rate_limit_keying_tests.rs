@@ -44,6 +44,7 @@ async fn host() -> Host {
         local: false,
         aionpro_mode: false,
         device_repo: Some(Arc::new(aionui_db::SqliteDeviceRepository::new(db.pool().clone()))),
+        desktop_requires_loopback_tls: false,
     };
     Host {
         app: auth_routes(state),

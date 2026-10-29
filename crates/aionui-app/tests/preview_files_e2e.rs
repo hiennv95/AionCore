@@ -114,6 +114,35 @@ impl Host {
         ))
         .await
     }
+
+    async fn diff(&self, conversation: &str, file: &str, token: &str) -> Reply {
+        self.send(get(
+            &format!("/api/conversations/{conversation}/files/{file}/diff"),
+            token,
+        ))
+        .await
+    }
+
+    fn git(&self, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(self.workspace.path())
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+    }
 }
 
 async fn host() -> Host {
@@ -386,6 +415,7 @@ async fn who_may_read_previews() {
     let id = h.mint("conv-a", "a.txt").await.unwrap();
 
     // The agent helper never reads previews.
+    common::ensure_conversation(&h.services, h.owner.as_str(), "conv-a").await;
     let issue = h.services.runtime_token_service.issue(
         h.owner.as_str(),
         "conv-a",
@@ -456,8 +486,13 @@ async fn who_may_read_previews() {
     // Another user sees nothing; refs never cross conversations; unknown ids are path-free 404s.
     let (mut app, services) = (h.app.clone(), &h.services);
     let (bob, _) = setup_and_login(&mut app, services, "bob", "StrongP@ss2").await;
-    assert_eq!(h.files("conv-a", &bob).await.status, StatusCode::NOT_FOUND);
-    assert_eq!(h.content("conv-a", &id, &bob).await.status, StatusCode::NOT_FOUND);
+    // Jev 053: bob's password session is device-less, so his own (off) device setting
+    // refuses him before any lookup of the owner's conversation.
+    let refused = (StatusCode::FORBIDDEN, json!("PREVIEW_DEVICES_DISABLED"));
+    let r = h.files("conv-a", &bob).await;
+    assert_eq!((r.status, r.json()["code"].clone()), refused);
+    let r = h.content("conv-a", &id, &bob).await;
+    assert_eq!((r.status, r.json()["code"].clone()), refused);
     h.conversation("conv-b", h.workspace.path()).await;
     assert_eq!(h.content("conv-b", &id, &h.desktop).await.status, StatusCode::NOT_FOUND);
     let r = h.content("conv-a", "pf_missing", &h.desktop).await;
@@ -576,4 +611,179 @@ async fn the_routes_need_a_session_and_the_setting_needs_csrf() {
         (r.status, r.json()["code"].clone()),
         (StatusCode::BAD_REQUEST, json!("BAD_REQUEST"))
     );
+}
+
+const PDF: &[u8] = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\n";
+
+#[tokio::test]
+async fn pdf_needs_magic_and_extension_and_is_served_as_an_attachment() {
+    let h = host().await;
+    h.write("doc.pdf", PDF);
+    h.write("fake.pdf", b"<html>not a pdf</html>");
+    h.write("doc.bin", PDF);
+    let mut big = PDF.to_vec();
+    big.resize(20 * 1024 * 1024 + 1, b' ');
+    h.write("big.pdf", &big);
+    let pdf = h.mint("conv-a", "doc.pdf").await.unwrap();
+    let fake = h.mint("conv-a", "fake.pdf").await.unwrap();
+    let bin = h.mint("conv-a", "doc.bin").await.unwrap();
+    let large = h.mint("conv-a", "big.pdf").await.unwrap();
+
+    let list = h.files("conv-a", &h.desktop).await.json();
+    let kind = |rel: &str| {
+        list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["rel_path"] == rel)
+            .map(|f| (f["preview_kind"].clone(), f["too_large"].clone()))
+            .unwrap()
+    };
+    assert_eq!(kind("doc.pdf"), (json!("pdf"), json!(false)));
+    assert_eq!(kind("fake.pdf"), (json!("unsupported"), json!(false)));
+    assert_eq!(kind("doc.bin"), (json!("unsupported"), json!(false)));
+    assert_eq!(kind("big.pdf"), (json!("pdf"), json!(true)));
+
+    let r = h.content("conv-a", &pdf, &h.desktop).await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert_eq!(r.body, PDF);
+    assert_eq!(r.headers["content-type"], "application/pdf");
+    assert_eq!(r.headers["x-content-type-options"], "nosniff");
+    assert_eq!(r.headers["cache-control"], "no-store");
+    assert_eq!(r.headers["content-disposition"], "attachment");
+    assert_eq!(r.headers["content-security-policy"], "default-src 'none'; sandbox");
+    for id in [&fake, &bin] {
+        let r = h.content("conv-a", id, &h.desktop).await;
+        assert_eq!(r.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+    let r = h.content("conv-a", &large, &h.desktop).await;
+    assert_eq!(r.status, StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn diff_is_head_against_disk_with_relative_headers() {
+    let h = host().await;
+    h.git(&["init", "-q"]);
+    h.write("src/a.txt", b"one\n");
+    h.git(&["add", "-A"]);
+    h.git(&["commit", "-qm", "c"]);
+    h.write("src/a.txt", b"two\n");
+    h.write("new.md", b"# new\n");
+    h.write("logo.png", PNG);
+    let tracked = h.mint("conv-a", "src/a.txt").await.unwrap();
+    let untracked = h.mint("conv-a", "new.md").await.unwrap();
+    let image = h.mint("conv-a", "logo.png").await.unwrap();
+
+    let r = h.diff("conv-a", &tracked, &h.desktop).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", String::from_utf8_lossy(&r.body));
+    let d = &r.json()["data"];
+    assert_eq!(
+        (d["source"].clone(), d["status"].clone()),
+        (json!("head_vs_disk"), json!("ok"))
+    );
+    assert_eq!(
+        (d["base"].clone(), d["truncated"].clone()),
+        (json!("head"), json!(false))
+    );
+    let text = d["diff"].as_str().unwrap();
+    assert!(
+        text.contains("--- a/src/a.txt\n+++ b/src/a.txt\n") && text.contains("-one\n+two\n"),
+        "{text}"
+    );
+    let body = String::from_utf8_lossy(&r.body).to_string();
+    let ws = std::fs::canonicalize(h.workspace.path()).unwrap();
+    assert!(!body.contains(ws.to_str().unwrap()) && !body.contains(h.workspace.path().to_str().unwrap()));
+
+    let d = h.diff("conv-a", &untracked, &h.desktop).await.json()["data"].clone();
+    assert_eq!(d["base"], "absent");
+    let text = d["diff"].as_str().unwrap();
+    assert!(
+        text.contains("--- /dev/null\n+++ b/new.md\n") && text.contains("\n+# new\n"),
+        "{text}"
+    );
+
+    let r = h.diff("conv-a", &image, &h.desktop).await;
+    assert_eq!(
+        (r.status, r.json()["code"].clone()),
+        (StatusCode::UNSUPPORTED_MEDIA_TYPE, json!("PREVIEW_UNSUPPORTED"))
+    );
+    let r = h.diff("conv-a", "pf_missing", &h.desktop).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn diff_outside_a_repo_is_not_a_repo() {
+    let h = host().await;
+    h.write("a.txt", b"x\n");
+    let id = h.mint("conv-a", "a.txt").await.unwrap();
+    let r = h.diff("conv-a", &id, &h.desktop).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let d = &r.json()["data"];
+    assert_eq!(
+        (d["status"].clone(), d["base"].clone(), d["diff"].clone()),
+        (json!("not_a_repo"), Value::Null, json!(""))
+    );
+}
+
+#[tokio::test]
+async fn pdf_content_and_diff_keep_the_reader_gates() {
+    let h = host().await;
+    h.git(&["init", "-q"]);
+    h.write("a.txt", b"hello\n");
+    h.write("doc.pdf", PDF);
+    let text = h.mint("conv-a", "a.txt").await.unwrap();
+    let pdf = h.mint("conv-a", "doc.pdf").await.unwrap();
+    let uris = [
+        format!("/api/conversations/conv-a/files/{pdf}/content"),
+        format!("/api/conversations/conv-a/files/{text}/diff"),
+    ];
+
+    common::ensure_conversation(&h.services, h.owner.as_str(), "conv-a").await;
+    let issue = h.services.runtime_token_service.issue(
+        h.owner.as_str(),
+        "conv-a",
+        TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+        [RuntimeTokenScope::ConversationHelper],
+    );
+    let (mut app, services) = (h.app.clone(), &h.services);
+    let (bob, _) = setup_and_login(&mut app, services, "bob", "StrongP@ss2").await;
+    let disabled = (StatusCode::FORBIDDEN, json!("PREVIEW_DEVICES_DISABLED"));
+    for uri in &uris {
+        let r = h
+            .send(
+                Request::builder()
+                    .uri(uri)
+                    .header("x-aionui-runtime-token", issue.token.as_str())
+                    .header("x-aionui-user-id", h.owner.as_str())
+                    .header("x-aionui-conversation-id", "conv-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(
+            (r.status, r.json()["code"].clone()),
+            (StatusCode::FORBIDDEN, json!("FS_OWNER_ONLY")),
+            "{uri}"
+        );
+        let r = h.send(get(uri, &h.device)).await;
+        assert_eq!(
+            (r.status, r.json()["code"].clone()),
+            disabled,
+            "paired device, setting off: {uri}"
+        );
+        let r = h.send(get(uri, &bob)).await;
+        assert_eq!((r.status, r.json()["code"].clone()), disabled, "device-less: {uri}");
+        assert_eq!(h.send(get(uri, &h.desktop)).await.status, StatusCode::OK, "{uri}");
+    }
+    h.send(json_with_token(
+        "PUT",
+        "/api/devices/file-preview",
+        json!({"devices_allowed": true}),
+        &h.desktop,
+        "c",
+    ))
+    .await;
+    for uri in &uris {
+        assert_eq!(h.send(get(uri, &h.device)).await.status, StatusCode::OK, "{uri}");
+    }
 }

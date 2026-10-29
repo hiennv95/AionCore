@@ -108,7 +108,12 @@ impl ProjectService {
                 // Containment before existence, and no symlink followed on the way: the
                 // answer for a path outside the upload dir, or behind a link in it, never
                 // depends on whether something exists outside (audit, held unit 4).
-                upload_path_in_root(upload_root, candidate, path)?;
+                let rest = upload_path_in_root(upload_root, candidate, path)?;
+                // Same refusal as outside the root, so another user's upload is not
+                // told apart from a missing one.
+                if !upload_owned_by(&rest, user_id) {
+                    return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
+                }
                 if !path_within(upload_root, candidate) {
                     return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
                 }
@@ -260,7 +265,7 @@ impl ProjectService {
 ///
 /// This is a read-time check, not a guarantee from the writer: `create_upload_file`
 /// creates directories along a path, so whatever is on disk is checked here.
-fn upload_path_in_root(root: &Path, target: &Path, path: &str) -> Result<(), ProjectError> {
+fn upload_path_in_root(root: &Path, target: &Path, path: &str) -> Result<std::path::PathBuf, ProjectError> {
     let outside = || ProjectError::UploadPathOutsideRoot { path: path.to_owned() };
     if !target.is_absolute()
         || target
@@ -302,8 +307,27 @@ fn upload_path_in_root(root: &Path, target: &Path, path: &str) -> Result<(), Pro
             return Err(outside());
         }
     }
-    Ok(())
+    Ok(rest)
 }
+
+/// Directory under the upload root that holds one user's uploads
+/// (`users/<user dir>/<conversation|general>/<file>`, written by `create_upload_file`).
+pub const UPLOAD_USERS_DIR: &str = "users";
+
+/// Whether an upload (`rest`, relative to the upload root) belongs to `user_id`: it sits
+/// in that user's namespace. Uploads from before the namespace (`<conversation>/<file>`)
+/// have no recorded owner; they stay readable only by the single-owner account
+/// `system_default_user`, never by anyone else.
+fn upload_owned_by(rest: &Path, user_id: &str) -> bool {
+    let mut parts = rest.components().map(|c| c.as_os_str());
+    match parts.next() {
+        Some(first) if first == UPLOAD_USERS_DIR => aionui_common::user_dir_name(user_id)
+            .is_ok_and(|dir| parts.next().is_some_and(|owner| owner == dir.as_str())),
+        _ => user_id == LEGACY_UPLOAD_OWNER,
+    }
+}
+
+const LEGACY_UPLOAD_OWNER: &str = "system_default_user";
 
 /// The upload root itself is a real directory (not a symlink) that passes [`private_dir`].
 /// Otherwise a root planted in a shared temp dir, or replaced with a link, would make any

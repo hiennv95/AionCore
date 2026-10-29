@@ -1,12 +1,10 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    EnsureExternalSessionRequest, EnsureExternalSessionResponse, EnsureExternalUserRequest, EnsureExternalUserResponse,
-    ExternalUserType, PublicUser, RevokeExternalSessionRequest, RevokeExternalSessionResponse,
+    EnsureExternalSessionRequest, EnsureExternalUserRequest, EnsureExternalUserResponse, ExternalUserType,
+    RevokeExternalSessionRequest, RevokeExternalSessionResponse,
 };
 use aionui_db::{ExternalUserProjection, IUserRepository, UserStatus, UserType, models::User};
-
-use crate::JwtService;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProvisionError {
@@ -36,24 +34,13 @@ pub trait SystemDefaultFilesystemAdopter: Send + Sync {
 #[derive(Clone)]
 pub struct AuthProvisionService {
     user_repo: Arc<dyn IUserRepository>,
-    jwt_service: Arc<JwtService>,
     fs_adopter: Option<Arc<dyn SystemDefaultFilesystemAdopter>>,
 }
 
-pub struct ExternalSessionExchange {
-    pub response: EnsureExternalSessionResponse,
-    /// Short-lived access token (set as the session cookie).
-    pub token: String,
-    /// Long-lived refresh token (set as the refresh cookie) used to renew the
-    /// access token without re-authenticating.
-    pub refresh_token: String,
-}
-
 impl AuthProvisionService {
-    pub fn new(user_repo: Arc<dyn IUserRepository>, jwt_service: Arc<JwtService>) -> Self {
+    pub fn new(user_repo: Arc<dyn IUserRepository>) -> Self {
         Self {
             user_repo,
-            jwt_service,
             fs_adopter: None,
         }
     }
@@ -112,10 +99,12 @@ impl AuthProvisionService {
         Ok(external_user_response(user, request.user_type))
     }
 
-    pub async fn create_external_session(
+    /// Resolve the provisioned, enabled user for an external session exchange.
+    /// The caller signs the (device-bound) session.
+    pub async fn find_external_session_user(
         &self,
         request: EnsureExternalSessionRequest,
-    ) -> Result<ExternalSessionExchange, ProvisionError> {
+    ) -> Result<User, ProvisionError> {
         let user_type = map_external_user_type(request.user_type)?;
         let user = self
             .user_repo
@@ -126,22 +115,7 @@ impl AuthProvisionService {
         if user.status == UserStatus::Disabled {
             return Err(ProvisionError::UserDisabled);
         }
-
-        let username = user.username.clone().unwrap_or_else(|| "external_user".to_string());
-        let (token, refresh_token) = self
-            .jwt_service
-            .issue_session_pair(&user.id, &username, user.session_generation, None)
-            .await?;
-        self.user_repo.update_last_login(&user.id).await?;
-
-        Ok(ExternalSessionExchange {
-            response: EnsureExternalSessionResponse {
-                user: PublicUser { id: user.id, username },
-                session_generation: user.session_generation,
-            },
-            token,
-            refresh_token,
-        })
+        Ok(user)
     }
 
     pub async fn revoke_external_session(

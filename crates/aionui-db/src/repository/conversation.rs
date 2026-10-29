@@ -34,6 +34,23 @@ pub trait IConversationRepository: Send + Sync {
     /// Returns `DbError::NotFound` if ID is missing for the user.
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;
 
+    /// Handoff (ADR-023): deletes the conversation and its `acp_session` row in one
+    /// transaction, only while `extra.handoff` is unready with exactly `attempt`.
+    /// Returns whether it deleted.
+    async fn delete_unready_handoff(&self, _user_id: &str, _id: &str, _attempt: &str) -> Result<bool, DbError> {
+        Err(DbError::Init(
+            "delete_unready_handoff not supported by this repository".into(),
+        ))
+    }
+
+    /// Handoff (ADR-023): sets `extra.handoff.ready` in one statement, only while it
+    /// is unready with exactly `attempt`. Returns whether it updated.
+    async fn mark_handoff_ready(&self, _user_id: &str, _id: &str, _attempt: &str) -> Result<bool, DbError> {
+        Err(DbError::Init(
+            "mark_handoff_ready not supported by this repository".into(),
+        ))
+    }
+
     /// Lists conversations with cursor-based pagination and optional filters.
     async fn list_paginated(
         &self,

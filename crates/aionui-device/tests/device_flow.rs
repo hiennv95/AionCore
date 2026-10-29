@@ -56,6 +56,7 @@ async fn host() -> Host {
         identity_mode: AuthIdentityMode::UserSession,
         runtime_token_verifier: None,
         device_repo: Some(devices),
+        desktop_requires_loopback_tls: false,
     };
     // Runs after auth_middleware, before the handler (see `revoke_token`).
     let owner_routes = device_owner_routes(state.clone()).route_layer(from_fn_with_state(jwt, revoke_token));

@@ -656,6 +656,19 @@ fn classify_agent_lifecycle(lower: &str) -> Option<ClassifiedError> {
 }
 
 fn classify_provider_text(lower: &str) -> Option<ClassifiedError> {
+    // An exhausted usage allowance (verified live, codex-cli 0.163.0: "You've hit your usage
+    // limit. Upgrade to Pro (…) or try again at <time>", with codexErrorInfo
+    // "usageLimitExceeded"). Retrying cannot help before the reset, so it is not retryable,
+    // and it must not fall into the billing rule below ("purchase more credits").
+    if lower.contains("usage limit") {
+        return Some(provider_error(
+            "The agent has reached its usage limit",
+            AgentErrorCode::UserLlmProviderUsageLimit,
+            false,
+            AgentErrorResolutionKind::CheckProviderBilling,
+            None,
+        ));
+    }
     if contains_sso_expired_auth_signature(lower) {
         return Some(provider_error(
             "The model provider rejected the request",
@@ -1122,6 +1135,27 @@ mod tests {
         assert_eq!(err.code(), Some(code));
         assert_eq!(err.ownership(), Some(ownership));
         assert_eq!(err.stream_error().resolution.map(|value| value.kind), Some(resolution));
+    }
+
+    /// Verified live (codex-cli 0.163.0, 2026-10-28): an exhausted ChatGPT-plan allowance.
+    /// It is a usage limit (not retryable), not the billing rule its "purchase more
+    /// credits" might otherwise trip.
+    #[test]
+    fn an_exhausted_usage_allowance_is_a_usage_limit_not_billing() {
+        let detail = "You\u{2019}ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Oct 29th, 2026 9:12 AM.";
+        assert_classification(
+            detail,
+            AgentErrorCode::UserLlmProviderUsageLimit,
+            AgentErrorOwnership::UserLlmProvider,
+            AgentErrorResolutionKind::CheckProviderBilling,
+        );
+        let err = AgentSendError::from_agent_error(AgentError::bad_gateway(detail));
+        assert_eq!(err.stream_error().retryable, Some(false));
+        assert_eq!(
+            err.stream_error().detail.as_deref(),
+            Some(detail),
+            "codex's text, with its reset time, is kept"
+        );
     }
 
     fn assert_classification_without_resolution(detail: &str, code: AgentErrorCode, ownership: AgentErrorOwnership) {

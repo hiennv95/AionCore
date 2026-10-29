@@ -13,12 +13,15 @@ use aionui_api_types::{
     CreateCronJobRequest, CronJobResponse, HasSkillResponse, ListCronJobsQuery, RunNowResponse, SaveCronSkillRequest,
     UpdateConversationCronRequest, UpdateCronJobRequest,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, is_paired_device};
+use aionui_auth::{
+    CurrentDevice, CurrentUser, DevicelessSession, RUNTIME_CONVERSATION_ID_HEADER, RuntimeHelperCaller,
+    from_paired_device, is_paired_device,
+};
 use aionui_common::ApiError;
 use aionui_db::DbError;
 
 use crate::error::CronError;
-use crate::service::CronService;
+use crate::service::{CronService, is_pause_only};
 use crate::state::CronRouterState;
 
 fn db_error_to_api_error(err: DbError) -> ApiError {
@@ -43,6 +46,7 @@ impl From<CronError> for ApiError {
             CronError::InvalidTimezone(msg) => ApiError::BadRequest(msg),
             CronError::InvalidSkillContent(msg) => ApiError::BadRequest(msg),
             CronError::InvalidAgentConfig(msg) => ApiError::BadRequest(msg),
+            CronError::HelperScope(msg) => ApiError::coded(StatusCode::FORBIDDEN, "CRON_HELPER_SCOPE", msg, None),
             CronError::CrossAccountReference(msg) => {
                 ApiError::coded(StatusCode::CONFLICT, "CROSS_ACCOUNT_REFERENCE", msg, None)
             }
@@ -58,8 +62,9 @@ impl From<CronError> for ApiError {
 
 /// Paired phones and browsers may list, inspect and pause jobs (ADR-019).
 /// A job runs its agent unattended in full-auto mode, so arming, changing,
-/// running or deleting one is for the desktop app; the agent helper keeps
-/// its owner-equivalent access.
+/// running or deleting one is for the desktop app. An agent's helper CLI
+/// manages only jobs bound to its own conversation, which run in that
+/// conversation's own mode, never a forced full-auto (C4, Jev 056).
 fn cron_desktop_only_error() -> ApiError {
     ApiError::coded(
         StatusCode::FORBIDDEN,
@@ -70,40 +75,26 @@ fn cron_desktop_only_error() -> ApiError {
 }
 
 async fn cron_desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
-    if is_paired_device(request.extensions().get::<CurrentDevice>()) {
+    if from_paired_device(request.extensions()) {
         return Err(cron_desktop_only_error());
     }
     Ok(next.run(request).await)
 }
 
-fn desktop<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> MethodRouter<S> {
-    route.route_layer(from_fn(cron_desktop_only))
+/// The helper's conversation. The auth middleware verified the runtime token
+/// against this header before inserting [`RuntimeHelperCaller`].
+fn helper_conversation(
+    helper: &Option<Extension<RuntimeHelperCaller>>,
+    headers: &HeaderMap,
+) -> Result<Option<String>, ApiError> {
+    match helper {
+        Some(_) => header_value(headers, RUNTIME_CONVERSATION_ID_HEADER).map(Some),
+        None => Ok(None),
+    }
 }
 
-/// The one change a paired device may make: `{enabled: false}` and nothing else.
-fn is_pause_only(req: &UpdateCronJobRequest) -> bool {
-    let UpdateCronJobRequest {
-        name,
-        description,
-        enabled,
-        schedule,
-        message,
-        execution_mode,
-        agent_config,
-        conversation_title,
-        max_retries,
-        queue_enabled,
-    } = req;
-    *enabled == Some(false)
-        && name.is_none()
-        && description.is_none()
-        && schedule.is_none()
-        && message.is_none()
-        && execution_mode.is_none()
-        && agent_config.is_none()
-        && conversation_title.is_none()
-        && max_retries.is_none()
-        && queue_enabled.is_none()
+fn desktop<S: Clone + Send + Sync + 'static>(route: MethodRouter<S>) -> MethodRouter<S> {
+    route.route_layer(from_fn(cron_desktop_only))
 }
 
 pub fn cron_routes(state: CronRouterState) -> Router {
@@ -138,10 +129,20 @@ pub fn cron_routes(state: CronRouterState) -> Router {
 async fn create_job(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    headers: HeaderMap,
     body: Result<Json<CreateCronJobRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<CronJobResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let job = state.cron_service.add_job(&user.id, req).await?;
+    let job = match helper_conversation(&helper, &headers)? {
+        Some(conversation_id) => {
+            state
+                .cron_service
+                .add_job_for_helper(&user.id, &conversation_id, req)
+                .await?
+        }
+        None => state.cron_service.add_job(&user.id, req).await?,
+    };
     let resp = CronService::to_response(&job);
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(resp))))
 }
@@ -149,8 +150,13 @@ async fn create_job(
 async fn list_jobs(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
-    Query(query): Query<ListCronJobsQuery>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    headers: HeaderMap,
+    Query(mut query): Query<ListCronJobsQuery>,
 ) -> Result<Json<ApiResponse<Vec<CronJobResponse>>>, ApiError> {
+    if let Some(conversation_id) = helper_conversation(&helper, &headers)? {
+        query.conversation_id = Some(conversation_id);
+    }
     let jobs = state.cron_service.list_jobs(&user.id, &query).await?;
     let items: Vec<CronJobResponse> = jobs.iter().map(CronService::to_response).collect();
     Ok(Json(ApiResponse::ok(items)))
@@ -159,22 +165,49 @@ async fn list_jobs(
 async fn get_job(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<CronJobResponse>>, ApiError> {
-    let job = state.cron_service.get_job(&user.id, &id).await?;
+    let job = match helper_conversation(&helper, &headers)? {
+        Some(conversation_id) => {
+            state
+                .cron_service
+                .job_for_helper(&user.id, &conversation_id, &id, false)
+                .await?
+        }
+        None => state.cron_service.get_job(&user.id, &id).await?,
+    };
     Ok(Json(ApiResponse::ok(CronService::to_response(&job))))
 }
 
+#[allow(clippy::too_many_arguments)] // axum extractors: auth context plus helper scope
 async fn update_job(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: Result<Json<UpdateCronJobRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CronJobResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    if is_paired_device(device.as_ref().map(|Extension(device)| device)) && !is_pause_only(&req) {
+    if (deviceless.is_some() || is_paired_device(device.as_ref().map(|Extension(device)| device)))
+        && !is_pause_only(&req)
+    {
         return Err(cron_desktop_only_error());
+    }
+    if let Some(conversation_id) = helper_conversation(&helper, &headers)? {
+        if req.execution_mode.is_some() || req.agent_config.is_some() {
+            return Err(
+                CronError::HelperScope("an agent cannot change the execution mode or agent of a job".into()).into(),
+            );
+        }
+        state
+            .cron_service
+            .job_for_helper(&user.id, &conversation_id, &id, !is_pause_only(&req))
+            .await?;
     }
     let job = state.cron_service.update_job(&user.id, &id, req).await?;
     Ok(Json(ApiResponse::ok(CronService::to_response(&job))))
@@ -183,8 +216,16 @@ async fn update_job(
 async fn delete_job(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    if let Some(conversation_id) = helper_conversation(&helper, &headers)? {
+        state
+            .cron_service
+            .job_for_helper(&user.id, &conversation_id, &id, false)
+            .await?;
+    }
     state.cron_service.remove_job(&user.id, &id).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -192,16 +233,30 @@ async fn delete_job(
 async fn run_now(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<RunNowResponse>>, ApiError> {
+    if let Some(conversation_id) = helper_conversation(&helper, &headers)? {
+        state
+            .cron_service
+            .job_for_helper(&user.id, &conversation_id, &id, true)
+            .await?;
+    }
     let resp = state.cron_service.run_now(&user.id, &id).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
 
 async fn system_resume(
     State(state): State<CronRouterState>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    // The header is chosen by the client, so it is not a trust boundary: an agent's
+    // helper never triggers the resume sweep (audit C11).
+    if helper.is_some() {
+        return Err(cron_desktop_only_error());
+    }
     let is_internal = headers.get("x-aionui-internal").and_then(|value| value.to_str().ok()) == Some("1");
     if !is_internal {
         return Err(ApiError::Forbidden("internal route".into()));
@@ -285,9 +340,17 @@ fn trusted_header_user_id(headers: &HeaderMap, current_user: &CurrentUser) -> Re
 async fn save_skill(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
     body: Result<Json<SaveCronSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    if let Some(conversation_id) = helper_conversation(&helper, &headers)? {
+        state
+            .cron_service
+            .job_for_helper(&user.id, &conversation_id, &id, true)
+            .await?;
+    }
     let Json(req) = body.map_err(ApiError::from)?;
     state.cron_service.save_skill(&user.id, &id, req).await?;
     Ok(Json(ApiResponse::success()))
@@ -296,8 +359,16 @@ async fn save_skill(
 async fn list_conversations_by_cron_job(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<ConversationResponse>>>, ApiError> {
+    if let Some(conversation_id) = helper_conversation(&helper, &headers)? {
+        state
+            .cron_service
+            .job_for_helper(&user.id, &conversation_id, &id, false)
+            .await?;
+    }
     let items = state.conversation_service.list_by_cron_job(&user.id, &id).await?;
     Ok(Json(ApiResponse::ok(items)))
 }
@@ -305,8 +376,16 @@ async fn list_conversations_by_cron_job(
 async fn has_skill(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<HasSkillResponse>>, ApiError> {
+    if let Some(conversation_id) = helper_conversation(&helper, &headers)? {
+        state
+            .cron_service
+            .job_for_helper(&user.id, &conversation_id, &id, false)
+            .await?;
+    }
     let resp = state.cron_service.has_skill(&user.id, &id).await?;
     Ok(Json(ApiResponse::ok(resp)))
 }
@@ -314,8 +393,16 @@ async fn has_skill(
 async fn delete_skill(
     State(state): State<CronRouterState>,
     Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
+    if let Some(conversation_id) = helper_conversation(&helper, &headers)? {
+        state
+            .cron_service
+            .job_for_helper(&user.id, &conversation_id, &id, false)
+            .await?;
+    }
     state.cron_service.delete_skill(&user.id, &id).await?;
     Ok(Json(ApiResponse::success()))
 }

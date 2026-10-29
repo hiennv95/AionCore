@@ -64,7 +64,7 @@ async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str, na
 
 async fn build_app() -> (axum::Router, aionui_app::AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
+    let services = aionui_app::AppServices::from_config(db, &common::scratch_config())
         .await
         .unwrap();
     let router = aionui_app::create_router(&services).await.expect("build router");
@@ -90,7 +90,7 @@ async fn workspace_browse_requires_auth() {
 #[tokio::test]
 async fn workspace_browse_no_active_task() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Seed a real workspace on disk so the handler can canonicalize it.
     let tmp = tempfile::tempdir().unwrap();
@@ -113,8 +113,8 @@ async fn workspace_browse_no_active_task() {
 
 #[tokio::test]
 async fn workspace_browse_conversation_not_found() {
-    let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let (app, services) = build_app().await;
+    let (token, _csrf) = common::desktop_login(&app, &services).await;
 
     let req = get_with_token("/api/conversations/does-not-exist/workspace?path=/src", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -123,8 +123,8 @@ async fn workspace_browse_conversation_not_found() {
 
 #[tokio::test]
 async fn workspace_browse_empty_path() {
-    let (mut app, services) = build_app().await;
-    let (token, _csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let (app, services) = build_app().await;
+    let (token, _csrf) = common::desktop_login(&app, &services).await;
 
     let req = get_with_token("/api/conversations/some-conv/workspace?path=", &token);
     let resp = app.oneshot(req).await.unwrap();
@@ -136,7 +136,7 @@ async fn workspace_browse_empty_path() {
 #[tokio::test]
 async fn workspace_browse_treats_symlinked_skill_dir_as_directory() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().join("workspace");

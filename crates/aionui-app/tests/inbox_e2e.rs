@@ -472,6 +472,7 @@ async fn the_inbox_needs_a_session_csrf_and_is_not_for_the_agent_helper() {
         .unwrap()
         .unwrap()
         .id;
+    common::ensure_conversation(&h.services, owner.as_str(), id.as_str()).await;
     let issue = h.services.runtime_token_service.issue(
         owner.as_str(),
         id.as_str(),

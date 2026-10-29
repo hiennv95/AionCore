@@ -433,3 +433,61 @@ async fn custom_delete_does_not_refresh_unrelated_agents() {
     assert!(unrelated.installed, "custom delete should not refresh unrelated agents");
     assert!(rows.iter().all(|row| row.id != "agent-target-delete"));
 }
+
+#[tokio::test]
+async fn disabled_installed_agent_stays_installed_in_management_rows() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("toggle-installed-command");
+    std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let command = path.to_string_lossy().to_string();
+    let source_info = serde_json::json!({ "binary_name": command }).to_string();
+    repo.upsert(&custom_params(
+        "agent-toggle-installed",
+        "Toggle Installed",
+        &command,
+        &source_info,
+    ))
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new(repo);
+    registry.hydrate().await.unwrap();
+    let service = agent_service(registry.clone(), provider_repo, temp.path().to_path_buf());
+
+    for enabled in [false, true] {
+        service
+            .set_agent_enabled(SYSTEM_DEFAULT_USER_ID, "agent-toggle-installed", enabled)
+            .await
+            .unwrap();
+        let cached = registry.list_management_rows().await;
+        let by_user = registry
+            .list_management_rows_for_user(SYSTEM_DEFAULT_USER_ID)
+            .await
+            .unwrap();
+        let single = registry.management_row_by_id("agent-toggle-installed").await.unwrap();
+        for row in [
+            cached.iter().find(|r| r.id == "agent-toggle-installed").unwrap(),
+            by_user.iter().find(|r| r.id == "agent-toggle-installed").unwrap(),
+            &single,
+        ] {
+            assert_eq!(row.enabled, enabled);
+            assert!(row.installed, "enabled={enabled}: installed must not depend on enabled");
+        }
+        if !enabled {
+            let visible = registry
+                .list_all()
+                .await
+                .iter()
+                .any(|m| m.id == "agent-toggle-installed");
+            assert!(!visible, "disabled agents stay out of the picker catalog");
+        }
+    }
+}

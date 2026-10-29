@@ -97,6 +97,11 @@ impl Database {
         &self.pool
     }
 
+    /// Whether the database answers a trivial query (health probes).
+    pub async fn ping(pool: &SqlitePool) -> bool {
+        sqlx::query("SELECT 1").execute(pool).await.is_ok()
+    }
+
     /// Closes all connections in the pool.
     pub async fn close(&self) {
         self.pool.close().await;

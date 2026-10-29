@@ -1159,13 +1159,16 @@ pub async fn export_skill_with_symlink(skill_path: &Path, target_dir: &Path) -> 
     let target_link = target_dir.join(&skill_name);
     tokio::fs::create_dir_all(target_dir).await?;
 
-    // Remove existing link if present
-    if target_link.exists() {
-        if target_link.is_symlink() || target_link.is_file() {
-            tokio::fs::remove_file(&target_link).await?;
-        } else {
-            tokio::fs::remove_dir_all(&target_link).await?;
+    // Replace an existing (even dangling) link, but never delete a real
+    // directory the user owns (audit H10).
+    if let Ok(meta) = tokio::fs::symlink_metadata(&target_link).await {
+        if meta.is_dir() {
+            return Err(ExtensionError::InvalidRequest(format!(
+                "refusing to replace existing directory {}",
+                target_link.display()
+            )));
         }
+        tokio::fs::remove_file(&target_link).await?;
     }
 
     create_symlink(skill_path, &target_link).await?;
@@ -3087,6 +3090,45 @@ mod tests {
 
         let link = target_dir.join("my-skill");
         assert!(link.is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_skill_refuses_to_delete_a_real_directory() {
+        let tmp = TempDir::new().unwrap();
+        let source_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let target_dir = tmp.path().join("exports");
+        let real = target_dir.join("my-skill");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("keep.txt"), "user data").unwrap();
+
+        assert!(export_skill_with_symlink(&source_dir, &target_dir).await.is_err());
+        assert_eq!(std::fs::read_to_string(real.join("keep.txt")).unwrap(), "user data");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_skill_replaces_existing_and_dangling_symlinks() {
+        let tmp = TempDir::new().unwrap();
+        let source_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(other.join("my-skill")).unwrap();
+        std::fs::write(other.join("my-skill/keep.txt"), "x").unwrap();
+        let target_dir = tmp.path().join("exports");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let link = target_dir.join("my-skill");
+
+        std::os::unix::fs::symlink(other.join("my-skill"), &link).unwrap();
+        export_skill_with_symlink(&source_dir, &target_dir).await.unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), source_dir);
+        assert!(other.join("my-skill/keep.txt").exists(), "symlink target must survive");
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &link).unwrap();
+        export_skill_with_symlink(&source_dir, &target_dir).await.unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), source_dir);
     }
 
     // -----------------------------------------------------------------------

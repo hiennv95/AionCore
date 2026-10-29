@@ -103,6 +103,18 @@ pub(crate) struct Cli {
     #[arg(long, value_name = "ADDR")]
     pub peer_listen: Option<std::net::SocketAddr>,
 
+    /// Also serve the API over TLS on 127.0.0.1 for the desktop app, with this host's
+    /// identity, and publish that listener's port and fingerprint in
+    /// `<data-dir>/identity.json`. The HTTP listener (`--port`) stays for browsers but
+    /// no longer answers the desktop bootstrap. Off when omitted.
+    #[arg(long)]
+    pub loopback_tls: bool,
+
+    /// Port of the loopback TLS listener (1024-65535, not `--port`); by default the OS
+    /// picks a free one. Needs `--loopback-tls`.
+    #[arg(long, value_name = "PORT", requires = "loopback_tls")]
+    pub loopback_tls_port: Option<u16>,
+
     /// Managed runtime resource source selection.
     #[arg(long, value_enum, default_value_t = ManagedResourcesModeArg::Download)]
     pub managed_resources_mode: ManagedResourcesModeArg,

@@ -101,6 +101,31 @@ pub struct ForkConversationRequest {
     pub name: Option<String>,
 }
 
+/// Body for `POST /api/conversations/{id}/handoff` (ADR-023).
+///
+/// Creates a NEW conversation for `target` seeded with the source's redacted
+/// dialog excerpt. The target stays in the source's workspace unless the owner
+/// explicitly sets `cross_project` and a workspace in `target.extra`.
+#[derive(Debug, Deserialize)]
+pub struct HandoffConversationRequest {
+    pub target: CreateConversationRequest,
+    /// Same key for the same source returns the same target.
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub cross_project: bool,
+}
+
+/// Response of `POST /api/conversations/{id}/handoff/preview`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HandoffPreviewResponse {
+    /// Redacted dialog-only excerpt (user and assistant text).
+    pub excerpt: String,
+    /// Dialog messages included.
+    pub turn_count: usize,
+    /// Older dialog or characters were left out.
+    pub truncated: bool,
+}
+
 /// Prompt media capability projection for one conversation, sourced from
 /// the effective `prompt_capabilities` projection (ACP handshake or constructed
 /// backend descriptor). `None` =

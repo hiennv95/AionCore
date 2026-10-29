@@ -3,6 +3,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Request extension the server adds to every request it accepted on the desktop
+/// loopback TLS listener (`--loopback-tls`). Only the server inserts it; nothing a
+/// client sends (headers, URI, address) can produce it. While that listener runs,
+/// credentials of a `desktop_app` device are accepted only on requests carrying it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ViaLoopbackTls;
+
 /// What kind of client a device is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

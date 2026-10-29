@@ -133,6 +133,7 @@ async fn non_desktop_readers_never_see_mcp_secrets() {
     }
 
     // A paired phone and the agent helper never see the secret, anywhere in the body.
+    common::ensure_conversation(&services, owner.as_str(), "conv-helper-mcp").await;
     let helper = services.runtime_token_service.issue(
         owner.as_str(),
         "conv-helper-mcp",

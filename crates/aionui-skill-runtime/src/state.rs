@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aionui_ai_agent::runtime_token::RuntimeTokenService;
+use aionui_ai_agent::HelperAccess;
 
 use crate::service::SkillRuntimeService;
 
@@ -9,5 +9,5 @@ use crate::service::SkillRuntimeService;
 #[derive(Clone)]
 pub struct SkillRuntimeRouterState {
     pub service: Arc<SkillRuntimeService>,
-    pub runtime_token_service: Arc<RuntimeTokenService>,
+    pub helper_access: Arc<HelperAccess>,
 }

@@ -98,8 +98,16 @@ pub fn skill_routes(state: SkillRouterState) -> Router {
             "/api/skills/scan",
             post(scan_for_skills).route_layer(from_fn(no_paired_devices)),
         )
-        .route("/api/skills/detect-paths", get(detect_paths))
-        .route("/api/skills/detect-external", get(detect_external))
+        // Discovery lists host skill config dirs and their contents: like scan, not
+        // for paired devices.
+        .route(
+            "/api/skills/detect-paths",
+            get(detect_paths).route_layer(from_fn(no_paired_devices)),
+        )
+        .route(
+            "/api/skills/detect-external",
+            get(detect_external).route_layer(from_fn(no_paired_devices)),
+        )
         // Built-in resources
         .route("/api/skills/builtin-rule", post(read_builtin_rule))
         .route("/api/skills/builtin-skill", post(read_builtin_skill))

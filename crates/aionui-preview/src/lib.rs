@@ -2,6 +2,7 @@
 
 //! Preview v1 (ADR-017): host-minted refs to files an agent produced in a chat, and reading them
 //! back as text, Markdown or images after re-checking they are still the file inside the chat folder.
+pub mod diff;
 pub mod error;
 pub mod kind;
 pub mod routes;

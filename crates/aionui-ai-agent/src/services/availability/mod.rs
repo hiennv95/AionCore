@@ -141,6 +141,12 @@ impl AgentAvailabilityService {
             .map_err(|error| AgentError::internal(format!("repo.get_for_user: {error}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
 
+        // A probe never sends a prompt, so it cannot see a used-up allowance:
+        // only a real turn may clear a recorded usage limit.
+        if existing.last_check_error_code.as_deref() == Some("usage_limit") && snapshot.kind != "session" {
+            return Ok(());
+        }
+
         let params = UpdateAgentAvailabilitySnapshotParams {
             last_check_status: Some(snapshot.status),
             last_check_kind: Some(snapshot.kind),
@@ -406,7 +412,10 @@ impl AgentAvailabilityFeedbackPort for AgentAvailabilityService {
 mod tests {
     use std::sync::Arc;
 
-    use super::{AgentAvailabilityService, explicit_probe_args, probe_aionrs_provider_readiness, run_probe};
+    use super::{
+        AgentAvailabilityService, AvailabilitySnapshot, explicit_probe_args, now_ms, probe_aionrs_provider_readiness,
+        run_probe,
+    };
     use crate::registry::AgentRegistry;
     use aionui_api_types::{
         AgentHandshake, AgentManagementStatus, AgentMetadata, AgentSnapshotCheckKind, AgentSnapshotCheckStatus,
@@ -610,6 +619,94 @@ mod tests {
         assert!(row.last_check_guidance.is_none());
         assert!(row.last_success_at.is_some());
         assert!(row.last_failure_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_probe_does_not_clear_a_usage_limit_only_a_turn_does() {
+        let db = init_database_memory().await.unwrap();
+        let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+
+        repo.upsert(&UpsertAgentMetadataParams {
+            id: "agent-usage-limit",
+            icon: None,
+            name: "Usage Limit Agent",
+            name_i18n: None,
+            description: None,
+            description_i18n: None,
+            backend: Some("claude"),
+            agent_type: "acp",
+            agent_source: "custom",
+            agent_source_info: Some(r#"{"binary_name":"cargo"}"#),
+            enabled: true,
+            command: Some("cargo"),
+            args: Some("[]"),
+            env: Some("[]"),
+            native_skills_dirs: None,
+            skill_delivery: None,
+            behavior_policy: None,
+            yolo_id: None,
+            agent_capabilities: None,
+            auth_methods: None,
+            config_options: None,
+            available_modes: None,
+            available_models: None,
+            available_commands: None,
+            sort_order: 100,
+        })
+        .await
+        .unwrap();
+
+        let registry = AgentRegistry::new(repo);
+        registry.hydrate().await.unwrap();
+
+        let provider_repo: Arc<dyn IProviderRepository> = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let service = AgentAvailabilityService::new(registry.clone(), provider_repo);
+        service
+            .record_session_failure(
+                TEST_USER_ID,
+                "agent-usage-limit",
+                "usage_limit",
+                "You've hit your usage limit. Try again at 6:51 PM.",
+            )
+            .await
+            .unwrap();
+        let probe = AvailabilitySnapshot {
+            status: "online",
+            kind: "manual",
+            error_code: None,
+            error_message: None,
+            guidance: None,
+            latency_ms: 5,
+            checked_at: now_ms(),
+        };
+        service
+            .persist_snapshot_for_user(TEST_USER_ID, "agent-usage-limit", &probe)
+            .await
+            .unwrap();
+        let row = service
+            .management_row_by_id(TEST_USER_ID, "agent-usage-limit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.last_check_error_code.as_deref(), Some("usage_limit"));
+        assert_eq!(
+            row.last_check_error_message.as_deref(),
+            Some("You've hit your usage limit. Try again at 6:51 PM.")
+        );
+        assert_eq!(row.last_check_kind, Some(AgentSnapshotCheckKind::Session));
+        assert!(row.installed, "a usage-limited agent stays installed and selectable");
+
+        service
+            .record_session_success(TEST_USER_ID, "agent-usage-limit")
+            .await
+            .unwrap();
+        let row = service
+            .management_row_by_id(TEST_USER_ID, "agent-usage-limit")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.last_check_error_code.is_none());
+        assert_eq!(row.last_check_status, Some(AgentSnapshotCheckStatus::Online));
     }
 
     #[tokio::test]

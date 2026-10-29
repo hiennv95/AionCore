@@ -12,7 +12,9 @@ use aionui_api_types::{
     ApiResponse, DocumentConversionRequest, PreviewUrlResponse, RefreshPreviewRequest, RefreshPreviewResponse,
     StartPreviewRequest, StopPreviewRequest,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, desktop_only, ensure_no_local_files};
+use aionui_auth::{
+    CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller, desktop_only, ensure_no_local_files,
+};
 use aionui_common::ApiError;
 use aionui_file::{FileError, path_safety::validate_path_with_extra_root};
 use axum::middleware::from_fn;
@@ -53,7 +55,9 @@ impl From<ProxyError> for ApiError {
 
 pub fn office_routes(state: OfficeRouterState) -> Router {
     // Starting a preview or converting reads a host document by path: desktop
-    // only until Preview adds scoped device reads (ADR-013).
+    // only until Preview adds scoped device reads (ADR-013). Starting or
+    // refreshing a watch only feeds the disabled proxies (Jev 055), so those are
+    // off too; stop stays so a running watch can still be cleaned up.
     let host_reads = Router::new()
         .route("/api/word-preview/start", post(start_word_preview))
         .route("/api/word-preview/refresh", post(refresh_word_preview))
@@ -61,6 +65,10 @@ pub fn office_routes(state: OfficeRouterState) -> Router {
         .route("/api/excel-preview/refresh", post(refresh_excel_preview))
         .route("/api/ppt-preview/start", post(start_ppt_preview))
         .route("/api/ppt-preview/refresh", post(refresh_ppt_preview))
+        .route_layer(from_fn(office_proxy_disabled))
+        .route_layer(from_fn(desktop_only));
+    // Conversion returns data, not same-origin HTML, so it stays available.
+    let conversion = Router::new()
         .route("/api/document/convert", post(convert_document))
         .route_layer(from_fn(desktop_only));
     Router::new()
@@ -68,7 +76,24 @@ pub fn office_routes(state: OfficeRouterState) -> Router {
         .route("/api/excel-preview/stop", post(stop_excel_preview))
         .route("/api/ppt-preview/stop", post(stop_ppt_preview))
         .merge(host_reads)
+        .merge(conversion)
         .with_state(state)
+}
+
+/// The proxies serve converter HTML on the app's own origin, where a hostile document's
+/// script could drive the whole API with the user's session. Owner decision (Jev 055):
+/// off until a client needs Office preview and an isolated design (capability token or
+/// separate origin) exists. The handlers stay so that redesign can reuse them.
+async fn office_proxy_disabled(
+    _request: axum::extract::Request,
+    _next: axum::middleware::Next,
+) -> Result<Response, ApiError> {
+    Err(ApiError::coded(
+        StatusCode::GONE,
+        "OFFICE_PROXY_DISABLED",
+        "Office document preview is turned off on this host.",
+        None,
+    ))
 }
 
 /// The proxies serve the documents the desktop opened for preview, so they are host reads
@@ -79,6 +104,9 @@ pub fn office_proxy_routes(state: OfficeRouterState) -> Router {
         .route("/api/ppt-proxy/{port}/{*path}", get(ppt_proxy))
         .route("/api/office-watch-proxy/{port}", get(office_watch_proxy))
         .route("/api/office-watch-proxy/{port}/{*path}", get(office_watch_proxy))
+        // Inner layer: authority is still checked first, so a phone or helper keeps
+        // getting FS_OWNER_ONLY and only the desktop learns the proxy is off.
+        .route_layer(from_fn(office_proxy_disabled))
         .route_layer(from_fn(desktop_only))
         .with_state(state)
 }
@@ -103,6 +131,7 @@ async fn stop_word_preview(
     State(state): State<OfficeRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
@@ -110,6 +139,7 @@ async fn stop_word_preview(
         state,
         &user.id,
         device.as_deref(),
+        deviceless.as_deref(),
         helper.as_deref(),
         body,
         DocType::Word,
@@ -137,6 +167,7 @@ async fn stop_excel_preview(
     State(state): State<OfficeRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
@@ -144,6 +175,7 @@ async fn stop_excel_preview(
         state,
         &user.id,
         device.as_deref(),
+        deviceless.as_deref(),
         helper.as_deref(),
         body,
         DocType::Excel,
@@ -171,6 +203,7 @@ async fn stop_ppt_preview(
     State(state): State<OfficeRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
@@ -178,6 +211,7 @@ async fn stop_ppt_preview(
         state,
         &user.id,
         device.as_deref(),
+        deviceless.as_deref(),
         helper.as_deref(),
         body,
         DocType::Ppt,
@@ -342,13 +376,14 @@ async fn stop_preview(
     state: OfficeRouterState,
     user_id: &str,
     device: Option<&CurrentDevice>,
+    deviceless: Option<&DevicelessSession>,
     helper: Option<&RuntimeHelperCaller>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     // Stop stays open to devices, but resolving a `Local` ref probes a host path.
-    ensure_no_local_files(req.file.iter(), device, helper)?;
+    ensure_no_local_files(req.file.iter(), device, deviceless, helper)?;
     // Resolve the same identity `start_preview` used so `stop_for_user` derives
     // the same session key (watch_manager re-canonicalizes internally). Prefer
     // the ChatFileRef; fall back to the legacy device path. Post-migration the

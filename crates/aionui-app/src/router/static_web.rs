@@ -189,11 +189,15 @@ pub fn with_static_web_clients(router: Router, root_dir: Option<&Path>, legacy_d
 
                         // Check containment and symlink escape.
                         if !subpath.is_empty() {
-                            let target = legacy_path.join(subpath);
+                            // Check the decoded path, which is what ServeDir opens (audit H3).
+                            let Some(subpath) = percent_decode(subpath) else {
+                                return StatusCode::NOT_FOUND.into_response();
+                            };
+                            let target = legacy_path.join(&subpath);
                             if !is_path_contained_in(canonical_legacy, &target) {
                                 return StatusCode::NOT_FOUND.into_response();
                             }
-                            if is_missing_asset(legacy_path, subpath) {
+                            if is_missing_asset(legacy_path, &subpath) {
                                 return StatusCode::NOT_FOUND.into_response();
                             }
                         }
@@ -232,11 +236,15 @@ pub fn with_static_web_clients(router: Router, root_dir: Option<&Path>, legacy_d
 
                     let subpath = path.trim_start_matches('/');
                     if !subpath.is_empty() {
-                        let target = root_path.join(subpath);
+                        // Check the decoded path, which is what ServeDir opens (audit H3).
+                        let Some(subpath) = percent_decode(subpath) else {
+                            return StatusCode::NOT_FOUND.into_response();
+                        };
+                        let target = root_path.join(&subpath);
                         if !is_path_contained_in(canonical_root, &target) {
                             return StatusCode::NOT_FOUND.into_response();
                         }
-                        if is_missing_asset(root_path, subpath) {
+                        if is_missing_asset(root_path, &subpath) {
                             return StatusCode::NOT_FOUND.into_response();
                         }
                     }
@@ -469,6 +477,44 @@ mod tests {
             response.headers().get(header::LOCATION).unwrap(),
             "/legacy/?redirect=%2Fconversation%2F1"
         );
+    }
+
+    /// Audit H3: containment must check the percent-decoded path ServeDir will open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn encoded_symlink_and_traversal_requests_do_not_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "TOP-SECRET").unwrap();
+        std::fs::write(outside.path().join("SECRET"), "TOP-SECRET").unwrap();
+        let root = web_dir();
+        let legacy = legacy_dir();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("my link")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), legacy.path().join("my link")).unwrap();
+        let router = dual_app(root.path(), legacy.path());
+        for path in [
+            "/my%20link/secret.txt",
+            "/my%20link/SECRET",
+            "/legacy/my%20link/secret.txt",
+            "/legacy/my%20link/SECRET",
+            "/%2e%2e/%2e%2e/etc/passwd",
+            "/assets/%2e%2e%2f%2e%2e%2fetc/passwd",
+            "/legacy/%2e%2e%2fsecret.txt",
+        ] {
+            let (status, body, _) = get_path(router.clone(), path).await;
+            assert!(!body.contains("TOP-SECRET") && !body.contains("root:"), "{path}");
+            assert_ne!(status, StatusCode::OK, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn encoded_asset_names_and_deep_links_still_work() {
+        let root = web_dir();
+        std::fs::write(root.path().join("assets/my file.js"), "spaced").unwrap();
+        let router = app(root.path());
+        let (status, body, _) = get_path(router.clone(), "/assets/my%20file.js").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "spaced"));
+        let (status, body, _) = get_path(router, "/c/caf%C3%A9%20chat").await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, "<html>spa</html>"));
     }
 
     #[tokio::test]

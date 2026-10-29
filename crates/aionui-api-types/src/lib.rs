@@ -103,9 +103,10 @@ pub use conversation::{
     ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
-    ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
-    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    HandoffConversationRequest, HandoffPreviewResponse, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot,
+    MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload,
+    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,
@@ -126,7 +127,7 @@ pub use custom_agent::{
 pub use device::{
     AppSessionRequest, ClaimRequest, ClaimResponse, CreatePairingResponse, DeviceKind, DeviceListenerInfo,
     DeviceListenerStatus, DeviceSession, DeviceView, HostProofRequest, HostProofResponse, PairRequest, PairResponse,
-    PairingState, PairingView, UpdateDeviceListenerRequest,
+    PairingState, PairingView, UpdateDeviceListenerRequest, ViaLoopbackTls,
 };
 pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,
@@ -164,7 +165,9 @@ pub use office::{
     ExcelSheetData, ExcelSheetImage, ExcelWorkbookData, PptJsonData, PptSlideData, PreviewState, PreviewStatusEvent,
     PreviewUrlResponse, RefreshPreviewRequest, RefreshPreviewResponse, StartPreviewRequest, StopPreviewRequest,
 };
-pub use preview::{ConversationFileView, FilePreviewSettings, PreviewKind};
+pub use preview::{
+    ConversationFileView, FileDiffBase, FileDiffSource, FileDiffStatus, FileDiffView, FilePreviewSettings, PreviewKind,
+};
 pub use project::{
     AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest, ResolveRefResponse,
 };

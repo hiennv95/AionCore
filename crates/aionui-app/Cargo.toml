@@ -94,5 +94,6 @@ sqlx = { workspace = true, features = ["migrate"] }
 tempfile = "3"
 tower = { workspace = true, features = ["util"] }
 tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
 futures-util.workspace = true
 wiremock = "0.6"

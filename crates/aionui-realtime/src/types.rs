@@ -150,6 +150,9 @@ pub struct WsPrincipal {
     /// Message names this connection may not send (e.g. host file frames for
     /// paired phones and browsers, ADR-013). Chosen by the app's resolver.
     pub denied_frames: &'static [&'static str],
+    /// The connection is accepted only if it came through the desktop loopback TLS
+    /// listener (server-injected `ViaLoopbackTls`). Chosen by the app's resolver.
+    pub requires_loopback_tls: bool,
 }
 
 impl WsPrincipal {
@@ -158,6 +161,7 @@ impl WsPrincipal {
         Self {
             user_id: user_id.into(),
             denied_frames: &[],
+            requires_loopback_tls: false,
         }
     }
 }

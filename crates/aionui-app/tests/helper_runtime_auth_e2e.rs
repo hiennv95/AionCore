@@ -4,6 +4,8 @@
 //! helper cannot carry a JWT, so it authenticates through the runtime-token
 //! channel with a conversation-helper-scoped token minted by the backend.
 
+mod common;
+
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
@@ -65,6 +67,7 @@ async fn body_json(resp: axum::response::Response) -> Value {
 #[tokio::test]
 async fn helper_token_channel_passes_auth_and_reaches_cron_domain() {
     let (app, services, user_id) = build_aionpro_app().await;
+    common::ensure_conversation(&services, user_id.as_str(), CONVERSATION_ID).await;
     let issue = services.runtime_token_service.issue(
         user_id.as_str(),
         CONVERSATION_ID,
@@ -107,6 +110,7 @@ async fn helper_token_channel_reads_owned_conversation() {
     .execute(services.database.pool())
     .await
     .unwrap();
+    common::ensure_conversation(&services, user_id.as_str(), CONVERSATION_ID).await;
     let issue = services.runtime_token_service.issue(
         user_id.as_str(),
         CONVERSATION_ID,
@@ -155,6 +159,7 @@ async fn helper_without_token_is_rejected_in_aionpro_mode() {
 #[tokio::test]
 async fn helper_token_bound_to_other_user_is_rejected() {
     let (app, services, user_id) = build_aionpro_app().await;
+    common::ensure_conversation(&services, user_id.as_str(), CONVERSATION_ID).await;
     let issue = services.runtime_token_service.issue(
         user_id.as_str(),
         CONVERSATION_ID,
@@ -209,6 +214,7 @@ async fn helper_token_bound_to_other_conversation_is_rejected() {
 #[tokio::test]
 async fn team_scoped_token_cannot_use_helper_channel() {
     let (app, services, user_id) = build_aionpro_app().await;
+    common::ensure_conversation(&services, user_id.as_str(), CONVERSATION_ID).await;
     let issue = services.runtime_token_service.issue(
         user_id.as_str(),
         CONVERSATION_ID,
@@ -236,6 +242,7 @@ async fn team_scoped_token_cannot_use_helper_channel() {
 #[tokio::test]
 async fn helper_write_request_is_exempt_from_csrf() {
     let (app, services, user_id) = build_aionpro_app().await;
+    common::ensure_conversation(&services, user_id.as_str(), CONVERSATION_ID).await;
     let issue = services.runtime_token_service.issue(
         user_id.as_str(),
         CONVERSATION_ID,

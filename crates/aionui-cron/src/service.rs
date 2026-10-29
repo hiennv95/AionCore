@@ -76,8 +76,9 @@ pub struct CronServiceDeps {
     pub data_dir: PathBuf,
 }
 
-/// Scheduled jobs force a full-auto mode, so they never attach to a LAN share,
-/// which keeps its fixed mode (ADR-009, audit run-2 SEC-F).
+/// Owner-created jobs can force a full-auto mode and a helper's job inherits its
+/// conversation's mode, so no job attaches to a LAN share, which keeps its own fixed
+/// mode (ADR-009, audit run-2 SEC-F).
 fn refuse_lan_share(row: &aionui_db::models::ConversationRow) -> Result<(), CronError> {
     if aionui_conversation::lan_share_mode(&row.extra).is_some() {
         return Err(CronError::InvalidAgentConfig(
@@ -108,7 +109,70 @@ impl CronService {
     // -----------------------------------------------------------------------
 
     pub async fn add_job(&self, user_id: &str, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
-        self.add_job_internal(user_id, req, None, None).await
+        self.add_job_internal(user_id, req, None, None, false).await
+    }
+
+    /// C4 (Jev 056): an agent helper creates jobs only in its own conversation,
+    /// which then run in that conversation's own mode, never a forced full-auto.
+    pub async fn add_job_for_helper(
+        &self,
+        user_id: &str,
+        helper_conversation_id: &str,
+        req: CreateCronJobRequest,
+    ) -> Result<CronJob, CronError> {
+        if req.conversation_id.trim() != helper_conversation_id {
+            return Err(CronError::HelperScope(
+                "an agent can only schedule jobs in its own conversation".into(),
+            ));
+        }
+        if req.agent_config.is_some()
+            || !matches!(
+                parse_execution_mode(req.execution_mode.as_deref())?,
+                ExecutionMode::Existing
+            )
+        {
+            return Err(CronError::HelperScope(
+                "an agent cannot choose the execution mode or agent of a job".into(),
+            ));
+        }
+        let row = self
+            .executor
+            .get_conversation_row_for_user(user_id, helper_conversation_id)
+            .await?
+            .ok_or_else(|| {
+                CronError::Conversation(aionui_conversation::ConversationError::NotFound {
+                    id: helper_conversation_id.to_owned(),
+                })
+            })?;
+        refuse_lan_share(&row)?;
+        let (agent_type, agent_config, backend_override) = self.build_agent_config_from_conversation(&row).await;
+        let req = CreateCronJobRequest { agent_config, ..req };
+        self.add_job_internal(user_id, req, Some(agent_type), backend_override, true)
+            .await
+    }
+
+    /// Loads a job for an agent helper. Jobs of other conversations stay
+    /// hidden; a job armed with a forced mode is refused unless the request
+    /// only reads, pauses or removes it (C4, Jev 056).
+    pub async fn job_for_helper(
+        &self,
+        user_id: &str,
+        helper_conversation_id: &str,
+        job_id: &str,
+        changes_run: bool,
+    ) -> Result<CronJob, CronError> {
+        let job = self.get_job(user_id, job_id).await?;
+        if job.conversation_id != helper_conversation_id {
+            return Err(CronError::JobNotFound(job_id.to_owned()));
+        }
+        // Any pinned mode (full-auto or not) was set by the owner, not inherited from
+        // this conversation, so the helper may not run or change the job.
+        if changes_run && job.agent_config.as_ref().is_some_and(|config| config.mode.is_some()) {
+            return Err(CronError::HelperScope(
+                "this job forces its own agent mode; change or run it from the desktop app".into(),
+            ));
+        }
+        Ok(job)
     }
 
     pub async fn create_for_conversation_helper(
@@ -141,7 +205,7 @@ impl CronService {
         };
 
         let job = self
-            .add_job_internal(user_id, create_req, Some(agent_type), assistant_backend_override)
+            .add_job_internal(user_id, create_req, Some(agent_type), assistant_backend_override, true)
             .await?;
         if let Err(err) = self
             .executor
@@ -201,10 +265,7 @@ impl CronService {
         self.verify_conversation_helper_context(user_id, conversation_id)
             .await?;
 
-        let existing = self.get_job(user_id, job_id).await?;
-        if existing.conversation_id != conversation_id {
-            return Err(CronError::JobNotFound(job_id.to_owned()));
-        }
+        self.job_for_helper(user_id, conversation_id, job_id, true).await?;
 
         let job = self
             .update_job(
@@ -270,6 +331,7 @@ impl CronService {
         req: CreateCronJobRequest,
         runtime_agent_type: Option<String>,
         assistant_backend_override: Option<String>,
+        from_helper: bool,
     ) -> Result<CronJob, CronError> {
         let schedule = with_host_timezone(schedule_from_dto(&req.schedule));
         validate_schedule(&schedule)?;
@@ -289,6 +351,9 @@ impl CronService {
         if matches!(execution_mode, ExecutionMode::Existing) {
             self.require_existing_conversation_scope(user_id, conversation_id)
                 .await?;
+        } else {
+            self.refuse_foreign_conversation_anchor(user_id, conversation_id)
+                .await?;
         }
 
         let agent_config = match req.agent_config {
@@ -303,6 +368,11 @@ impl CronService {
             ),
             None => None,
         };
+        // A helper's job keeps the conversation's own mode: no forced full-auto (C4).
+        let agent_config = agent_config.map(|config| CronAgentConfig {
+            mode: if from_helper { None } else { config.mode },
+            ..config
+        });
 
         let now = now_ms();
         let next_run_at = compute_next_run(&schedule, now);
@@ -358,7 +428,14 @@ impl CronService {
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
         let mut job = cron_job_from_row(existing_row)?;
-        job.agent_type = self.resolve_job_agent_type(&job).await?;
+        // A pure pause only stops future runs, so it must work even when the job's
+        // assistant or workspace has since been removed (audit H20).
+        let pause_only = is_pause_only(&req);
+        job.agent_type = match self.resolve_job_agent_type(&job).await {
+            Ok(agent_type) => agent_type,
+            Err(_) if pause_only => job.agent_type.clone(),
+            Err(err) => return Err(err),
+        };
         let original_execution_mode = job.execution_mode;
         let original_conversation_id = job.conversation_id.clone();
         let mut clear_conversation_binding = false;
@@ -444,7 +521,9 @@ impl CronService {
         }
 
         job.updated_at = now_ms();
-        self.validate_job_workspace(&job).await?;
+        if !pause_only {
+            self.validate_job_workspace(&job).await?;
+        }
 
         let mut params = build_update_params(&job, &req);
         if clear_conversation_binding {
@@ -1062,6 +1141,19 @@ impl CronService {
             ));
         }
         refuse_lan_share(&row)
+    }
+
+    /// A NewConversation job keeps its conversation id only as an anchor, and a stale
+    /// (missing) one is allowed. An anchor that does exist must still be the caller's
+    /// own non-LAN-share conversation (audit H19).
+    async fn refuse_foreign_conversation_anchor(&self, user_id: &str, conversation_id: &str) -> Result<(), CronError> {
+        if conversation_id.is_empty() {
+            return Ok(());
+        }
+        match self.executor.get_conversation_row(conversation_id).await? {
+            None => Ok(()),
+            Some(_) => self.require_existing_conversation_scope(user_id, conversation_id).await,
+        }
     }
 
     async fn is_team_conversation_job(&self, job: &CronJob) -> Result<bool, CronError> {
@@ -2426,6 +2518,33 @@ fn schedule_to_row_fields(schedule: &CronSchedule) -> (String, String, Option<St
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// The request only sets `enabled: false` and changes nothing else: the one change a
+/// paired device may make (routes), and a pause that skips assistant/workspace checks.
+pub(crate) fn is_pause_only(req: &UpdateCronJobRequest) -> bool {
+    let UpdateCronJobRequest {
+        name,
+        description,
+        enabled,
+        schedule,
+        message,
+        execution_mode,
+        agent_config,
+        conversation_title,
+        max_retries,
+        queue_enabled,
+    } = req;
+    *enabled == Some(false)
+        && name.is_none()
+        && description.is_none()
+        && schedule.is_none()
+        && message.is_none()
+        && execution_mode.is_none()
+        && agent_config.is_none()
+        && conversation_title.is_none()
+        && max_retries.is_none()
+        && queue_enabled.is_none()
+}
 
 #[cfg(test)]
 mod tests {

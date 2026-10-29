@@ -133,8 +133,8 @@ async fn version_check_github_error_with_auth() {
 
 #[tokio::test]
 async fn full_system_flow_e2e() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // 1. Get default settings
     let resp = app

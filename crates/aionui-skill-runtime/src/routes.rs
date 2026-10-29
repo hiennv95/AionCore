@@ -14,8 +14,7 @@
 //! the read-write management surface; letting a runtime token reach it would hand
 //! an agent authority over the whole installation's skills.
 
-use aionui_ai_agent::TEAM_RUNTIME_TOKEN_SESSION_GENERATION;
-use aionui_ai_agent::runtime_token::RuntimeTokenScope;
+use aionui_ai_agent::HelperUse;
 use aionui_api_types::{
     RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListResponse, RuntimeSkillShowResponse,
     SkillRuntimeEnvelope, SkillRuntimeErrorCode, SkillRuntimeErrorPayload,
@@ -48,23 +47,19 @@ struct RuntimeCaller {
 
 /// Shared preamble for every route. The token is validated against BOTH the user
 /// and the conversation, so a token minted for one conversation cannot read
-/// another's skills even within the same user.
-fn runtime_caller(state: &SkillRuntimeRouterState, headers: &HeaderMap) -> Result<RuntimeCaller, SkillRuntimeError> {
+/// another's skills even within the same user. Skill reads are the one helper use a
+/// LAN-share conversation keeps.
+async fn runtime_caller(
+    state: &SkillRuntimeRouterState,
+    headers: &HeaderMap,
+) -> Result<RuntimeCaller, SkillRuntimeError> {
     let user_id = required_header(headers, HEADER_USER_ID)?;
     let conversation_id = required_header(headers, HEADER_CONVERSATION_ID)?;
     let token = required_header(headers, HEADER_RUNTIME_TOKEN)?;
     state
-        .runtime_token_service
-        .validate(
-            Some(&token),
-            &user_id,
-            &conversation_id,
-            RuntimeTokenScope::ConversationHelper,
-            // Despite the `TEAM_` prefix this is not team-specific: every
-            // conversation's helper token is issued with this same constant
-            // (value "default"), and passing anything else fails validation.
-            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-        )
+        .helper_access
+        .authorize(Some(&token), &user_id, &conversation_id, HelperUse::ReadSkills)
+        .await
         .map_err(|_| SkillRuntimeError::RuntimeAuthFailed)?;
     Ok(RuntimeCaller {
         user_id,
@@ -87,7 +82,7 @@ async fn list(
     headers: HeaderMap,
 ) -> (StatusCode, Json<SkillRuntimeEnvelope<RuntimeSkillListResponse>>) {
     let command = Some("skills list".to_owned());
-    let caller = match runtime_caller(&state, &headers) {
+    let caller = match runtime_caller(&state, &headers).await {
         Ok(caller) => caller,
         Err(error) => return envelope_failure(error, command),
     };
@@ -103,7 +98,7 @@ async fn show(
     Path(name): Path<String>,
 ) -> (StatusCode, Json<SkillRuntimeEnvelope<RuntimeSkillShowResponse>>) {
     let command = Some("skills show".to_owned());
-    let caller = match runtime_caller(&state, &headers) {
+    let caller = match runtime_caller(&state, &headers).await {
         Ok(caller) => caller,
         Err(error) => return envelope_failure(error, command),
     };
@@ -124,7 +119,7 @@ async fn read_file(
     Query(query): Query<RuntimeSkillFileQuery>,
 ) -> (StatusCode, Json<SkillRuntimeEnvelope<RuntimeSkillFileResponse>>) {
     let command = Some("skills cat".to_owned());
-    let caller = match runtime_caller(&state, &headers) {
+    let caller = match runtime_caller(&state, &headers).await {
         Ok(caller) => caller,
         Err(error) => return envelope_failure(error, command),
     };

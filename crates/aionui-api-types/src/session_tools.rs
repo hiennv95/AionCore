@@ -137,8 +137,27 @@ pub enum SessionToolErrorCode {
     RateLimited,
     FeatureDisabled,
     RuntimeAuthFailed,
+    /// The caller is the helper of a LAN-share conversation, which may only read skills.
+    HelperNotForLanShare,
     SchemaValidationFailed,
     TransportUnavailable,
+}
+
+impl SessionToolErrorCode {
+    /// Every code, in declaration order. `capabilities` documents exactly this list.
+    pub const ALL: [Self; 11] = [
+        Self::TargetNotFound,
+        Self::TargetIsTeam,
+        Self::SenderIsTeam,
+        Self::TargetIsSelf,
+        Self::QueueFull,
+        Self::RateLimited,
+        Self::FeatureDisabled,
+        Self::RuntimeAuthFailed,
+        Self::HelperNotForLanShare,
+        Self::SchemaValidationFailed,
+        Self::TransportUnavailable,
+    ];
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -366,18 +385,7 @@ mod tests {
     fn every_error_code_has_a_distinct_wire_value() {
         // The CLI envelope, the routes, and every bad-path test assert on these
         // strings, so a duplicate would silently collapse two failure modes.
-        let codes = [
-            SessionToolErrorCode::TargetNotFound,
-            SessionToolErrorCode::TargetIsTeam,
-            SessionToolErrorCode::SenderIsTeam,
-            SessionToolErrorCode::TargetIsSelf,
-            SessionToolErrorCode::QueueFull,
-            SessionToolErrorCode::RateLimited,
-            SessionToolErrorCode::FeatureDisabled,
-            SessionToolErrorCode::RuntimeAuthFailed,
-            SessionToolErrorCode::SchemaValidationFailed,
-            SessionToolErrorCode::TransportUnavailable,
-        ];
+        let codes = SessionToolErrorCode::ALL;
         let mut wire: Vec<String> = codes
             .iter()
             .map(|code| serde_json::to_value(code).unwrap().as_str().unwrap().to_owned())

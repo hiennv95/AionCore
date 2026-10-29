@@ -66,6 +66,9 @@ pub(crate) enum RefreshError {
     /// An older refresh token of a rotation grant was presented; the grant is
     /// revoked (ADR-022). `401 REFRESH_TOKEN_REUSED`.
     Replayed,
+    /// A desktop app's refresh token outside the loopback TLS listener while it runs.
+    /// `403 DESKTOP_REQUIRES_LOOPBACK_TLS`; refused before the grant is touched.
+    DesktopRequiresLoopbackTls,
     /// Backend failure — user lookup or token signing. Maps to `500`.
     Internal(&'static str),
 }

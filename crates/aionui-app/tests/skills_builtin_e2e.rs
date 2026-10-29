@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use common::{body_json, get_with_token, json_with_token, setup_and_login};
+use common::{body_json, get_with_token, json_with_token};
 
 // ---------------------------------------------------------------------------
 // Fixture — build router with embedded-corpus paths rooted at a temp dir
@@ -55,7 +55,7 @@ async fn fixture_embedded() -> Fixture {
         .expect("failed to materialize embedded builtin skills for test fixture");
 
     let db = init_database_memory().await.unwrap();
-    let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
+    let services = aionui_app::AppServices::from_config(db, &common::scratch_config())
         .await
         .unwrap();
     let (mut states, _): (ModuleStates, _) = build_module_states(&services).await.expect("build module states");
@@ -84,8 +84,8 @@ async fn fixture_embedded() -> Fixture {
         .await
         .expect("sync embedded builtin skill catalog");
 
-    let mut app = create_router_with_states(&services, states);
-    let (token, csrf) = setup_and_login(&mut app, &services, "builtin-e2e", "StrongP@ss1").await;
+    let app = create_router_with_states(&services, states);
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     Fixture {
         app,

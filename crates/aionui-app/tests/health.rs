@@ -162,3 +162,24 @@ async fn office_proxy_routes_allow_same_origin_framing() {
         );
     }
 }
+
+// SRE readiness (Jev 028, degraded-200): /health stays 200 so launchers keep their
+// "is the process up" signal, but reports the database it cannot reach.
+#[tokio::test]
+async fn health_reports_degraded_when_the_database_is_unreachable() {
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let app = aionui_app::create_router(&services).await.expect("build router");
+
+    let response = app.clone().oneshot(build_request("GET", "/health")).await.unwrap();
+    let json = response_json(response.into_body()).await;
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["checks"]["database"], "ok");
+
+    services.database.close().await;
+    let response = app.oneshot(build_request("GET", "/health")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response.into_body()).await;
+    assert_eq!(json["status"], "degraded");
+    assert_eq!(json["checks"]["database"], "error");
+}

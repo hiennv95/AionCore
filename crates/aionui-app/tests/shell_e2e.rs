@@ -109,8 +109,8 @@ async fn set_stt_config_at_key(app: &mut axum::Router, token: &str, csrf: &str, 
 // SH-2: open-file — file not found
 #[tokio::test]
 async fn sh2_open_file_not_found() {
-    let (mut app, services) = build_app_with_noop_opener().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_noop_opener().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -128,8 +128,8 @@ async fn sh2_open_file_not_found() {
 // SH-4: show-item-in-folder — path not found
 #[tokio::test]
 async fn sh4_show_item_in_folder_not_found() {
-    let (mut app, services) = build_app_with_noop_opener().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_noop_opener().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -145,8 +145,8 @@ async fn sh4_show_item_in_folder_not_found() {
 // SH-6: open-external — command injection attempt
 #[tokio::test]
 async fn sh6_open_external_command_injection() {
-    let (mut app, services) = build_app_with_noop_opener().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_noop_opener().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -164,8 +164,8 @@ async fn sh6_open_external_command_injection() {
 // SH-7: open-external — disallowed scheme
 #[tokio::test]
 async fn sh7_open_external_file_scheme() {
-    let (mut app, services) = build_app_with_noop_opener().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_noop_opener().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -241,8 +241,8 @@ async fn sh10_check_tool_vscode() {
 // SH-12: open-folder-with — directory not found
 #[tokio::test]
 async fn sh12_open_folder_with_nonexistent() {
-    let (mut app, services) = build_app_with_noop_opener().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_noop_opener().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -258,8 +258,8 @@ async fn sh12_open_folder_with_nonexistent() {
 // SH-13: open-file — missing filePath
 #[tokio::test]
 async fn sh13_open_file_missing_field() {
-    let (mut app, services) = build_app_with_noop_opener().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_noop_opener().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/shell/open-file", json!({}), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -269,8 +269,8 @@ async fn sh13_open_file_missing_field() {
 // SH-14: open-external — empty URL
 #[tokio::test]
 async fn sh14_open_external_empty_url() {
-    let (mut app, services) = build_app_with_noop_opener().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_noop_opener().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/shell/open-external", json!({ "url": "" }), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -719,8 +719,8 @@ async fn au2_stt_unauthenticated() {
 // M-145: mailto scheme URL positive test
 #[tokio::test]
 async fn sh_open_external_mailto_scheme() {
-    let (mut app, services) = build_app_with_noop_opener().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_noop_opener().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",

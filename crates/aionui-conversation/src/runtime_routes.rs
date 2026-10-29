@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use aionui_ai_agent::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+use aionui_ai_agent::{HelperAccess, HelperDenied, HelperUse};
 use aionui_api_types::{
     ConversationCliEnvelope, ConversationCreateRequest, ConversationCreateResponse, ConversationToolErrorCode,
     ConversationToolErrorPayload,
@@ -32,7 +32,7 @@ const COMMAND: &str = "conversation create";
 #[derive(Clone)]
 pub struct ConversationRuntimeRouterState {
     pub service: ConversationService,
-    pub runtime_token_service: Arc<RuntimeTokenService>,
+    pub helper_access: Arc<HelperAccess>,
 }
 
 pub fn conversation_runtime_routes(state: ConversationRuntimeRouterState) -> Router {
@@ -46,23 +46,19 @@ struct RuntimeCaller {
     conversation_id: String,
 }
 
-fn runtime_caller(state: &ConversationRuntimeRouterState, headers: &HeaderMap) -> Option<RuntimeCaller> {
-    let user_id = required_header(headers, HEADER_USER_ID)?;
-    let conversation_id = required_header(headers, HEADER_CONVERSATION_ID)?;
-    let token = required_header(headers, HEADER_RUNTIME_TOKEN)?;
+async fn runtime_caller(
+    state: &ConversationRuntimeRouterState,
+    headers: &HeaderMap,
+) -> Result<RuntimeCaller, HelperDenied> {
+    let header = |name| required_header(headers, name).ok_or(HelperDenied::Unauthenticated);
+    let user_id = header(HEADER_USER_ID)?;
+    let conversation_id = header(HEADER_CONVERSATION_ID)?;
+    let token = header(HEADER_RUNTIME_TOKEN)?;
     state
-        .runtime_token_service
-        .validate(
-            Some(&token),
-            &user_id,
-            &conversation_id,
-            RuntimeTokenScope::ConversationHelper,
-            // Every conversation's helper token is issued with this constant;
-            // despite the prefix it is not team-specific.
-            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-        )
-        .ok()?;
-    Some(RuntimeCaller {
+        .helper_access
+        .authorize(Some(&token), &user_id, &conversation_id, HelperUse::Other)
+        .await?;
+    Ok(RuntimeCaller {
         user_id,
         conversation_id,
     })
@@ -84,17 +80,38 @@ async fn create(
     headers: HeaderMap,
     body: Result<Json<ConversationCreateRequest>, JsonRejection>,
 ) -> Reply {
-    let Some(caller) = runtime_caller(&state, &headers) else {
-        // No header values are logged — the token must never reach the logs.
-        warn!(
-            outcome = "rejected",
-            error_code = "runtime_auth_failed",
-            "agent conversation create refused"
-        );
-        return failure(
-            StatusCode::UNAUTHORIZED,
-            ConversationToolErrorPayload::new(ConversationToolErrorCode::RuntimeAuthFailed, "runtime auth failed"),
-        );
+    let caller = match runtime_caller(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(HelperDenied::LanShare) => {
+            return failure(
+                StatusCode::FORBIDDEN,
+                ConversationToolErrorPayload::new(
+                    ConversationToolErrorCode::HelperNotForLanShare,
+                    "an agent in a LAN share can only read skills",
+                ),
+            );
+        }
+        Err(HelperDenied::ConversationGone) => {
+            return failure(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ConversationToolErrorPayload::new(
+                    ConversationToolErrorCode::TransportUnavailable,
+                    "the calling conversation no longer exists",
+                ),
+            );
+        }
+        Err(_) => {
+            // No header values are logged — the token must never reach the logs.
+            warn!(
+                outcome = "rejected",
+                error_code = "runtime_auth_failed",
+                "agent conversation create refused"
+            );
+            return failure(
+                StatusCode::UNAUTHORIZED,
+                ConversationToolErrorPayload::new(ConversationToolErrorCode::RuntimeAuthFailed, "runtime auth failed"),
+            );
+        }
     };
     // Body parsing is deliberately AFTER auth so an unauthenticated caller
     // learns nothing about the schema; `deny_unknown_fields` on the request

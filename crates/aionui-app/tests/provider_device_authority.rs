@@ -125,6 +125,7 @@ async fn paired_devices_and_the_helper_see_masked_providers_and_cannot_change_or
     let target_url = format!("http://{}", target.local_addr().unwrap());
 
     let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
+    common::ensure_conversation(&services, owner.as_str(), "conv-helper-providers").await;
     let helper = services.runtime_token_service.issue(
         owner.as_str(),
         "conv-helper-providers",

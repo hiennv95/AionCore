@@ -2730,7 +2730,9 @@ async fn create_for_conversation_helper_keeps_conversation_extra_mode_unchanged(
 
     let row = cron_repo.get_by_id_system(&response.job_id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
-    assert_eq!(config.mode.as_deref(), Some("yolo"));
+    // C4 (Jev 056, owner decision 2026-10-29): a helper job keeps the
+    // conversation's own mode; it never carries a forced full-auto mode.
+    assert_eq!(config.mode, None);
 
     let bound = conv_repo.get("u1", "conv_mode_default").await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&bound.extra).unwrap();
@@ -2741,7 +2743,7 @@ async fn create_for_conversation_helper_keeps_conversation_extra_mode_unchanged(
 }
 
 #[tokio::test]
-async fn create_for_conversation_helper_uses_assistant_metadata_full_auto_mode() {
+async fn create_for_conversation_helper_ignores_assistant_metadata_full_auto_mode() {
     let (svc, cron_repo, _, _, conv_service) = setup_with_conv_runtime().await;
     let runtime_state = conv_service.runtime_state();
     let _claim = runtime_state
@@ -2759,11 +2761,13 @@ async fn create_for_conversation_helper_uses_assistant_metadata_full_auto_mode()
 
     let row = cron_repo.get_by_id_system(&response.job_id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
-    assert_eq!(config.mode.as_deref(), Some("agent-full-access"));
+    // C4 (Jev 056, owner decision 2026-10-29): a helper job keeps the
+    // conversation's own mode; it never carries a forced full-auto mode.
+    assert_eq!(config.mode, None);
 }
 
 #[tokio::test]
-async fn create_for_conversation_helper_uses_codex_canonical_full_auto_mode_from_fallback() {
+async fn create_for_conversation_helper_ignores_codex_fallback_full_auto_mode() {
     let (svc, cron_repo, _, _, conv_service, agent_metadata_repo, _) =
         setup_with_conv_runtime_and_agent_metadata().await;
     let codex = agent_metadata_repo
@@ -2818,7 +2822,9 @@ async fn create_for_conversation_helper_uses_codex_canonical_full_auto_mode_from
 
     let row = cron_repo.get_by_id_system(&response.job_id).await.unwrap().unwrap();
     let config: CronAgentConfig = serde_json::from_str(row.agent_config.as_deref().unwrap()).unwrap();
-    assert_eq!(config.mode.as_deref(), Some("agent-full-access"));
+    // C4 (Jev 056, owner decision 2026-10-29): a helper job keeps the
+    // conversation's own mode; it never carries a forced full-auto mode.
+    assert_eq!(config.mode, None);
 }
 
 #[tokio::test]
@@ -3688,7 +3694,7 @@ fn switch_to_existing() -> UpdateCronJobRequest {
 /// update must too, or a job can be moved onto a LAN share afterwards.
 #[tokio::test]
 async fn update_cannot_move_a_job_onto_a_lan_share_conversation() {
-    let (svc, _repo, _bc, conv_repo) = setup_with_conv_repo().await;
+    let (svc, cron_repo, _bc, conv_repo) = setup_with_conv_repo().await;
     conv_repo
         .create(&conversation_row(
             "conv_lan_share",
@@ -3697,10 +3703,12 @@ async fn update_cannot_move_a_job_onto_a_lan_share_conversation() {
         ))
         .await
         .unwrap();
-    let mut req = make_create_req("Fresh runs", every_60s());
-    req.conversation_id = "conv_lan_share".into();
-    req.execution_mode = Some("new_conversation".into());
-    let job = svc.add_job("u1", req).await.unwrap();
+    // add_job now refuses this anchor (H19); a row written before that check still
+    // exists, so seed one directly and prove the update path stays closed too.
+    let mut row = make_cron_row_with_workspace("cron_legacy_anchor", "u1", "conv_lan_share", "");
+    row.execution_mode = "new_conversation".into();
+    cron_repo.insert(&row).await.unwrap();
+    let job = svc.get_job("u1", "cron_legacy_anchor").await.unwrap();
 
     let err = svc.update_job("u1", &job.id, switch_to_existing()).await.unwrap_err();
     assert!(matches!(
@@ -3712,7 +3720,7 @@ async fn update_cannot_move_a_job_onto_a_lan_share_conversation() {
 
 #[tokio::test]
 async fn update_cannot_move_a_job_onto_another_users_conversation() {
-    let (svc, _repo, _bc, conv_repo) = setup_with_conv_repo().await;
+    let (svc, cron_repo, _bc, conv_repo) = setup_with_conv_repo().await;
     sqlx::query(
         "INSERT OR IGNORE INTO users (id, username, password_hash, created_at, updated_at) \
          VALUES ('u2', 'u2', 'hash', 0, 0)",
@@ -3724,10 +3732,12 @@ async fn update_cannot_move_a_job_onto_another_users_conversation() {
         .create(&conversation_row("conv_of_u2", "u2", "{}"))
         .await
         .unwrap();
-    let mut req = make_create_req("Fresh runs", every_60s());
-    req.conversation_id = "conv_of_u2".into();
-    req.execution_mode = Some("new_conversation".into());
-    let job = svc.add_job("u1", req).await.unwrap();
+    // add_job now refuses this anchor (H19); a row written before that check still
+    // exists, so seed one directly and prove the update path stays closed too.
+    let mut row = make_cron_row_with_workspace("cron_legacy_anchor", "u1", "conv_of_u2", "");
+    row.execution_mode = "new_conversation".into();
+    cron_repo.insert(&row).await.unwrap();
+    let job = svc.get_job("u1", "cron_legacy_anchor").await.unwrap();
 
     let err = svc.update_job("u1", &job.id, switch_to_existing()).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::CrossAccountReference(_)));
@@ -3815,4 +3825,106 @@ async fn cron_schedule_without_timezone_gets_the_host_zone() {
         panic!("cron schedule expected");
     };
     assert_eq!(tz.as_deref(), Some("UTC"));
+}
+
+// H20: a pure pause ({enabled:false} only) must succeed even when the job's workspace
+// directory or assistant no longer exists, and must not run anything.
+#[tokio::test]
+async fn h20_pause_succeeds_when_workspace_or_assistant_vanished() {
+    let (svc, cron_repo, _bc, _conv_repo, _conv_service) = setup_with_conv_runtime().await;
+    let pause = || UpdateCronJobRequest {
+        name: None,
+        description: None,
+        enabled: Some(false),
+        schedule: None,
+        message: None,
+        execution_mode: None,
+        agent_config: None,
+        conversation_title: None,
+        max_retries: None,
+        queue_enabled: None,
+    };
+
+    let gone_dir = std::env::temp_dir().join(format!("aionui-cron-h20-{}", now_ms()));
+    std::fs::create_dir_all(&gone_dir).unwrap();
+    let mut row = make_cron_row_with_workspace("cron_h20_ws", "u1", "conv_h20", &gone_dir.to_string_lossy());
+    row.execution_mode = "new_conversation".into();
+    cron_repo.insert(&row).await.unwrap();
+    std::fs::remove_dir_all(&gone_dir).unwrap();
+    let paused = svc.update_job("u1", "cron_h20_ws", pause()).await.unwrap();
+    assert!(!paused.enabled, "vanished workspace");
+
+    let mut row = make_cron_row_with_workspace(
+        "cron_h20_asst",
+        "u1",
+        "conv_h20b",
+        &std::env::temp_dir().to_string_lossy(),
+    );
+    row.execution_mode = "new_conversation".into();
+    row.agent_config = Some(
+        serde_json::to_string(&CronAgentConfig {
+            name: "Gone".into(),
+            cli_path: None,
+            is_preset: None,
+            assistant_id: Some("assistant-that-was-deleted".into()),
+            custom_agent_id: None,
+            mode: None,
+            model_id: None,
+            model: None,
+            config_options: None,
+            workspace: None,
+        })
+        .unwrap(),
+    );
+    cron_repo.insert(&row).await.unwrap();
+    let paused = svc.update_job("u1", "cron_h20_asst", pause()).await.unwrap();
+    assert!(!paused.enabled, "vanished assistant");
+    let stored = cron_repo.get_by_id_system("cron_h20_asst").await.unwrap().unwrap();
+    assert!(!stored.enabled);
+    assert_eq!(stored.run_count, 0, "pausing never runs the job");
+}
+
+#[tokio::test]
+async fn h19_new_conversation_job_cannot_anchor_another_users_conversation() {
+    let (svc, _repo, _bc, conv_repo) = setup_with_conv_repo().await;
+    sqlx::query(
+        "INSERT OR IGNORE INTO users (id, username, password_hash, created_at, updated_at) \
+         VALUES ('u2', 'u2', 'hash', 0, 0)",
+    )
+    .execute(&conv_repo.sqlite_pool)
+    .await
+    .unwrap();
+    conv_repo
+        .create(&aionui_db::models::ConversationRow {
+            id: "conv_user_b".to_owned(),
+            user_id: "u2".to_owned(),
+            name: "User B Conversation".to_owned(),
+            r#type: "normal".to_owned(),
+            model: None,
+            status: Some("pending".to_owned()),
+            source: None,
+            channel_chat_id: None,
+            extra: "{}".to_owned(),
+            pinned: false,
+            pinned_at: None,
+            created_at: 0,
+            updated_at: 0,
+            project_id: None,
+            folder_id: None,
+            name_source: None,
+        })
+        .await
+        .unwrap();
+
+    let mut req = make_create_req("Cross User Anchor", every_60s());
+    req.conversation_id = "conv_user_b".into();
+    // H19: the anchor of a NewConversation job is scoped too, not only Existing ones.
+    req.execution_mode = Some("new_conversation".into());
+
+    let err = svc.add_job("u1", req).await.unwrap_err();
+    assert!(matches!(
+        err,
+        aionui_cron::error::CronError::CrossAccountReference(message)
+            if message == "Referenced conversation belongs to another user."
+    ));
 }

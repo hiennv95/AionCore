@@ -221,6 +221,7 @@ async fn paired_devices_cannot_change_assistants_or_delete_skills() {
 
     // The agent helper keeps the writes its config CLI advertises.
     let owner = services.user_repo.get_system_user().await.unwrap().unwrap().id;
+    common::ensure_conversation(&services, owner.as_str(), "conv-helper-assistants").await;
     let token = services.runtime_token_service.issue(
         owner.as_str(),
         "conv-helper-assistants",

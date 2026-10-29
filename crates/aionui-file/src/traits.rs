@@ -102,6 +102,7 @@ pub trait IFileService: Send + Sync {
     /// `file_name` must not contain path separators or traversal patterns.
     async fn create_upload_file(
         &self,
+        user_id: &str,
         file_name: &str,
         data: &[u8],
         conversation_id: Option<&str>,

@@ -14,7 +14,7 @@
 //! hanging a `/api/conversations/*` path here would make
 //! `aionui-conversation/src/routes.rs`'s route list misleading.
 
-use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+use aionui_ai_agent::{HelperDenied, HelperUse};
 use aionui_api_types::{
     ApiResponse, SessionCliEnvelope, SessionMentionableQuery, SessionMentionableResponse, SessionSendMessageRequest,
     SessionSendMessageResponse, SessionToolErrorCode, SessionToolErrorPayload,
@@ -53,33 +53,19 @@ struct RuntimeCaller {
     conversation_id: String,
 }
 
-/// Shared preamble for every runtime `session` route: validate the token. The
+/// Shared preamble for every runtime `session` route: validate the token and the
+/// bound conversation's helper policy (a LAN share's helper only reads skills). The
 /// team-caller rejection lives one layer in (`send` / `guard_list_access`) so it
 /// cannot be forgotten by a new subcommand that skips this helper.
-fn runtime_caller(
-    state: &SessionMessageRouterState,
-    headers: &HeaderMap,
-) -> Result<RuntimeCaller, SessionMessageError> {
-    let user_id = required_header(headers, HEADER_USER_ID)?;
-    let conversation_id = required_header(headers, HEADER_CONVERSATION_ID)?;
-    let token = required_header(headers, HEADER_RUNTIME_TOKEN)?;
+async fn runtime_caller(state: &SessionMessageRouterState, headers: &HeaderMap) -> Result<RuntimeCaller, HelperDenied> {
+    let header = |name| required_header(headers, name).map_err(|_| HelperDenied::Unauthenticated);
+    let user_id = header(HEADER_USER_ID)?;
+    let conversation_id = header(HEADER_CONVERSATION_ID)?;
+    let token = header(HEADER_RUNTIME_TOKEN)?;
     state
-        .runtime_token_service
-        .validate(
-            Some(&token),
-            &user_id,
-            &conversation_id,
-            RuntimeTokenScope::ConversationHelper,
-            // Verified: `validate`'s 5th parameter is `session_generation: &str`
-            // (`runtime_token.rs:139-146`), and every conversation's helper
-            // token — team or not — is issued with this same constant (value
-            // `"default"`, `runtime_token.rs:8`). Despite the `TEAM_` prefix it
-            // is not team-specific; passing anything else fails validation.
-            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-        )
-        .map_err(|_| SessionMessageError::SchemaValidation {
-            reason: "runtime auth failed".to_owned(),
-        })?;
+        .helper_access
+        .authorize(Some(&token), &user_id, &conversation_id, HelperUse::Other)
+        .await?;
     Ok(RuntimeCaller {
         user_id,
         conversation_id,
@@ -104,9 +90,9 @@ async fn send(
     Json(request): Json<SessionSendMessageRequest>,
 ) -> (StatusCode, Json<SessionCliEnvelope<SessionSendMessageResponse>>) {
     let command = Some("session send-message".to_owned());
-    let caller = match runtime_caller(&state, &headers) {
+    let caller = match runtime_caller(&state, &headers).await {
         Ok(caller) => caller,
-        Err(_) => return unauthorized(command),
+        Err(denied) => return refused(denied, command),
     };
     match state
         .service
@@ -124,9 +110,9 @@ async fn targets(
     Query(query): Query<SessionMentionableQuery>,
 ) -> (StatusCode, Json<SessionCliEnvelope<SessionMentionableResponse>>) {
     let command = Some("session list".to_owned());
-    let caller = match runtime_caller(&state, &headers) {
+    let caller = match runtime_caller(&state, &headers).await {
         Ok(caller) => caller,
-        Err(_) => return unauthorized(command),
+        Err(denied) => return refused(denied, command),
     };
     if let Err(error) = state
         .service
@@ -188,14 +174,21 @@ fn to_api_error(error: SessionMessageError) -> aionui_common::ApiError {
     }
 }
 
-fn unauthorized<T>(command: Option<String>) -> (StatusCode, Json<SessionCliEnvelope<T>>) {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(SessionCliEnvelope::failure(
+fn refused<T>(denied: HelperDenied, command: Option<String>) -> (StatusCode, Json<SessionCliEnvelope<T>>) {
+    let (status, payload) = match denied {
+        HelperDenied::LanShare => (
+            StatusCode::FORBIDDEN,
+            SessionToolErrorPayload::new(
+                SessionToolErrorCode::HelperNotForLanShare,
+                "an agent in a LAN share can only read skills",
+            ),
+        ),
+        HelperDenied::Unauthenticated | HelperDenied::ConversationGone | HelperDenied::Unavailable => (
+            StatusCode::UNAUTHORIZED,
             SessionToolErrorPayload::new(SessionToolErrorCode::RuntimeAuthFailed, "runtime auth failed"),
-            command,
-        )),
-    )
+        ),
+    };
+    (status, Json(SessionCliEnvelope::failure(payload, command)))
 }
 
 fn envelope_failure<T>(

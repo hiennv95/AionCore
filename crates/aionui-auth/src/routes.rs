@@ -13,11 +13,11 @@ use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 
 use aionui_api_types::{
-    ApiResponse, AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest, EnsureExternalUserRequest,
-    EnsureExternalUserResponse, LoginRequest, LoginResponse, PublicUser, QrLoginRequest, RefreshResponse,
-    RefreshTokenRequest, RevokeExternalSessionRequest, RevokeExternalSessionResponse, UserInfoResponse,
-    WebuiChangePasswordRequest, WebuiChangeUsernameRequest, WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse,
-    WebuiResetPasswordResponse, WsTokenResponse,
+    ApiResponse, AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest,
+    EnsureExternalSessionResponse, EnsureExternalUserRequest, EnsureExternalUserResponse, LoginRequest, LoginResponse,
+    PublicUser, QrLoginRequest, RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest,
+    RevokeExternalSessionResponse, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
+    WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
 };
 use aionui_common::ApiError;
 use aionui_common::constants::REFRESH_COOKIE_NAME;
@@ -75,6 +75,7 @@ impl From<RefreshError> for ApiError {
                 "This session was signed out because an old sign-in token was used again.",
                 None,
             ),
+            RefreshError::DesktopRequiresLoopbackTls => crate::middleware::desktop_requires_loopback_tls(),
             RefreshError::Internal(msg) => ApiError::Internal(msg.into()),
         }
     }
@@ -108,6 +109,8 @@ pub struct AuthRouterState {
     pub aionpro_mode: bool,
     /// Client devices (ADR-011); refresh of a device-bound token requires a live device.
     pub device_repo: Option<Arc<dyn IDeviceRepository>>,
+    /// `--loopback-tls` is running: a desktop app refreshes only over that listener.
+    pub desktop_requires_loopback_tls: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,6 +293,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         // calls them, so the runtime-token channel stays disabled here.
         runtime_token_verifier: None,
         device_repo: state.device_repo.clone(),
+        desktop_requires_loopback_tls: state.desktop_requires_loopback_tls,
     };
 
     // Auth rate limited routes (login, qr-login)
@@ -406,7 +410,7 @@ async fn ensure_external_user_handler(
 ) -> Result<Json<ApiResponse<EnsureExternalUserResponse>>, ApiError> {
     require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let mut service = AuthProvisionService::new(state.user_repo, state.jwt_service);
+    let mut service = AuthProvisionService::new(state.user_repo);
     if let Some(fs_adopter) = state.fs_adopter {
         service = service.with_filesystem_adopter(fs_adopter);
     }
@@ -433,23 +437,26 @@ async fn create_external_session_handler(
 ) -> Result<Response, ApiError> {
     require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let service = AuthProvisionService::new(state.user_repo, state.jwt_service);
-    let exchange = service
-        .create_external_session(req)
+    let service = AuthProvisionService::new(state.user_repo.clone());
+    let user = service
+        .find_external_session_user(req)
         .await
         .map_err(provision_error_to_api_error)?;
-    tracing::info!(
-        user_id = %exchange.response.user.id,
-        "external core session exchange succeeded"
-    );
-    let session_cookie = state.cookie_config.build_session_cookie(&exchange.token);
-    let refresh_cookie = state.cookie_config.build_refresh_cookie(&exchange.refresh_token);
+    let (token, refresh_token) = issue_device_session_pair(&state, &user, "External account").await?;
+    let username = user.username.clone().unwrap_or_else(|| "external_user".to_string());
+    tracing::info!(user_id = %user.id, "external core session exchange succeeded");
+    let session_cookie = state.cookie_config.build_session_cookie(&token);
+    let refresh_cookie = state.cookie_config.build_refresh_cookie(&refresh_token);
+    let response = EnsureExternalSessionResponse {
+        user: PublicUser { id: user.id, username },
+        session_generation: user.session_generation,
+    };
     Ok((
         AppendHeaders([
             (header::SET_COOKIE, session_cookie),
             (header::SET_COOKIE, refresh_cookie),
         ]),
-        Json(ApiResponse::ok(exchange.response)),
+        Json(ApiResponse::ok(response)),
     )
         .into_response())
 }
@@ -465,7 +472,7 @@ async fn revoke_external_session_handler(
 ) -> Result<Json<ApiResponse<RevokeExternalSessionResponse>>, ApiError> {
     require_bootstrap_secret(&headers, state.bootstrap_secret.as_deref().map(AsRef::as_ref))?;
     let Json(req) = body.map_err(ApiError::from)?;
-    let service = AuthProvisionService::new(state.user_repo, state.jwt_service);
+    let service = AuthProvisionService::new(state.user_repo);
     let response = service
         .revoke_external_session(req)
         .await
@@ -487,6 +494,7 @@ async fn revoke_external_session_handler(
 
 async fn login_handler(
     State(state): State<AuthRouterState>,
+    headers: HeaderMap,
     body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     if state.aionpro_mode {
@@ -539,27 +547,40 @@ async fn login_handler(
 
     let user = found_user.ok_or_else(|| ApiError::Unauthorized("Invalid username or password".into()))?;
 
-    issue_session(&state, user).await
+    issue_session(&state, user, &headers, "password").await
+}
+
+/// Device-list label for a login: the user-agent family plus the login method.
+/// Display only: the user agent never grants or decides anything.
+fn login_device_name(headers: &HeaderMap, method: &str) -> String {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let family = [
+        ("Edg/", "Edge"),
+        ("Firefox/", "Firefox"),
+        ("Chrome/", "Chrome"),
+        ("Safari/", "Safari"),
+    ]
+    .into_iter()
+    .find(|(marker, _)| ua.contains(marker))
+    .map_or("Browser", |(_, family)| family);
+    format!("{family} ({method})")
 }
 
 /// Sign access + refresh tokens for `user` and return the login response with
 /// both cookies.
-async fn issue_session(state: &AuthRouterState, user: User) -> Result<Response, ApiError> {
-    let (token, refresh_token) = state
-        .jwt_service
-        .issue_session_pair(
-            &user.id,
-            user.username.as_deref().unwrap_or("external_user"),
-            user.session_generation,
-            None,
-        )
-        .await
-        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
-
-    // Update last login (best-effort)
-    if let Err(e) = state.user_repo.update_last_login(&user.id).await {
-        tracing::warn!("Failed to update last login for {}: {e}", user.id);
-    }
+/// Policy B (Jev 057): outside local mode the session is bound to a new
+/// `browser` device, so it is listed, revocable alone, and restricted like a
+/// paired browser.
+async fn issue_session(
+    state: &AuthRouterState,
+    user: User,
+    headers: &HeaderMap,
+    method: &str,
+) -> Result<Response, ApiError> {
+    let (token, refresh_token) = issue_device_session_pair(state, &user, &login_device_name(headers, method)).await?;
 
     let session_cookie = state.cookie_config.build_session_cookie(&token);
     let refresh_cookie = state.cookie_config.build_refresh_cookie(&refresh_token);
@@ -579,6 +600,40 @@ async fn issue_session(state: &AuthRouterState, user: User) -> Result<Response, 
         Json(resp),
     )
         .into_response())
+}
+
+/// Policy B (Jev 057): outside local mode, register a `browser` device named
+/// `device_name` and sign an access + refresh pair bound to it.
+async fn issue_device_session_pair(
+    state: &AuthRouterState,
+    user: &User,
+    device_name: &str,
+) -> Result<(String, String), ApiError> {
+    let device_id = match state.device_repo.as_ref() {
+        Some(repo) if !state.local => Some(
+            repo.insert(&user.id, device_name, aionui_api_types::DeviceKind::Browser.as_str())
+                .await
+                .map_err(|e| ApiError::Internal(format!("Device registration error: {e}")))?
+                .id,
+        ),
+        _ => None,
+    };
+    let (token, refresh_token) = state
+        .jwt_service
+        .issue_session_pair(
+            &user.id,
+            user.username.as_deref().unwrap_or("external_user"),
+            user.session_generation,
+            device_id.as_deref(),
+        )
+        .await
+        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
+
+    // Update last login (best-effort)
+    if let Err(e) = state.user_repo.update_last_login(&user.id).await {
+        tracing::warn!("Failed to update last login for {}: {e}", user.id);
+    }
+    Ok((token, refresh_token))
 }
 
 // ---------------------------------------------------------------------------
@@ -830,6 +885,12 @@ async fn change_password_handler(
         .update_password(&current_user.id, &new_hash)
         .await
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
+    // Revoke old access and refresh tokens (audit H15).
+    state
+        .user_repo
+        .increment_session_generation(&current_user.id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     // Rotate JWT secret to invalidate all sessions
     let new_secret = state
@@ -865,9 +926,11 @@ async fn refresh_handler(
     State(state): State<AuthRouterState>,
     Extension(limiter): Extension<Arc<RefreshLimiter>>,
     Extension(ClientIp(client_ip)): Extension<ClientIp>,
+    via: Option<Extension<aionui_api_types::ViaLoopbackTls>>,
     headers: HeaderMap,
     body: Result<Json<RefreshTokenRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let via_loopback_tls = via.is_some();
     // Prefer the HttpOnly refresh cookie; fall back to the request body for
     // legacy clients that posted the token explicitly.
     let (raw_token, from_cookie) = match extract_cookie_value(&headers, REFRESH_COOKIE_NAME) {
@@ -894,7 +957,9 @@ async fn refresh_handler(
     // auth path. Same token -> one execution, shared result.
     let tokens = state
         .refresh_coalescer
-        .run(&raw_token, || refresh_tokens(&state, &raw_token, from_cookie))
+        .run(&coalesce_key(&raw_token, from_cookie, via_loopback_tls), || {
+            refresh_tokens(&state, &raw_token, from_cookie, via_loopback_tls)
+        })
         .await?;
 
     let session_cookie = state.cookie_config.build_session_cookie(&tokens.access);
@@ -911,6 +976,16 @@ async fn refresh_handler(
         }),
     )
         .into_response())
+}
+
+/// Refreshes share one execution only when everything that decides their outcome
+/// matches: the token, the channel (a cookie must carry a refresh token; the body path
+/// may accept an access token) and the transport (desktop credentials need the loopback
+/// TLS listener). Otherwise a caller could receive a result it would not get alone.
+fn coalesce_key(raw_token: &str, from_cookie: bool, via_loopback_tls: bool) -> String {
+    let channel = if from_cookie { "cookie" } else { "body" };
+    let transport = if via_loopback_tls { "tls" } else { "plain" };
+    format!("{channel}:{transport}:{raw_token}")
 }
 
 /// Verify the signature and type of a presented refresh credential.
@@ -941,6 +1016,7 @@ async fn refresh_tokens(
     state: &AuthRouterState,
     raw_token: &str,
     from_cookie: bool,
+    via_loopback_tls: bool,
 ) -> Result<RefreshedTokens, RefreshError> {
     let payload = verify_refresh_credential(state, raw_token, from_cookie)
         .map_err(|_| RefreshError::Unauthorized("Invalid or expired token"))?;
@@ -964,14 +1040,22 @@ async fn refresh_tokens(
     }
 
     if let Some(device_id) = payload.device_id.as_deref() {
-        let active = crate::middleware::device_is_active(state.device_repo.as_ref(), device_id, &user.id)
+        let device = crate::middleware::active_device(state.device_repo.as_ref(), device_id, &user.id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "refresh device lookup failed");
                 RefreshError::Internal("Authentication service unavailable")
-            })?;
-        if !active {
-            return Err(RefreshError::DeviceRevoked);
+            })?
+            .ok_or(RefreshError::DeviceRevoked)?;
+        // Before the device is touched or the grant rotated, so a refused attempt burns
+        // nothing and the desktop can retry the same token over TLS.
+        if !crate::middleware::desktop_transport_allowed(
+            state.desktop_requires_loopback_tls,
+            &device.kind,
+            via_loopback_tls,
+        ) {
+            tracing::info!(device_id, "desktop refresh refused outside the loopback TLS listener");
+            return Err(RefreshError::DesktopRequiresLoopbackTls);
         }
         if let Some(repo) = state.device_repo.as_ref()
             && let Err(e) = repo.touch(device_id, aionui_common::now_ms()).await
@@ -1059,6 +1143,7 @@ async fn ws_token_handler(
 
 async fn qr_login_handler(
     State(state): State<AuthRouterState>,
+    headers: HeaderMap,
     body: Result<Json<QrLoginRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     if state.aionpro_mode {
@@ -1078,7 +1163,7 @@ async fn qr_login_handler(
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
         .ok_or_else(|| ApiError::Internal("No primary user configured".into()))?;
 
-    issue_session(&state, user).await
+    issue_session(&state, user, &headers, "QR").await
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,6 +1271,12 @@ async fn webui_change_password_handler(
         .update_password(&user.id, &new_hash)
         .await
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
+    // Revoke old access and refresh tokens (audit H15).
+    state
+        .user_repo
+        .increment_session_generation(&user.id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
     Ok(Json(ApiResponse::message("Password changed successfully")))
 }
@@ -1237,6 +1328,12 @@ async fn webui_reset_password_handler(
     state
         .user_repo
         .update_password(&user.id, &new_hash)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
+    // Revoke old access and refresh tokens (audit H15).
+    state
+        .user_repo
+        .increment_session_generation(&user.id)
         .await
         .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?;
 
@@ -1311,5 +1408,22 @@ mod error_mapping_tests {
     fn hash_error_maps_to_internal() {
         let api_err = ApiError::from(AuthError::HashError("failed".into()));
         assert_eq!(api_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn refreshes_coalesce_only_with_the_same_channel_and_transport() {
+        let keys = [
+            coalesce_key("t", true, true),
+            coalesce_key("t", true, false),
+            coalesce_key("t", false, true),
+            coalesce_key("t", false, false),
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b, "each channel and transport gets its own execution");
+            }
+        }
+        assert_eq!(coalesce_key("t", true, true), coalesce_key("t", true, true));
+        assert_ne!(coalesce_key("t", false, false), coalesce_key("u", false, false));
     }
 }

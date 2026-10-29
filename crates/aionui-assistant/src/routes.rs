@@ -15,7 +15,9 @@ use aionui_api_types::{
     ApiResponse, AssistantDetailResponse, AssistantResponse, CreateAssistantRequest, ImportAssistantsRequest,
     ImportAssistantsResult, SetAssistantStateRequest, UpdateAssistantRequest,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device, no_paired_devices};
+use aionui_auth::{
+    CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller, is_paired_device, no_paired_devices,
+};
 use aionui_common::ApiError;
 
 use crate::error::AssistantError;
@@ -78,8 +80,12 @@ fn requires_desktop_fs_avatar(avatar: Option<&str>) -> bool {
         .is_some_and(|v| !crate::service::is_safe_untrusted_avatar(v))
 }
 
-fn is_desktop_fs_caller(device: Option<&CurrentDevice>, helper: Option<&RuntimeHelperCaller>) -> bool {
-    helper.is_none() && !is_paired_device(device)
+fn is_desktop_fs_caller(
+    device: Option<&CurrentDevice>,
+    deviceless: Option<&DevicelessSession>,
+    helper: Option<&RuntimeHelperCaller>,
+) -> bool {
+    helper.is_none() && deviceless.is_none() && !is_paired_device(device)
 }
 
 async fn list(
@@ -94,6 +100,7 @@ async fn create(
     State(state): State<AssistantRouterState>,
     Extension(current_user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     body: Result<Json<CreateAssistantRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<AssistantResponse>>), ApiError> {
@@ -101,6 +108,7 @@ async fn create(
     if requires_desktop_fs_avatar(req.avatar.as_deref())
         && !is_desktop_fs_caller(
             device.as_ref().map(|Extension(d)| d),
+            deviceless.as_ref().map(|Extension(d)| d),
             helper.as_ref().map(|Extension(h)| h),
         )
     {
@@ -127,6 +135,7 @@ async fn update(
     State(state): State<AssistantRouterState>,
     Extension(current_user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateAssistantRequest>, JsonRejection>,
@@ -135,6 +144,7 @@ async fn update(
     if requires_desktop_fs_avatar(req.avatar.as_deref())
         && !is_desktop_fs_caller(
             device.as_ref().map(|Extension(d)| d),
+            deviceless.as_ref().map(|Extension(d)| d),
             helper.as_ref().map(|Extension(h)| h),
         )
     {
@@ -168,6 +178,7 @@ async fn import(
     State(state): State<AssistantRouterState>,
     Extension(current_user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     body: Result<Json<ImportAssistantsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<ImportAssistantsResult>>, ApiError> {
@@ -179,6 +190,7 @@ async fn import(
     if has_fs_avatar
         && !is_desktop_fs_caller(
             device.as_ref().map(|Extension(d)| d),
+            deviceless.as_ref().map(|Extension(d)| d),
             helper.as_ref().map(|Extension(h)| h),
         )
     {
@@ -202,13 +214,23 @@ async fn get_avatar(
         .await
         .ok_or_else(|| ApiError::NotFound(format!("avatar '{id}' not found")))?;
 
-    let content_type = content_type_for_extension(asset.extension.as_deref());
+    avatar_response(asset.bytes, asset.extension.as_deref())
+}
 
+/// Avatar bytes are user-supplied, so an SVG opened directly must not run script
+/// or load anything (audit H12). `<img>` rendering ignores script anyway, so
+/// legit avatars still display.
+fn avatar_response(bytes: Vec<u8>, extension: Option<&str>) -> Result<Response, ApiError> {
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_TYPE, content_type_for_extension(extension))
         .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(asset.bytes))
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+        )
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(Body::from(bytes))
         .map_err(|e| ApiError::Internal(e.to_string()))
 }
 
@@ -222,4 +244,28 @@ fn content_type_for_extension(ext: Option<&str>) -> HeaderValue {
         _ => "application/octet-stream",
     };
     HeaderValue::from_static(mime)
+}
+
+#[cfg(test)]
+mod avatar_response_tests {
+    use super::*;
+
+    #[test]
+    fn svg_avatar_is_served_as_image_with_script_blocking_csp() {
+        let resp = avatar_response(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec(), Some("svg")).unwrap();
+        let h = resp.headers();
+        assert_eq!(h[header::CONTENT_TYPE], "image/svg+xml");
+        assert_eq!(
+            h[header::CONTENT_SECURITY_POLICY],
+            "default-src 'none'; style-src 'unsafe-inline'; sandbox"
+        );
+        assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    }
+
+    #[test]
+    fn png_avatar_keeps_its_image_type_and_nosniff() {
+        let resp = avatar_response(vec![0x89, b'P', b'N', b'G'], Some("png")).unwrap();
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(resp.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+    }
 }

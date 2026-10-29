@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use aionui_ai_agent::RuntimeTokenService;
+use aionui_ai_agent::HelperAccess;
 
 use crate::service::SessionMessageService;
 use crate::targets::MentionableTargets;
@@ -12,5 +12,5 @@ use crate::targets::MentionableTargets;
 pub struct SessionMessageRouterState {
     pub service: Arc<SessionMessageService>,
     pub targets: Arc<MentionableTargets>,
-    pub runtime_token_service: Arc<RuntimeTokenService>,
+    pub helper_access: Arc<HelperAccess>,
 }

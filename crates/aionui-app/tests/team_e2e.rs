@@ -186,7 +186,7 @@ fn mcp_text(resp: &Value) -> &str {
 #[tokio::test]
 async fn tc1_create_team_with_multiple_agents() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     assert_eq!(data["name"], "Alpha");
@@ -201,7 +201,7 @@ async fn tc1_create_team_with_multiple_agents() {
 #[tokio::test]
 async fn tc2_create_single_agent_team() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
 
     let body = json!({
@@ -217,8 +217,8 @@ async fn tc2_create_single_agent_team() {
 
 #[tokio::test]
 async fn tc_create_team_rejects_existing_agent_conversation_id() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({
         "name": "No Adoption",
@@ -250,7 +250,7 @@ async fn tc_create_team_rejects_existing_agent_conversation_id() {
 #[tokio::test]
 async fn tc3_each_agent_has_conversation_id() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     for agent in data["assistants"].as_array().unwrap() {
@@ -266,7 +266,7 @@ async fn tc3_each_agent_has_conversation_id() {
 #[tokio::test]
 async fn tc3b_create_team_writes_legacy_extra_shape() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
@@ -287,7 +287,7 @@ async fn tc3b_create_team_writes_legacy_extra_shape() {
 #[tokio::test]
 async fn tc3c_team_conversation_rejects_standalone_runtime_ensure() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
@@ -313,7 +313,7 @@ async fn tc3c_team_conversation_rejects_standalone_runtime_ensure() {
 #[tokio::test]
 async fn tc4_explicit_lead_is_returned_first() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
 
     let body = json!({
@@ -339,8 +339,8 @@ async fn tc4_explicit_lead_is_returned_first() {
 // TC-5: Empty agents returns 400
 #[tokio::test]
 async fn tc5_empty_agents_returns_error() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({ "name": "Empty", "agents": [] });
     let req = json_with_token("POST", "/api/teams", body, &token, &csrf);
@@ -352,7 +352,7 @@ async fn tc5_empty_agents_returns_error() {
 #[tokio::test]
 async fn tc6_missing_name_returns_error() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
 
     let body = json!({ "agents": [json!({
@@ -369,7 +369,7 @@ async fn tc6_missing_name_returns_error() {
 #[tokio::test]
 async fn tc6b_workspace_with_whitespace_segment_is_accepted() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("Archive ");
@@ -391,7 +391,7 @@ async fn tc6b_workspace_with_whitespace_segment_is_accepted() {
 #[tokio::test]
 async fn tc6c_create_team_rejects_missing_workspace_path() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
     let missing_workspace =
         std::env::temp_dir().join(format!("aionui-team-missing-{}", aionui_common::generate_short_id()));
@@ -456,7 +456,7 @@ async fn tl1_empty_team_list() {
 #[tokio::test]
 async fn tl2_list_multiple_teams() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     create_team(&mut app, &services, &token, &csrf).await;
     ensure_default_team_assistant(&mut app, &services, &token, &csrf).await;
@@ -478,7 +478,7 @@ async fn tl2_list_multiple_teams() {
 #[tokio::test]
 async fn team_api_rejects_cross_user_access() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (owner_token, owner_csrf) = common::desktop_login(&app, &services).await;
     let (other_token, other_csrf) = setup_and_login(&mut app, &services, "alice", "StrongP@ss2").await;
 
     let data = create_team(&mut app, &services, &owner_token, &owner_csrf).await;
@@ -554,16 +554,19 @@ async fn team_api_rejects_cross_user_access() {
         ),
     ];
 
+    // Jev 053: the other account's password session is device-less, so every
+    // team-changing route refuses it before the ownership lookup.
     for req in hidden_requests {
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(resp).await["code"], "TEAM_DESKTOP_ONLY");
     }
 }
 
 #[tokio::test]
 async fn pause_team_slot_endpoint_requires_owned_team_and_active_run() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let lead_slot_id = data["assistants"][0]["slot_id"].as_str().unwrap();
@@ -587,7 +590,7 @@ async fn pause_team_slot_endpoint_requires_owned_team_and_active_run() {
 #[tokio::test]
 async fn interrupt_agent_endpoint_rejects_bad_requests() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let lead_slot_id = data["assistants"][0]["slot_id"].as_str().unwrap();
@@ -680,7 +683,7 @@ async fn interrupt_agent_endpoint_rejects_bad_requests() {
 #[tokio::test]
 async fn trs1_run_state_returns_null_for_existing_team_without_active_run() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
@@ -700,7 +703,7 @@ async fn trs1_run_state_returns_null_for_existing_team_without_active_run() {
 #[tokio::test]
 async fn trs2_run_state_returns_active_run_payload() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
@@ -763,7 +766,7 @@ async fn trs4_run_state_missing_team_returns_404() {
 #[tokio::test]
 async fn trs5_run_state_rejects_cross_user_access() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (admin_token, admin_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (admin_token, admin_csrf) = common::desktop_login(&app, &services).await;
     let data = create_team(&mut app, &services, &admin_token, &admin_csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
@@ -780,7 +783,7 @@ async fn trs5_run_state_rejects_cross_user_access() {
 #[tokio::test]
 async fn tl3_teams_contain_full_agent_info() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     create_team(&mut app, &services, &token, &csrf).await;
 
@@ -801,7 +804,7 @@ async fn tl3_teams_contain_full_agent_info() {
 #[tokio::test]
 async fn tg1_get_existing_team() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -829,7 +832,7 @@ async fn tg2_get_nonexistent_returns_404() {
 #[tokio::test]
 async fn td1_delete_existing_team() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -843,7 +846,7 @@ async fn td1_delete_existing_team() {
 #[tokio::test]
 async fn td2_delete_then_list_empty() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -860,8 +863,8 @@ async fn td2_delete_then_list_empty() {
 // TD-6: Delete nonexistent team returns 404
 #[tokio::test]
 async fn td6_delete_nonexistent_returns_404() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = delete_with_token("/api/teams/nonexistent", &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -872,7 +875,7 @@ async fn td6_delete_nonexistent_returns_404() {
 #[tokio::test]
 async fn tr1_rename_existing_team() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -892,7 +895,7 @@ async fn tr1_rename_existing_team() {
 #[tokio::test]
 async fn tr2_rename_then_get_confirms_new_name() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -915,8 +918,8 @@ async fn tr2_rename_then_get_confirms_new_name() {
 // TR-4: Rename nonexistent team returns 404
 #[tokio::test]
 async fn tr4_rename_nonexistent_returns_404() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "PATCH",
@@ -937,7 +940,7 @@ async fn tr4_rename_nonexistent_returns_404() {
 #[tokio::test]
 async fn aa1_add_agent_to_team() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -960,7 +963,7 @@ async fn aa1_add_agent_to_team() {
 #[tokio::test]
 async fn aa2_add_agent_increases_count() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -983,8 +986,8 @@ async fn aa2_add_agent_increases_count() {
 // AA-4: Add agent to nonexistent team returns 404
 #[tokio::test]
 async fn aa4_add_agent_nonexistent_team() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({
         "name": "X",
@@ -1001,7 +1004,7 @@ async fn aa4_add_agent_nonexistent_team() {
 #[tokio::test]
 async fn aa5_add_agent_missing_fields() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1016,7 +1019,7 @@ async fn aa5_add_agent_missing_fields() {
 #[tokio::test]
 async fn ar1_remove_agent_from_team() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1031,7 +1034,7 @@ async fn ar1_remove_agent_from_team() {
 #[tokio::test]
 async fn ar2_after_removal_agent_gone() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1052,7 +1055,7 @@ async fn ar2_after_removal_agent_gone() {
 #[tokio::test]
 async fn ar4_remove_nonexistent_agent() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1066,7 +1069,7 @@ async fn ar4_remove_nonexistent_agent() {
 #[tokio::test]
 async fn an1_rename_agent() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1087,7 +1090,7 @@ async fn an1_rename_agent() {
 #[tokio::test]
 async fn an2_rename_then_get_confirms_name() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1114,7 +1117,7 @@ async fn an2_rename_then_get_confirms_name() {
 #[tokio::test]
 async fn an3_rename_nonexistent_agent() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1138,7 +1141,7 @@ async fn an3_rename_nonexistent_agent() {
 #[tokio::test]
 async fn es1_ensure_session() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1158,7 +1161,7 @@ async fn es1_ensure_session() {
 #[tokio::test]
 async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     mark_claude_backend_team_mcp_stdio_capable(&services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
@@ -1248,8 +1251,8 @@ async fn es1b_team_mcp_list_assistants_matches_assistant_projection() {
 // binding. A fixed empty binding must not inherit globally enabled servers.
 #[tokio::test]
 async fn es1c_team_conversations_carry_assistant_bound_mcp_snapshot() {
-    let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let pool = services.database.pool().clone();
     let user_id = "system_default_user";
@@ -1529,7 +1532,7 @@ async fn es1c_team_conversations_carry_assistant_bound_mcp_snapshot() {
 #[tokio::test]
 async fn context_reset_rejects_leader_through_the_http_contract() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let leader_slot_id = data["assistants"][0]["slot_id"].as_str().unwrap();
@@ -1552,7 +1555,7 @@ async fn context_reset_rejects_leader_through_the_http_contract() {
 #[tokio::test]
 async fn context_reset_returns_structured_success_and_projects_a_semantic_notice() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let worker = &data["assistants"][1];
@@ -1719,7 +1722,7 @@ async fn context_reset_returns_structured_success_and_projects_a_semantic_notice
 #[tokio::test]
 async fn context_reset_requires_authentication() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
@@ -1740,7 +1743,7 @@ async fn context_reset_requires_authentication() {
 #[tokio::test]
 async fn context_reset_requires_csrf() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
     let slot_id = data["assistants"][1]["slot_id"].as_str().unwrap();
@@ -1766,7 +1769,7 @@ async fn conversation_extra(services: &aionui_app::AppServices, conversation_id:
 #[tokio::test]
 async fn es2_ensure_session_idempotent() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1795,8 +1798,8 @@ async fn es2_ensure_session_idempotent() {
 // ES-3: Ensure session for nonexistent team returns 404
 #[tokio::test]
 async fn es3_ensure_session_nonexistent() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/teams/nonexistent/session", json!({}), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -1807,7 +1810,7 @@ async fn es3_ensure_session_nonexistent() {
 #[tokio::test]
 async fn ss1_stop_session() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1830,7 +1833,7 @@ async fn ss1_stop_session() {
 #[tokio::test]
 async fn ss3_stop_session_noop() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1848,7 +1851,7 @@ async fn ss3_stop_session_noop() {
 #[tokio::test]
 async fn sm1_send_message_with_session() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1877,7 +1880,7 @@ async fn sm1_send_message_with_session() {
 #[tokio::test]
 async fn sm1b_team_send_persists_user_bubble_through_projection_adapter() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1917,7 +1920,7 @@ async fn sm1b_team_send_persists_user_bubble_through_projection_adapter() {
 #[tokio::test]
 async fn sm1e_team_send_rejects_empty_content_without_starting_a_run() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -1987,7 +1990,7 @@ async fn sm1e_team_send_rejects_empty_content_without_starting_a_run() {
 #[tokio::test]
 async fn sm1c_team_owned_conversation_regular_send_is_forbidden() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let conversation_id = data["assistants"][0]["conversation_id"].as_str().unwrap();
@@ -2009,7 +2012,7 @@ async fn sm1c_team_owned_conversation_regular_send_is_forbidden() {
 #[tokio::test]
 async fn sm1d_team_send_rejects_missing_csrf() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
 
@@ -2027,8 +2030,8 @@ async fn sm1d_team_send_rejects_missing_csrf() {
 // SM-4: Send message without session returns 404
 #[tokio::test]
 async fn sm4_send_message_no_session() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -2045,7 +2048,7 @@ async fn sm4_send_message_no_session() {
 #[tokio::test]
 async fn sm5_send_message_missing_content() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -2065,7 +2068,7 @@ async fn sm5_send_message_missing_content() {
 #[tokio::test]
 async fn sa1_send_message_to_agent() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_team(&mut app, &services, &token, &csrf).await;
     let team_id = data["id"].as_str().unwrap();
@@ -2100,7 +2103,7 @@ async fn sa1_send_message_to_agent() {
 #[tokio::test]
 async fn full_team_lifecycle() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create
     let data = create_team(&mut app, &services, &token, &csrf).await;
@@ -2197,7 +2200,7 @@ async fn full_team_lifecycle() {
 #[tokio::test]
 async fn another_user_cannot_use_any_team_route_of_the_owner() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let team = create_team(&mut app, &services, &token, &csrf).await;
     let id = team["id"].as_str().unwrap().to_owned();
     let (bob, bc) = setup_and_login(&mut app, &services, "bob", "StrongP@ss2").await;

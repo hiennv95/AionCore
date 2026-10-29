@@ -172,8 +172,8 @@ async fn conversation_active_lease_rejects_cross_user_without_renewing() {
 
 #[tokio::test]
 async fn team_active_lease_renews_member_conversations() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let owner = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
     insert_team(
         &services,
@@ -201,8 +201,8 @@ async fn team_active_lease_renews_member_conversations() {
 
 #[tokio::test]
 async fn team_active_lease_allows_empty_agents() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let owner = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
     insert_team(&services, &owner.id, "team-empty", vec![]).await;
 
@@ -255,7 +255,7 @@ async fn team_active_lease_rejects_missing_csrf() {
 #[tokio::test]
 async fn team_active_lease_rejects_cross_user_without_renewing() {
     let (mut app, services) = build_app().await;
-    let (_owner_token, _owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (_owner_token, _owner_csrf) = common::desktop_login(&app, &services).await;
     let owner = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
     insert_team(
         &services,
@@ -269,8 +269,9 @@ async fn team_active_lease_rejects_cross_user_without_renewing() {
     let req = empty_post_with_token("/api/teams/team-cross-user/active-lease", &other_token, &other_csrf);
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // Jev 053: the other account's password session is device-less and refused outright.
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let body = body_json(resp).await;
-    assert_eq!(body["code"], "NOT_FOUND");
+    assert_eq!(body["code"], "TEAM_DESKTOP_ONLY");
     assert!(services.active_lease_registry.active_until("team-cross-conv").is_none());
 }

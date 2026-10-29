@@ -214,7 +214,7 @@ fn cron_skill_does_not_instruct_agents_to_write_payload_files() {
 #[tokio::test]
 async fn cj1_create_cron_job() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_job(&mut app, &services, &token, &csrf, create_job_body("Daily Report")).await;
 
@@ -233,7 +233,7 @@ async fn cj1_create_cron_job() {
 #[tokio::test]
 async fn cj1b_create_job_allows_missing_task_description() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let data = create_job(&mut app, &services, &token, &csrf, create_job_body("No Description")).await;
 
@@ -246,7 +246,7 @@ async fn cj1b_create_job_allows_missing_task_description() {
 #[tokio::test]
 async fn cj2_create_three_schedule_types() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let now = aionui_common::now_ms();
 
@@ -283,7 +283,7 @@ async fn cj2_create_three_schedule_types() {
 #[tokio::test]
 async fn cj3_create_missing_required_fields() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     ensure_default_assistant(&mut app, &token, &csrf).await;
 
     let invalid_bodies = vec![
@@ -307,7 +307,7 @@ async fn cj3_create_missing_required_fields() {
 #[tokio::test]
 async fn cj3b_create_accepts_workspace_with_whitespace_segment() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     ensure_default_assistant(&mut app, &token, &csrf).await;
     let dir = std::env::temp_dir().join(format!("aionui-cron-test-{}", aionui_common::generate_short_id()));
     std::fs::create_dir(&dir).unwrap();
@@ -340,7 +340,7 @@ async fn cj3b_create_accepts_workspace_with_whitespace_segment() {
 #[tokio::test]
 async fn cj3c_create_rejects_missing_workspace_path() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     ensure_default_assistant(&mut app, &token, &csrf).await;
 
     let body = json!({
@@ -386,7 +386,7 @@ async fn cj3c_create_rejects_missing_workspace_path() {
 #[tokio::test]
 async fn cj4_get_single_job() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Get Test")).await;
     let job_id = created["id"].as_str().unwrap();
@@ -415,7 +415,7 @@ async fn cj5_get_nonexistent() {
 #[tokio::test]
 async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let owner = services.user_repo.find_by_username("admin").await.unwrap().unwrap();
     ensure_default_assistant(&mut app, &token, &csrf).await;
     let cron_repo = SqliteCronRepository::new(services.database.pool().clone());
@@ -484,7 +484,7 @@ async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
 #[tokio::test]
 async fn cj6_list_all_jobs() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     for i in 0..3 {
         create_job(&mut app, &services, &token, &csrf, create_job_body(&format!("Job {i}"))).await;
@@ -504,7 +504,7 @@ async fn cj6_list_all_jobs() {
 #[tokio::test]
 async fn cj7_list_by_conversation() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let mut body_a = create_job_body("Job A");
     body_a["conversation_id"] = json!("conv_target");
@@ -532,7 +532,7 @@ async fn cj7_list_by_conversation() {
 #[tokio::test]
 async fn cj8_update_job() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Original")).await;
     let job_id = created["id"].as_str().unwrap();
@@ -555,7 +555,7 @@ async fn cj8_update_job() {
 #[tokio::test]
 async fn cj9_update_schedule_type() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Schedule Change")).await;
     let job_id = created["id"].as_str().unwrap();
@@ -573,7 +573,7 @@ async fn cj9_update_schedule_type() {
 #[tokio::test]
 async fn cj9b_update_schedule_preserves_existing_timezone_when_omitted() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_job(
         &mut app,
@@ -607,8 +607,8 @@ async fn cj9b_update_schedule_preserves_existing_timezone_when_omitted() {
 
 #[tokio::test]
 async fn cj10_update_nonexistent() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let update_body = json!({"name": "X"});
     let req = json_with_token("PUT", "/api/cron/jobs/cron_nonexistent", update_body, &token, &csrf);
@@ -621,7 +621,7 @@ async fn cj10_update_nonexistent() {
 #[tokio::test]
 async fn cj11_delete_job() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_job(&mut app, &services, &token, &csrf, create_job_body("To Delete")).await;
     let job_id = created["id"].as_str().unwrap();
@@ -639,8 +639,8 @@ async fn cj11_delete_job() {
 
 #[tokio::test]
 async fn cj12_delete_nonexistent() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = delete_with_token("/api/cron/jobs/cron_nonexistent", &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -652,7 +652,7 @@ async fn cj12_delete_nonexistent() {
 #[tokio::test]
 async fn rn1_run_now_returns_conversation_id_for_new_conversation_job() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let create_conv_req = json_with_token(
         "POST",
@@ -692,7 +692,7 @@ async fn rn1_run_now_returns_conversation_id_for_new_conversation_job() {
 #[tokio::test]
 async fn rn1b_run_now_returns_active_conversation_when_conversation_is_busy() {
     let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let create_conv_req = json_with_token(
         "POST",
@@ -738,8 +738,8 @@ async fn rn1b_run_now_returns_active_conversation_when_conversation_is_busy() {
 
 #[tokio::test]
 async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcps() {
-    let (mut app, services) = build_app_with_mock_agents().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app_with_mock_agents().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let mcp_repo = SqliteMcpServerRepository::new(services.database.pool().clone());
     let fixed_mcp = mcp_repo
@@ -880,8 +880,8 @@ async fn rn1c_run_now_new_conversation_preset_assistant_uses_fixed_assistant_mcp
 
 #[tokio::test]
 async fn rn2_run_now_nonexistent() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/cron/jobs/cron_nonexistent/run", json!({}), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -893,7 +893,7 @@ async fn rn2_run_now_nonexistent() {
 #[tokio::test]
 async fn sk1_save_skill() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Skill Job")).await;
     let job_id = created["id"].as_str().unwrap();
@@ -915,7 +915,7 @@ async fn sk1_save_skill() {
 #[tokio::test]
 async fn sk2_has_skill_true() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Skill Check")).await;
     let job_id = created["id"].as_str().unwrap();
@@ -943,7 +943,7 @@ async fn sk2_has_skill_true() {
 #[tokio::test]
 async fn sk3_has_skill_false() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_job(&mut app, &services, &token, &csrf, create_job_body("No Skill")).await;
     let job_id = created["id"].as_str().unwrap();
@@ -961,7 +961,7 @@ async fn sk3_has_skill_false() {
 #[tokio::test]
 async fn sk4_save_empty_skill() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Empty Skill")).await;
     let job_id = created["id"].as_str().unwrap();
@@ -983,7 +983,7 @@ async fn sk4_save_empty_skill() {
 #[tokio::test]
 async fn sk5_save_placeholder_skill() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Placeholder Skill")).await;
     let job_id = created["id"].as_str().unwrap();
@@ -1004,8 +1004,8 @@ async fn sk5_save_placeholder_skill() {
 
 #[tokio::test]
 async fn sk6_save_skill_nonexistent() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let skill_body = json!({"content": "---\nname: x\n---\nOk"});
     let req = json_with_token(
@@ -1024,7 +1024,7 @@ async fn sk6_save_skill_nonexistent() {
 #[tokio::test]
 async fn sk7_delete_skill() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_job(&mut app, &services, &token, &csrf, create_job_body("Delete Skill Job")).await;
     let job_id = created["id"].as_str().unwrap();
@@ -1055,8 +1055,8 @@ async fn sk7_delete_skill() {
 
 #[tokio::test]
 async fn sk8_delete_skill_nonexistent() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = delete_with_token("/api/cron/jobs/cron_nonexistent/skill", &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -1067,8 +1067,8 @@ async fn sk8_delete_skill_nonexistent() {
 
 #[tokio::test]
 async fn sc5_invalid_cron_expression() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = create_cron_job_body("Invalid Cron", "invalid cron");
     let req = json_with_token("POST", "/api/cron/jobs", body, &token, &csrf);
@@ -1081,7 +1081,7 @@ async fn sc5_invalid_cron_expression() {
 #[tokio::test]
 async fn sc6_cron_with_timezone() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     ensure_default_assistant(&mut app, &token, &csrf).await;
 
     let body = json!({
@@ -1103,7 +1103,7 @@ async fn sc6_cron_with_timezone() {
 #[tokio::test]
 async fn sc7_every_zero_interval() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     ensure_default_assistant(&mut app, &token, &csrf).await;
 
     let body = json!({
@@ -1124,7 +1124,7 @@ async fn sc7_every_zero_interval() {
 #[tokio::test]
 async fn sc8_every_negative_interval() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     ensure_default_assistant(&mut app, &token, &csrf).await;
 
     let body = json!({
@@ -1144,31 +1144,28 @@ async fn sc8_every_negative_interval() {
 //
 // Real HTTP round-trip for the CROSS_ACCOUNT_REFERENCE contract: user B
 // creates a cron job whose conversation_id belongs to user A and must get a
-// 409 with the exact error code — not a generic conflict.
+// 409 with the exact error code — not a generic conflict. Since Jev 053 only
+// the desktop app session may create cron jobs, so B is the owner (`admin`)
+// and A is a second account whose conversation is seeded directly.
 
 #[tokio::test]
 async fn cross_account_conversation_reference_returns_409_over_http() {
-    let (mut app, services) = build_app().await;
+    let (app, services) = build_app().await;
 
     // User A owns a conversation.
-    let (_token_a, _csrf_a) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
-    let user_a = services
-        .user_repo
-        .find_by_username("admin")
-        .await
-        .unwrap()
-        .expect("admin user should exist");
+    let hash = aionui_auth::hash_password("StrongP@ss2").unwrap();
+    let user_a = services.user_repo.create_user("mallory", &hash).await.unwrap();
     ensure_conversation(&services, &user_a.id, "conv_cross_acct", "A's Conversation").await;
 
     // User B (their own assistant, so agent resolution succeeds and the
     // request reaches the conversation ownership check).
-    let (token_b, csrf_b) = setup_and_login(&mut app, &services, "mallory", "StrongP@ss2").await;
+    let (token_b, csrf_b) = common::desktop_login(&app, &services).await;
     let req = json_with_token(
         "POST",
         "/api/assistants",
         json!({
             "id": "cron-e2e-assistant-b",
-            "name": "Mallory Assistant",
+            "name": "Owner Assistant",
             "agent_id": "2d23ff1c"
         }),
         &token_b,
@@ -1203,9 +1200,9 @@ async fn cross_account_conversation_reference_returns_409_over_http() {
     assert!(repo.list_all_for_user(&user_a.id).await.unwrap().is_empty());
     let user_b = services
         .user_repo
-        .find_by_username("mallory")
+        .find_by_username("admin")
         .await
         .unwrap()
-        .expect("mallory should exist");
+        .expect("admin user should exist");
     assert!(repo.list_all_for_user(&user_b.id).await.unwrap().is_empty());
 }

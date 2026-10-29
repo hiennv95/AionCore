@@ -7,8 +7,8 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
-use aionui_api_types::{ApiResponse, ConversationFileView, FilePreviewSettings};
-use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, is_paired_device};
+use aionui_api_types::{ApiResponse, ConversationFileView, FileDiffView, FilePreviewSettings};
+use aionui_auth::{CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller, is_paired_device};
 use aionui_common::ApiError;
 
 use crate::error::PreviewError;
@@ -22,6 +22,7 @@ pub fn preview_routes(state: PreviewRouterState) -> Router {
     Router::new()
         .route("/api/conversations/{id}/files", get(list))
         .route("/api/conversations/{id}/files/{file_id}/content", get(content))
+        .route("/api/conversations/{id}/files/{file_id}/diff", get(diff))
         .route("/api/devices/file-preview", get(get_setting).put(put_setting))
         .with_state(state)
 }
@@ -58,6 +59,7 @@ async fn ensure_reader(
     user: &CurrentUser,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
 ) -> Result<(), ApiError> {
     if helper.is_some() {
         return Err(ApiError::coded(
@@ -67,7 +69,7 @@ async fn ensure_reader(
             None,
         ));
     }
-    if is_paired_device(device.as_ref().map(|Extension(device)| device))
+    if (deviceless.is_some() || is_paired_device(device.as_ref().map(|Extension(device)| device)))
         && !state.service.devices_allowed(&user.id).await?
     {
         return Err(ApiError::coded(
@@ -84,8 +86,9 @@ async fn ensure_reader(
 fn ensure_manager(
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
 ) -> Result<(), ApiError> {
-    if helper.is_some() || is_paired_device(device.as_ref().map(|Extension(device)| device)) {
+    if helper.is_some() || deviceless.is_some() || is_paired_device(device.as_ref().map(|Extension(device)| device)) {
         return Err(ApiError::coded(
             StatusCode::FORBIDDEN,
             "DEVICE_OWNER_ONLY",
@@ -101,9 +104,10 @@ async fn list(
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<ConversationFileView>>>, ApiError> {
-    ensure_reader(&state, &user, helper, device).await?;
+    ensure_reader(&state, &user, helper, device, deviceless).await?;
     Ok(Json(ApiResponse::ok(state.service.list(&user.id, &id).await?)))
 }
 
@@ -112,9 +116,10 @@ async fn content(
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     Path((id, file_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    ensure_reader(&state, &user, helper, device).await?;
+    ensure_reader(&state, &user, helper, device, deviceless).await?;
     let content = state.service.read(&user.id, &id, &file_id).await?;
     let csp = if content.mime == SVG { SVG_CSP } else { CONTENT_CSP };
     Ok((
@@ -130,13 +135,29 @@ async fn content(
         .into_response())
 }
 
+/// PV06 (ADR-024): git HEAD against the file on disk, under the same reader gate as content.
+async fn diff(
+    State(state): State<PreviewRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+    device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
+    Path((id, file_id)): Path<(String, String)>,
+) -> Result<Json<ApiResponse<FileDiffView>>, ApiError> {
+    ensure_reader(&state, &user, helper, device, deviceless).await?;
+    Ok(Json(ApiResponse::ok(
+        state.service.diff(&user.id, &id, &file_id).await?,
+    )))
+}
+
 async fn get_setting(
     State(state): State<PreviewRouterState>,
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
 ) -> Result<Json<ApiResponse<FilePreviewSettings>>, ApiError> {
-    ensure_manager(helper, device)?;
+    ensure_manager(helper, device, deviceless)?;
     let devices_allowed = state.service.devices_allowed(&user.id).await?;
     Ok(Json(ApiResponse::ok(FilePreviewSettings { devices_allowed })))
 }
@@ -146,9 +167,10 @@ async fn put_setting(
     Extension(user): Extension<CurrentUser>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     body: Result<Json<FilePreviewSettings>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FilePreviewSettings>>, ApiError> {
-    ensure_manager(helper, device)?;
+    ensure_manager(helper, device, deviceless)?;
     let Json(settings) = body.map_err(ApiError::from)?;
     state
         .service

@@ -16,7 +16,7 @@ use aionui_api_types::{
     AgentManagementRow, AgentManagementStatus, AgentSnapshotCheckKind, AgentSnapshotCheckStatus, AgentSource,
     AgentSourceInfo, BehaviorPolicy,
 };
-use aionui_app::{AppConfig, AppServices, ModuleStates, build_module_states, create_router_with_states};
+use aionui_app::{AppServices, ModuleStates, build_module_states, create_router_with_states};
 use aionui_assistant::{AssistantAgentCatalogPort, AssistantRouterState, AssistantService, BuiltinAssistantRegistry};
 use aionui_common::AgentType;
 use aionui_db::{
@@ -216,7 +216,7 @@ async fn fixture() -> Fixture {
 
     // Bring up in-memory DB + services + default module states.
     let db = init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = AppServices::from_config(db, &common::scratch_config()).await.unwrap();
     let (mut states, _): (ModuleStates, _) = build_module_states(&services).await.expect("build module states");
     for table in [
         "assistant_preferences",
@@ -344,8 +344,8 @@ async fn fixture() -> Fixture {
     let dispatcher: Arc<dyn AssistantRuleDispatcher> = service;
     states.skill.assistant_dispatcher = Some(dispatcher);
 
-    let mut app = create_router_with_states(&services, states);
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let app = create_router_with_states(&services, states);
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     Fixture {
         app,
@@ -952,6 +952,9 @@ async fn update_extension_registry_id_without_user_row_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// Jev 056 (owner decision 2026-10-29): a password-only second account is a
+/// device-less session and stays read-only for assistants. B still cannot see
+/// A's row, and B's writes are refused by the write gate before any lookup.
 #[tokio::test]
 async fn assistant_routes_hide_other_users_rows() {
     let fx = fixture().await;
@@ -960,8 +963,16 @@ async fn assistant_routes_hide_other_users_rows() {
     let mut app = fx.app.clone();
     let (token_b, csrf_b) = setup_and_login(&mut app, &fx.services, "other-user", "OtherP@ss1").await;
 
-    let requests = [
-        get_with_token("/api/assistants/private-a", &token_b),
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants/private-a", &token_b))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(resp).await["code"], "NOT_FOUND");
+
+    for request in [
         json_with_token(
             "PUT",
             "/api/assistants/private-a",
@@ -970,14 +981,15 @@ async fn assistant_routes_hide_other_users_rows() {
             &csrf_b,
         ),
         delete_with_token("/api/assistants/private-a", &token_b, &csrf_b),
-    ];
-
-    for request in requests {
+    ] {
         let resp = fx.app.clone().oneshot(request).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let status = resp.status();
         let body = body_json(resp).await;
-        assert_eq!(body["success"], false);
-        assert_eq!(body["code"], "NOT_FOUND");
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::FORBIDDEN, Some(GATE_CODE)),
+            "{body}"
+        );
     }
 
     let resp = fx
@@ -989,6 +1001,9 @@ async fn assistant_routes_hide_other_users_rows() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["data"]["profile"]["name"], "Private A");
 }
+
+/// The write gate's refusal for a device-less session (Jev 053/056).
+const GATE_CODE: &str = "FS_OWNER_ONLY";
 
 // ===========================================================================
 // DELETE /api/assistants/{id}
@@ -1385,6 +1400,9 @@ async fn read_rule_user_round_trip_through_write() {
     assert_eq!(json["data"], "my rule");
 }
 
+/// Jev 056 (owner decision 2026-10-29): rules and skills are read-only for a
+/// password-only second account. The owner writes; B's writes are refused,
+/// nothing lands in either user's dir from B, and B cannot read A's files.
 #[tokio::test]
 async fn rule_and_skill_files_are_isolated_by_current_user() {
     let fx = fixture().await;
@@ -1397,102 +1415,68 @@ async fn rule_and_skill_files_are_isolated_by_current_user() {
         .await
         .unwrap()
         .unwrap();
+    let dir_b = aionui_common::user_dir_name(&user_b.id).unwrap();
 
-    for (token, csrf, endpoint, content) in [
-        (
-            fx.token.as_str(),
-            fx.csrf.as_str(),
-            "/api/skills/assistant-rule/write",
-            "rule-a",
-        ),
-        (
-            token_b.as_str(),
-            csrf_b.as_str(),
-            "/api/skills/assistant-rule/write",
-            "rule-b",
-        ),
-        (
-            fx.token.as_str(),
-            fx.csrf.as_str(),
-            "/api/skills/assistant-skill/write",
-            "skill-a",
-        ),
-        (
-            token_b.as_str(),
-            csrf_b.as_str(),
-            "/api/skills/assistant-skill/write",
-            "skill-b",
-        ),
+    for (endpoint, content) in [
+        ("/api/skills/assistant-rule/write", "rule-a"),
+        ("/api/skills/assistant-skill/write", "skill-a"),
     ] {
         let req = json_with_token(
             "POST",
             endpoint,
             json!({ "assistant_id": "shared-assistant", "content": content }),
-            token,
-            csrf,
+            &fx.token,
+            &fx.csrf,
         );
         let resp = fx.app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-    }
 
-    for (token, csrf, expected) in [
-        (fx.token.as_str(), fx.csrf.as_str(), "rule-a"),
-        (token_b.as_str(), csrf_b.as_str(), "rule-b"),
-    ] {
         let req = json_with_token(
             "POST",
-            "/api/skills/assistant-rule/read",
-            json!({ "assistant_id": "shared-assistant" }),
-            token,
-            csrf,
+            endpoint,
+            json!({ "assistant_id": "shared-assistant", "content": "from-b" }),
+            &token_b,
+            &csrf_b,
         );
         let resp = fx.app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_json(resp).await["data"], expected);
+        let status = resp.status();
+        let body = body_json(resp).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::FORBIDDEN, Some(GATE_CODE)),
+            "{endpoint}: {body}"
+        );
     }
 
-    let rule_root = fx.user_data_dir.join("assistant-rules");
-    let skill_root = fx.user_data_dir.join("assistant-skills");
-    assert_eq!(
-        std::fs::read_to_string(
-            rule_root
-                .join("users")
-                .join(DEFAULT_USER_ID)
-                .join("shared-assistant.md")
-        )
-        .unwrap(),
-        "rule-a"
-    );
-    assert_eq!(
-        std::fs::read_to_string(
-            rule_root
-                .join("users")
-                .join(aionui_common::user_dir_name(&user_b.id).unwrap())
-                .join("shared-assistant.md")
-        )
-        .unwrap(),
-        "rule-b"
-    );
-    assert_eq!(
-        std::fs::read_to_string(
-            skill_root
-                .join("users")
-                .join(DEFAULT_USER_ID)
-                .join("shared-assistant.md")
-        )
-        .unwrap(),
-        "skill-a"
-    );
-    assert_eq!(
-        std::fs::read_to_string(
-            skill_root
-                .join("users")
-                .join(aionui_common::user_dir_name(&user_b.id).unwrap())
-                .join("shared-assistant.md")
-        )
-        .unwrap(),
-        "skill-b"
-    );
+    for (endpoint, expected_a) in [
+        ("/api/skills/assistant-rule/read", "rule-a"),
+        ("/api/skills/assistant-skill/read", "skill-a"),
+    ] {
+        let read = |token: &str, csrf: &str| {
+            json_with_token(
+                "POST",
+                endpoint,
+                json!({ "assistant_id": "shared-assistant" }),
+                token,
+                csrf,
+            )
+        };
+        let resp = fx.app.clone().oneshot(read(&fx.token, &fx.csrf)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["data"], expected_a);
+        let resp = fx.app.clone().oneshot(read(&token_b, &csrf_b)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["data"], "", "B must not read A's {endpoint}");
+    }
+
+    for (root, expected_a) in [("assistant-rules", "rule-a"), ("assistant-skills", "skill-a")] {
+        let users = fx.user_data_dir.join(root).join("users");
+        assert_eq!(
+            std::fs::read_to_string(users.join(DEFAULT_USER_ID).join("shared-assistant.md")).unwrap(),
+            expected_a
+        );
+        assert!(!users.join(&dir_b).exists(), "B wrote into {root}/users/{dir_b}");
+    }
 }
 
 // ===========================================================================
@@ -1807,16 +1791,14 @@ fn find_id<'a>(list: &'a Value, id: &str) -> Option<&'a Value> {
 // Two-user filesystem isolation: avatars
 // ---------------------------------------------------------------------------
 
-/// Two Core Users each upload an avatar. Each must land under its owner's
-/// `assistant-avatars/users/{dir}/` (never a shared flat dir), keep its own
-/// bytes, and be served per-user. (The service rejects reusing another user's
-/// assistant id outright — asserted here too — so a same-name overwrite can't
-/// even be attempted.)
+/// Jev 056 (owner decision 2026-10-29): only the owner (desktop session)
+/// uploads avatars; a password-only second account is read-only. B's upload is
+/// refused, nothing lands in B's or A's dir, A's bytes stay intact, and B
+/// cannot fetch A's avatar.
 #[tokio::test]
 async fn avatars_of_two_users_are_physically_isolated() {
     let mut fx = fixture().await;
 
-    // Second user alongside the fixture's admin (system_default_user).
     let (token_b, csrf_b) = setup_and_login(&mut fx.app, &fx.services, "bob", "StrongP@ss2").await;
     let user_b = fx
         .services
@@ -1827,84 +1809,70 @@ async fn avatars_of_two_users_are_physically_isolated() {
         .expect("bob should exist");
     let dir_b = aionui_common::user_dir_name(&user_b.id).unwrap();
 
-    // Same-named source file, different bytes per user.
     let src_a = fx.user_data_dir.join("picked-a.png");
     let src_b = fx.user_data_dir.join("picked-b.png");
     std::fs::write(&src_a, b"avatar-bytes-A").unwrap();
     std::fs::write(&src_b, b"avatar-bytes-B").unwrap();
 
-    for (id_body, token, csrf) in [
-        (
-            json!({ "id": "av-iso-a", "name": "Iso A", "avatar": src_a.to_string_lossy(), "agent_id": "632f31d2" }),
-            &fx.token,
-            &fx.csrf,
-        ),
-        (
-            json!({ "id": "av-iso-b", "name": "Iso B", "avatar": src_b.to_string_lossy(), "agent_id": "632f31d2" }),
-            &token_b,
-            &csrf_b,
-        ),
-    ] {
-        let req = json_with_token("POST", "/api/assistants", id_body, token, csrf);
-        let resp = fx.app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-    }
-
-    // Reusing another user's assistant id is rejected outright, so a
-    // same-name avatar overwrite cannot even be attempted.
     let req = json_with_token(
         "POST",
         "/api/assistants",
-        json!({ "id": "av-iso-a", "name": "Steal", "avatar": src_b.to_string_lossy(), "agent_id": "632f31d2" }),
-        &token_b,
-        &csrf_b,
+        json!({ "id": "av-iso-a", "name": "Iso A", "avatar": src_a.to_string_lossy(), "agent_id": "632f31d2" }),
+        &fx.token,
+        &fx.csrf,
     );
     let resp = fx.app.clone().oneshot(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::CONFLICT,
-        "cross-user assistant id reuse must be rejected"
-    );
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // Physically distinct per-user files, each with its own bytes.
-    let file_a = fx
-        .user_data_dir
-        .join("assistant-avatars/users/system_default_user/av-iso-a.png");
-    let file_b = fx
-        .user_data_dir
-        .join(format!("assistant-avatars/users/{dir_b}/av-iso-b.png"));
-    assert!(file_a.exists(), "A's avatar missing: {}", file_a.display());
-    assert!(file_b.exists(), "B's avatar missing: {}", file_b.display());
+    for id in ["av-iso-b", "av-iso-a"] {
+        let req = json_with_token(
+            "POST",
+            "/api/assistants",
+            json!({ "id": id, "name": "Iso B", "avatar": src_b.to_string_lossy(), "agent_id": "632f31d2" }),
+            &token_b,
+            &csrf_b,
+        );
+        let resp = fx.app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = body_json(resp).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::FORBIDDEN, Some(GATE_CODE)),
+            "{id}: {body}"
+        );
+    }
+
+    let avatars = fx.user_data_dir.join("assistant-avatars");
+    let file_a = avatars.join("users/system_default_user/av-iso-a.png");
     assert_eq!(
         std::fs::read(&file_a).unwrap(),
         b"avatar-bytes-A",
         "A's avatar bytes must be untouched"
     );
-    assert_eq!(std::fs::read(&file_b).unwrap(), b"avatar-bytes-B");
-    // Nothing leaked into a shared flat root or the other user's dir.
-    assert!(!fx.user_data_dir.join("assistant-avatars/av-iso-b.png").exists());
     assert!(
-        !fx.user_data_dir
-            .join("assistant-avatars/users/system_default_user/av-iso-b.png")
-            .exists()
+        !avatars.join(format!("users/{dir_b}")).exists(),
+        "B's upload must not land anywhere"
     );
+    assert!(!avatars.join("users/system_default_user/av-iso-b.png").exists());
+    assert!(!avatars.join("av-iso-b.png").exists());
 
-    // Serving is per-user: each token gets its own bytes.
-    for (id, token, expected) in [
-        ("av-iso-a", &fx.token, &b"avatar-bytes-A"[..]),
-        ("av-iso-b", &token_b, &b"avatar-bytes-B"[..]),
-    ] {
-        let resp = fx
-            .app
-            .clone()
-            .oneshot(get_with_token(&format!("/api/assistants/{id}/avatar"), token))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = http_body_util::BodyExt::collect(resp.into_body())
-            .await
-            .unwrap()
-            .to_bytes();
-        assert_eq!(&bytes[..], expected);
-    }
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants/av-iso-a/avatar", &fx.token))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = http_body_util::BodyExt::collect(resp.into_body())
+        .await
+        .unwrap()
+        .to_bytes();
+    assert_eq!(&bytes[..], b"avatar-bytes-A");
+    let resp = fx
+        .app
+        .clone()
+        .oneshot(get_with_token("/api/assistants/av-iso-a/avatar", &token_b))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "B must not fetch A's avatar");
 }

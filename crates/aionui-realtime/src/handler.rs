@@ -47,10 +47,12 @@ pub async fn ws_upgrade_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     via: Option<axum::Extension<crate::types::ViaDeviceListener>>,
+    via_tls: Option<axum::Extension<aionui_api_types::ViaLoopbackTls>>,
     axum::extract::State(state): axum::extract::State<WsHandlerState>,
 ) -> impl IntoResponse {
     let token = (state.token_extractor)(&headers);
     let via_device_listener = via.is_some();
+    let via_loopback_tls = via_tls.is_some();
 
     // Echo Sec-WebSocket-Protocol so clients using it for auth
     // receive a valid subprotocol negotiation response.
@@ -65,14 +67,20 @@ pub async fn ws_upgrade_handler(
     };
 
     ws.on_upgrade(move |socket| async move {
-        handle_socket(socket, token, state, via_device_listener).await;
+        handle_socket(socket, token, state, via_device_listener, via_loopback_tls).await;
     })
 }
 
 /// Post-upgrade connection handler.
 ///
 /// Validates the token, registers the client, spawns send/recv loops.
-async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandlerState, via_device_listener: bool) {
+async fn handle_socket(
+    socket: WebSocket,
+    token: Option<String>,
+    state: WsHandlerState,
+    via_device_listener: bool,
+    via_loopback_tls: bool,
+) {
     let Some(token) = token else {
         send_realtime_error_and_close(socket, RealtimeError::AuthMissing, "authentication required").await;
         return;
@@ -87,6 +95,16 @@ async fn handle_socket(socket: WebSocket, token: Option<String>, state: WsHandle
         send_realtime_error_and_close(socket, RealtimeError::AuthExpired, "authentication failed").await;
         return;
     };
+    if principal.requires_loopback_tls && !via_loopback_tls {
+        info!(user_id = %principal.user_id, "desktop websocket refused outside the loopback TLS listener");
+        send_realtime_error_and_close(
+            socket,
+            RealtimeError::Forbidden,
+            "desktop session requires loopback TLS",
+        )
+        .await;
+        return;
+    }
 
     let (tx, rx) = mpsc::channel::<WsOutbound>(PER_CONNECTION_BUFFER);
     let user_id = principal.user_id.clone();
@@ -593,6 +611,7 @@ mod tests {
         let phone = WsPrincipal {
             user_id: "user-1".into(),
             denied_frames: &["fs"],
+            requires_loopback_tls: false,
         };
 
         handle_text_message(

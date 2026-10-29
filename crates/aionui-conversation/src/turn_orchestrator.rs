@@ -478,6 +478,7 @@ impl ConversationTurnOrchestrator {
         let mut replay_started_at = None;
         let mut final_error_message;
         let mut auth_failure = false;
+        let mut usage_limited = false;
         // The last attempt's terminal, or the early-exit source when no relay ran (B05).
         let mut last_terminal: Option<RelayTerminal> = None;
         let turn_started_at = now_ms();
@@ -522,6 +523,7 @@ impl ConversationTurnOrchestrator {
             // Track the final attempt's auth signal so the post-loop availability
             // write-back can reflect "needs sign-in" (last iteration wins).
             auth_failure = terminal_is_auth_failure(&attempt_result.outcome);
+            usage_limited = terminal_is_usage_limit(&attempt_result.outcome);
 
             let lifecycle = runtime_state.lifecycle_for(&conv_id);
             if !attempt_result.outcome.terminal.is_error() {
@@ -645,6 +647,18 @@ impl ConversationTurnOrchestrator {
                     .unwrap_or("Agent requires sign-in to run."),
             )
             .await;
+        } else if usage_limited {
+            // Shown in the agent pickers until a later turn succeeds.
+            record_agent_session_failure(
+                &self.service,
+                &input.user_id,
+                availability_agent_id(&input.build_options).as_deref(),
+                "usage_limit",
+                final_error_message
+                    .as_deref()
+                    .unwrap_or("The agent has reached its usage limit."),
+            )
+            .await;
         } else if !final_failed {
             record_agent_session_success(
                 &self.service,
@@ -739,6 +753,11 @@ fn terminal_is_auth_failure(outcome: &RelayOutcome) -> bool {
                 | AgentErrorCode::UserLlmProviderAwsSsoExpired
         )
     )
+}
+
+/// True when the turn ended because the agent's account used up its usage allowance.
+fn terminal_is_usage_limit(outcome: &RelayOutcome) -> bool {
+    matches!(outcome.terminal.code(), Some(AgentErrorCode::UserLlmProviderUsageLimit))
 }
 
 /// codex's canonical full-access mode id (migration 021 / `full_auto_mode_id`,
@@ -1043,6 +1062,17 @@ mod tests {
     #[test]
     fn needs_auth_empty_turn_is_auth_failure() {
         assert!(terminal_is_auth_failure(&finish_outcome(true)));
+    }
+
+    #[test]
+    fn only_a_usage_limit_error_is_a_usage_limit() {
+        assert!(terminal_is_usage_limit(&error_outcome(
+            AgentErrorCode::UserLlmProviderUsageLimit
+        )));
+        assert!(!terminal_is_usage_limit(&error_outcome(
+            AgentErrorCode::UserLlmProviderBillingRequired
+        )));
+        assert!(!terminal_is_usage_limit(&finish_outcome(false)));
     }
 
     #[test]

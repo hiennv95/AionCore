@@ -799,3 +799,48 @@ async fn group_or_world_writable_upload_dirs_are_refused() {
     );
     mode(&root.join("conv"), 0o755);
 }
+
+/// H9: an upload resolves only for its owner. A namespaced upload is the named user's;
+/// a legacy (pre-namespace) upload has no owner and stays with `system_default_user`.
+#[tokio::test]
+async fn upload_refs_resolve_only_for_their_owner() {
+    let (service, _pe_id, _dir, upload_root) = setup().await;
+    let root = upload_root.path();
+    let alice_dir = root.join("users").join("alice").join("general");
+    let legacy_dir = root.join("conv-legacy");
+    std::fs::create_dir_all(&alice_dir).unwrap();
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    std::fs::write(alice_dir.join("a.txt"), b"a").unwrap();
+    std::fs::write(legacy_dir.join("l.txt"), b"l").unwrap();
+    let alice_ref = ChatFileRef::Upload {
+        path: alice_dir.join("a.txt").to_string_lossy().into_owned(),
+    };
+    let legacy_ref = ChatFileRef::Upload {
+        path: legacy_dir.join("l.txt").to_string_lossy().into_owned(),
+    };
+    let resolve = |user: &'static str, file: ChatFileRef| {
+        let service = Arc::clone(&service);
+        let root = root.to_path_buf();
+        async move {
+            service
+                .resolve_chat_file_ref(user, &file, &root, crate::FileOp::Read)
+                .await
+        }
+    };
+
+    assert!(resolve("user_alice", alice_ref.clone()).await.is_ok());
+    for (user, file) in [
+        ("user_bob", alice_ref.clone()),
+        ("system_default_user", alice_ref),
+        ("user_bob", legacy_ref.clone()),
+    ] {
+        assert!(
+            matches!(
+                resolve(user, file).await,
+                Err(ProjectError::UploadPathOutsideRoot { .. })
+            ),
+            "{user} must not resolve another owner's upload"
+        );
+    }
+    assert!(resolve("system_default_user", legacy_ref).await.is_ok());
+}

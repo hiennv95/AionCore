@@ -148,6 +148,49 @@ pub(crate) async fn bind_http_listener(config: &mut AppConfig) -> Result<BoundHt
     ))
 }
 
+/// Bind, guard, serve and then publish the desktop loopback TLS listener. Any failure
+/// stops startup: the desktop app asked for this listener and must not be left to
+/// guess. Nothing is published for a listener that is not serving.
+async fn start_loopback_tls(
+    services: &AppServices,
+    router: axum::Router,
+    port: u16,
+    http_port: u16,
+) -> Result<tokio::task::JoinHandle<()>, BootstrapError> {
+    // The host identity the device and peer listeners use (`<data-dir>/peer`).
+    let identity = aionui_peer::PeerIdentity::load_or_create(&services.data_dir.join("peer"), "aionx-host")
+        .map_err(|e| loopback_tls_error(BootstrapErrorCode::DataInitFailed, "loopback_tls.identity", e))?;
+    let listener = aionui_device::LoopbackTlsListener::bind(port)
+        .await
+        .map_err(|e| loopback_tls_error(BootstrapErrorCode::BindFailed, "loopback_tls.bind", e))?;
+    let tls_port = listener.port();
+    // The guards the HTTP listener gets, for this listener's own https origins and port.
+    let router = with_host_guard(
+        with_origin_guard(router, AllowedOrigins::bound_loopback_tls(tls_port)),
+        AllowedHosts::loopback(tls_port, None),
+    );
+    let task = listener
+        .serve(&identity, router)
+        .map_err(|e| loopback_tls_error(BootstrapErrorCode::ServerFailed, "loopback_tls.serve", e))?;
+    if let Err(error) = aionui_device::publish_identity_metadata(&services.data_dir, &identity, http_port, tls_port) {
+        task.abort();
+        return Err(loopback_tls_error(
+            BootstrapErrorCode::DataInitFailed,
+            "loopback_tls.metadata",
+            error,
+        ));
+    }
+    Ok(task)
+}
+
+fn loopback_tls_error(
+    code: BootstrapErrorCode,
+    stage: &'static str,
+    error: impl Into<anyhow::Error>,
+) -> BootstrapError {
+    BootstrapError::new(code, stage, "loopback TLS listener failed to start").with_source(error)
+}
+
 fn is_fetch_forbidden_backend_port(port: u16) -> bool {
     matches!(
         port,
@@ -292,7 +335,7 @@ pub(crate) async fn run_server(
         let jwt_service = services.jwt_service.clone();
         services
             .ws_manager
-            .start_token_expiry_sweep(Arc::new(move |token: &str| jwt_service.verify(token).is_ok()));
+            .start_token_expiry_sweep(Arc::new(move |token: &str| jwt_service.verify_access(token).is_ok()));
     }
     // LAN network (ADR-009): recover the inbox/outbox and start the peer
     // listener when enabled (UI setting) or fixed by `--peer-listen`.
@@ -322,6 +365,20 @@ pub(crate) async fn run_server(
     {
         warn!(%error, "device listener did not start");
     }
+    // Desktop loopback TLS (`--loopback-tls`): the same routes over TLS on 127.0.0.1 for
+    // the desktop app. The desktop bootstrap (session and host proof) then answers only
+    // there; the plain HTTP listener keeps serving browsers without it.
+    let (router, _loopback_tls) = match env.loopback_tls {
+        Some(port) => {
+            let task = start_loopback_tls(&services, router.clone(), port, bound.addr.port()).await?;
+            let router = router.layer(axum::middleware::from_fn(aionui_device::no_desktop_bootstrap));
+            (router, Some(task))
+        }
+        None => {
+            aionui_device::withdraw_identity_metadata(&services.data_dir);
+            (router, None)
+        }
+    };
     // Outermost: must see every request before CORS, auth, WS upgrade or static files.
     // Without an explicit list, a non-local host still only answers browsers on its own
     // loopback origins (C4, Jev 045); local mode already guards inside the router.

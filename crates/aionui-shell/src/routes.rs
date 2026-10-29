@@ -55,14 +55,15 @@ impl From<SttError> for ApiError {
 }
 
 pub fn shell_routes(state: ShellRouterState) -> Router {
-    // Opening or revealing host paths is a host file effect (ADR-013).
+    // Opening or revealing host paths, or opening a URL in the host's browser, is a
+    // host effect (ADR-013). The tool probe only returns a bool and stays open.
     let host_file_effects = Router::new()
+        .route("/api/shell/open-external", post(open_external))
         .route("/api/shell/open-file", post(open_file))
         .route("/api/shell/show-item-in-folder", post(show_item_in_folder))
         .route("/api/shell/open-folder-with", post(open_folder_with))
         .route_layer(from_fn(desktop_only));
     Router::new()
-        .route("/api/shell/open-external", post(open_external))
         .route("/api/shell/check-tool-installed", post(check_tool_installed))
         .route("/api/stt", post(speech_to_text))
         .route("/api/stt/stream", get(speech_to_text_stream))

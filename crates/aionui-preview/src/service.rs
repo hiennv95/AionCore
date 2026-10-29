@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use aionui_api_types::ConversationFileView;
+use aionui_api_types::{ConversationFileView, FileDiffView, PreviewKind};
 use aionui_common::OnFilesReported;
 use aionui_db::{ConversationFileRefRow, IConversationRepository, IPreviewRepository, UpsertFileRefParams};
 
@@ -84,30 +84,35 @@ impl PreviewService {
             .await?
             .ok_or(PreviewError::FileNotFound)?;
         blocking(move || {
-            let (mut file, meta) = workspace
-                .as_deref()
-                .and_then(|workspace| open_checked(workspace, &row))
-                .ok_or(PreviewError::FileNotFound)?;
-            let mut bytes = Vec::new();
-            (&mut file)
-                .take(SNIFF_LEN as u64)
-                .read_to_end(&mut bytes)
-                .map_err(|_| PreviewError::FileNotFound)?;
-            let kind = classify(&row.rel_path, &bytes);
-            let cap = kind.cap().ok_or(PreviewError::Unsupported)?;
-            if meta.len() > cap {
-                return Err(PreviewError::TooLarge);
-            }
-            // The file may grow after the size check; never read past the cap.
-            file.take(cap + 1 - bytes.len() as u64)
-                .read_to_end(&mut bytes)
-                .map_err(|_| PreviewError::FileNotFound)?;
-            if bytes.len() as u64 > cap {
-                return Err(PreviewError::TooLarge);
-            }
+            let (kind, bytes) = read_checked(workspace.as_deref(), &row)?;
             Ok(PreviewContent { mime: kind.mime, bytes })
         })
         .await
+    }
+
+    /// PV06 (ADR-024): the git HEAD blob of a text ref against the file on disk now.
+    pub async fn diff(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        file_id: &str,
+    ) -> Result<FileDiffView, PreviewError> {
+        let workspace = self.owned_workspace(user_id, conversation_id).await?;
+        let row = self
+            .refs
+            .find_file_ref(conversation_id, file_id)
+            .await?
+            .ok_or(PreviewError::FileNotFound)?;
+        let (workspace, row, current) = blocking(move || {
+            let (kind, bytes) = read_checked(workspace.as_deref(), &row)?;
+            if !matches!(kind.preview, PreviewKind::Text | PreviewKind::Markdown) {
+                return Err(PreviewError::Unsupported);
+            }
+            Ok((workspace, row, bytes))
+        })
+        .await?;
+        let workspace = workspace.ok_or(PreviewError::FileNotFound)?;
+        crate::diff::file_diff(&workspace, &row.rel_path, current).await
     }
 
     pub async fn devices_allowed(&self, user_id: &str) -> Result<bool, PreviewError> {
@@ -219,6 +224,31 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
 #[cfg(not(unix))]
 fn same_file(a: &Metadata, b: &Metadata) -> bool {
     a.len() == b.len() && a.modified().ok() == b.modified().ok()
+}
+
+/// The ref's kind and bytes, re-checked by `open_checked` and never read past the kind's cap.
+fn read_checked(workspace: Option<&Path>, row: &ConversationFileRefRow) -> Result<(Kind, Vec<u8>), PreviewError> {
+    let (mut file, meta) = workspace
+        .and_then(|workspace| open_checked(workspace, row))
+        .ok_or(PreviewError::FileNotFound)?;
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(SNIFF_LEN as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| PreviewError::FileNotFound)?;
+    let kind = classify(&row.rel_path, &bytes);
+    let cap = kind.cap().ok_or(PreviewError::Unsupported)?;
+    if meta.len() > cap {
+        return Err(PreviewError::TooLarge);
+    }
+    // The file may grow after the size check; never read past the cap.
+    file.take(cap + 1 - bytes.len() as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| PreviewError::FileNotFound)?;
+    if bytes.len() as u64 > cap {
+        return Err(PreviewError::TooLarge);
+    }
+    Ok((kind, bytes))
 }
 
 fn mtime_ms(meta: &Metadata) -> i64 {

@@ -24,8 +24,11 @@ const MAX_DEVICE_NAME: usize = 64;
 /// Who makes an owner request, as authentication established it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Caller {
-    /// A session without a device: the legacy login or local mode.
+    /// Local identity mode: no login, the single local owner.
     Session,
+    /// A network login bound to no device (password, QR code or external
+    /// account). Like a paired phone it never manages devices (Jev 053).
+    Deviceless,
     /// A device-bound session.
     Device(String),
     /// An agent's helper CLI on the runtime-token channel. Acts for the owner's
@@ -37,7 +40,7 @@ impl Caller {
     fn device(&self) -> Option<&str> {
         match self {
             Self::Device(id) => Some(id),
-            Self::Session | Self::RuntimeHelper => None,
+            Self::Session | Self::Deviceless | Self::RuntimeHelper => None,
         }
     }
 }
@@ -137,14 +140,14 @@ impl DeviceService {
         Ok(owner)
     }
 
-    /// Owner who may manage devices: the desktop app (or a session without a
-    /// device, i.e. the legacy login / local mode). Paired phones and browsers
-    /// cannot pair or revoke other devices, nor can an agent's helper CLI.
+    /// Owner who may manage devices: the desktop app or local mode. Paired
+    /// phones and browsers, device-less logins and an agent's helper CLI cannot
+    /// pair or revoke other devices.
     async fn ensure_manager(&self, user_id: &str, caller: &Caller) -> Result<User, DeviceError> {
         let owner = self.ensure_owner(user_id).await?;
         match caller {
             Caller::Session => {}
-            Caller::RuntimeHelper => return Err(DeviceError::OwnerOnly),
+            Caller::RuntimeHelper | Caller::Deviceless => return Err(DeviceError::OwnerOnly),
             Caller::Device(device_id) => {
                 let manager = self
                     .devices

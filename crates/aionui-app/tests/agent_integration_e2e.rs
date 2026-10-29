@@ -190,7 +190,7 @@ impl IWorkerTaskManager for MockTaskManager {
 
 async fn build_app_with_mock_tasks() -> (axum::Router, aionui_app::AppServices, Arc<MockTaskManager>) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
+    let services = aionui_app::AppServices::from_config(db, &common::scratch_config())
         .await
         .unwrap();
 
@@ -626,8 +626,8 @@ async fn side_question_with_mock_agent() {
 
 #[tokio::test]
 async fn agent_overrides_roundtrip_and_management_summary() {
-    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     upsert_visible_agent_metadata(&services, "ovr-agent", "acp").await;
     services.agent_registry.hydrate().await.unwrap();
     services.agent_registry.refresh_availability().await;
@@ -675,8 +675,8 @@ async fn agent_overrides_roundtrip_and_management_summary() {
 
 #[tokio::test]
 async fn npx_bridged_agent_rejects_command_override() {
-    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Seed a builtin npx-bridged ACP row (command == "npx", bridge_binary != binary_name),
     // mirroring the ACP Registry agents such as Kilo.
@@ -747,8 +747,8 @@ async fn npx_bridged_agent_rejects_command_override() {
 
 #[tokio::test]
 async fn internal_aion_cli_rejects_overrides() {
-    let (mut app, services, _mock_tm) = build_app_with_mock_tasks().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "Pass123!").await;
+    let (app, services, _mock_tm) = build_app_with_mock_tasks().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     upsert_visible_agent_metadata(&services, "632f31d2", "aionrs").await;
     services.agent_registry.hydrate().await.unwrap();
     services.agent_registry.refresh_availability().await;

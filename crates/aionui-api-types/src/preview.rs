@@ -11,6 +11,8 @@ pub enum PreviewKind {
     Text,
     Markdown,
     Image,
+    /// Shown by the platform viewer (ADR-025, Jev 061).
+    Pdf,
     Unsupported,
 }
 
@@ -35,4 +37,39 @@ pub struct ConversationFileView {
 #[serde(deny_unknown_fields)]
 pub struct FilePreviewSettings {
     pub devices_allowed: bool,
+}
+
+/// What a file diff compares (ADR-024): always the git HEAD blob against the file on disk now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDiffSource {
+    HeadVsDisk,
+}
+
+/// `not_a_repo`: no git worktree inside the chat folder holds the file; there is no diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDiffStatus {
+    Ok,
+    NotARepo,
+}
+
+/// `absent`: the file is not in HEAD (untracked or new), so the diff adds every line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileDiffBase {
+    Head,
+    Absent,
+}
+
+/// A unified diff of one previewable file. Headers are `a/<rel_path>` and `b/<rel_path>`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileDiffView {
+    pub source: FileDiffSource,
+    pub status: FileDiffStatus,
+    /// `None` when `status` is `not_a_repo`.
+    pub base: Option<FileDiffBase>,
+    pub diff: String,
+    /// The diff was cut at the 256 KB output cap.
+    pub truncated: bool,
 }

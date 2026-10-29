@@ -114,8 +114,8 @@ async fn t1_3_create_with_optional_fields() {
 
 #[tokio::test]
 async fn t1_3b_create_persists_available_locale_fallback_rule_in_assistant_snapshot() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
     let assistant_id = "locale-fallback-u1";
 
     let create_assistant_req = json_with_token(
@@ -1314,6 +1314,23 @@ async fn lan_remote_conversation_rejects_rescoping_through_extra_but_allows_rena
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     let id = body_json(resp).await["data"]["id"].as_str().unwrap().to_owned();
+    // `lan_remote` is server-owned (stripped from client create); the LAN share runner
+    // sets it through the service, so the fixture marks the row directly.
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let user_id = repo.owner_user_id(&id).await.unwrap().unwrap();
+    let row = aionui_db::IConversationRepository::get(&repo, &user_id, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stored: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    stored["lan_remote"] = json!(true);
+    let update = aionui_db::ConversationRowUpdate {
+        extra: Some(stored.to_string()),
+        ..Default::default()
+    };
+    aionui_db::IConversationRepository::update(&repo, &user_id, &id, &update)
+        .await
+        .unwrap();
 
     for extra in [
         json!({"session_mode": "full-access"}),

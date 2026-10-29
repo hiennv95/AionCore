@@ -2800,15 +2800,31 @@ fn is_unsupported_direct_avatar_reference(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://") || value.starts_with("data:")
 }
 
+/// Accepts only `/api/assistants/{id}/avatar[?…|#…]`, optionally behind a
+/// loopback origin; anything else (foreign hosts, path prefixes) is refused (audit H13).
 pub(crate) fn parse_assistant_avatar_route(value: &str) -> Option<String> {
-    let prefix = "/api/assistants/";
-    let suffix = "/avatar";
-    let route_start = value.find(prefix)?;
-    let route_and_after = &value[route_start..];
-    let suffix_end = route_and_after.find(suffix)? + suffix.len();
-    let route = &route_and_after[..suffix_end];
-    let id = route.strip_prefix(prefix)?.strip_suffix(suffix)?.trim();
-    (!id.is_empty()).then(|| id.to_string())
+    let value = value.trim();
+    let path = match value.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") => {
+            let (authority, path) = rest.split_at(rest.find('/')?);
+            let host = authority.rsplit_once(':').map_or(authority, |(host, port)| {
+                if port.bytes().all(|b| b.is_ascii_digit()) {
+                    host
+                } else {
+                    authority
+                }
+            });
+            if !matches!(host.to_ascii_lowercase().as_str(), "localhost" | "127.0.0.1" | "[::1]") {
+                return None;
+            }
+            path
+        }
+        Some(_) => return None,
+        None => value,
+    };
+    let path = path.split(['?', '#']).next()?;
+    let id = path.strip_prefix("/api/assistants/")?.strip_suffix("/avatar")?.trim();
+    (!id.is_empty() && !id.contains('/')).then(|| id.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -3579,6 +3595,27 @@ mod tests {
         assert!(plain.ends_with("custom-1.jpg"), "{plain}");
     }
 
+    // H11: deleting `a` must not remove the avatar of a neighbouring id such as `a.b`,
+    // whose encoded file name (`a%2Eb.png`) also starts with `a`.
+    #[tokio::test]
+    async fn deleting_an_avatar_keeps_neighbour_ids_avatars() {
+        let data = tempfile::tempdir().unwrap();
+        let svc = test_service_with_data_dir(data.path()).await;
+        let user = "system_default_user";
+        for id in ["a", "a.b", "a-b", "ab"] {
+            svc.persist_user_avatar_bytes(user, id, b"png", Some("png")).unwrap();
+        }
+        let dir = svc.user_avatars_dir_for_user(user);
+        assert!(remove_assistant_avatar_files(&dir, "a"));
+        assert!(svc.find_existing_user_avatar_file(user, "a").is_none());
+        for neighbour in ["a.b", "a-b", "ab"] {
+            assert!(
+                svc.find_existing_user_avatar_file(user, neighbour).is_some(),
+                "{neighbour} lost its avatar"
+            );
+        }
+    }
+
     fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(dir).unwrap().flatten() {
@@ -3622,6 +3659,25 @@ mod tests {
         assert!(is_safe_untrusted_avatar("/api/assistants/custom-1/avatar?v=2"));
         assert!(is_safe_untrusted_avatar(
             "http://localhost:25818/api/assistants/custom-1/avatar"
+        ));
+
+        assert!(is_safe_untrusted_avatar(
+            "http://127.0.0.1:49194/api/assistants/custom-1/avatar"
+        ));
+        assert_eq!(
+            parse_assistant_avatar_route("/api/assistants/custom-1/avatar?v=2").as_deref(),
+            Some("custom-1")
+        );
+
+        // Unsafe (audit H13): the route must be anchored at the start or a loopback origin
+        assert!(!is_safe_untrusted_avatar(
+            "https://evil.example/api/assistants/custom-1/avatar"
+        ));
+        assert!(!is_safe_untrusted_avatar("/etc/x/api/assistants/custom-1/avatar"));
+        assert!(!is_safe_untrusted_avatar("/api/assistants/a/b/avatar"));
+        assert!(!is_safe_untrusted_avatar("/api/assistants/custom-1/avatar.png"));
+        assert!(!is_safe_untrusted_avatar(
+            "http://localhost.evil.example/api/assistants/custom-1/avatar"
         ));
 
         // Unsafe / Host-file candidates: absolute paths
@@ -4334,6 +4390,48 @@ mod tests {
         assert!(!default_list.iter().any(|assistant| assistant.id == "u-b"));
         assert!(user_b_list.iter().any(|assistant| assistant.id == "u-b"));
         assert!(!user_b_list.iter().any(|assistant| assistant.id == "u-default"));
+    }
+
+    // The HTTP write gate now stops device-less secondary accounts before the service
+    // (Jev 056), so the service's own ownership check on writes is covered here.
+    #[tokio::test]
+    async fn update_and_delete_refuse_another_users_assistant() {
+        let fx = fixture_with_builtins(vec![]).await;
+        let user_b = create_test_user(&fx._db, "assistant_owner_b").await;
+        seed_provider_for_user(&*fx.provider_repo, &user_b, "openai").await;
+        fx.service
+            .create_for_user(
+                &user_b,
+                CreateAssistantRequest {
+                    id: Some("b-only".into()),
+                    name: "B Assistant".into(),
+                    ..req_default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let update = fx
+            .service
+            .update_for_user(
+                DEFAULT_USER_ID,
+                "b-only",
+                UpdateAssistantRequest {
+                    name: Some("hijacked".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(update, Err(AssistantError::NotFound(_))), "{update:?}");
+        let delete = fx.service.delete_for_user(DEFAULT_USER_ID, "b-only").await;
+        assert!(matches!(delete, Err(AssistantError::NotFound(_))), "{delete:?}");
+
+        let b_list = fx.service.list_for_user(&user_b).await.unwrap();
+        let row = b_list
+            .iter()
+            .find(|a| a.id == "b-only")
+            .expect("B's assistant is still there");
+        assert_eq!(row.name, "B Assistant");
     }
 
     #[tokio::test]

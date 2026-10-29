@@ -10068,4 +10068,11 @@ async fn a_peer_turn_needs_the_live_agent_in_the_share_mode() {
     let kept = Arc::new(MockAgent::new(&conv.id).with_config_options(vec![mode_option("read-only")]));
     task_mgr.insert_agent(&conv.id, AgentInstance::Mock(kept));
     svc.ensure_lan_share_mode("user_1", &conv.id).await.unwrap();
+
+    // H17: a share whose live agent reports no mode at all cannot prove it is in the
+    // shared mode, so the peer turn is refused (fail closed).
+    let silent = Arc::new(MockAgent::new(&conv.id));
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(silent));
+    let err = svc.ensure_lan_share_mode("user_1", &conv.id).await.unwrap_err();
+    assert!(matches!(err, ConversationError::Forbidden { .. }), "{err:?}");
 }

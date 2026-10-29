@@ -46,6 +46,7 @@ fn app_for(db: &aionui_db::Database, jwt: Arc<JwtService>) -> Router {
         local: false,
         aionpro_mode: false,
         device_repo: Some(Arc::new(aionui_db::SqliteDeviceRepository::new(db.pool().clone()))),
+        desktop_requires_loopback_tls: false,
     })
 }
 

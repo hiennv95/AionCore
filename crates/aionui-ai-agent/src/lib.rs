@@ -12,6 +12,7 @@ pub(crate) mod cli_probe;
 pub(crate) mod dev_prompt_dump;
 pub mod error;
 pub mod factory;
+pub mod helper_access;
 pub(crate) mod idle_scanner;
 pub mod manager;
 /// Neutral MCP resolution for the session-model port (claude/codex). Ported from
@@ -54,6 +55,7 @@ pub use capability::skill_manager::{
 };
 pub use error::AgentError;
 pub use factory::{AgentFactoryDeps, build_agent_factory};
+pub use helper_access::{HelperAccess, HelperDenied, HelperUse};
 pub use idle_scanner::{
     IdleCleanupCoordinator, resolve_idle_config_from_env, start_idle_scanner, start_idle_scanner_with_coordinator,
 };

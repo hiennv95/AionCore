@@ -110,11 +110,27 @@ pub enum ConversationToolErrorCode {
     AssistantDisabled,
     AssistantModelUnresolved,
     RuntimeAuthFailed,
+    /// The caller is the helper of a LAN-share conversation, which may only read skills.
+    HelperNotForLanShare,
     SchemaValidationFailed,
     TransportUnavailable,
 }
 
 impl ConversationToolErrorCode {
+    /// Every code, in declaration order. `capabilities` documents exactly this list.
+    pub const ALL: [Self; 10] = [
+        Self::CallerIsTeam,
+        Self::WorkspaceNotAbsolute,
+        Self::WorkspaceUnavailable,
+        Self::AssistantNotFound,
+        Self::AssistantDisabled,
+        Self::AssistantModelUnresolved,
+        Self::RuntimeAuthFailed,
+        Self::HelperNotForLanShare,
+        Self::SchemaValidationFailed,
+        Self::TransportUnavailable,
+    ];
+
     /// The wire value, for structured log fields. Kept in lock-step with the
     /// serde rename by a unit test.
     pub fn as_str(self) -> &'static str {
@@ -126,6 +142,7 @@ impl ConversationToolErrorCode {
             Self::AssistantDisabled => "assistant_disabled",
             Self::AssistantModelUnresolved => "assistant_model_unresolved",
             Self::RuntimeAuthFailed => "runtime_auth_failed",
+            Self::HelperNotForLanShare => "helper_not_for_lan_share",
             Self::SchemaValidationFailed => "schema_validation_failed",
             Self::TransportUnavailable => "transport_unavailable",
         }
@@ -269,17 +286,7 @@ mod tests {
 
     #[test]
     fn every_error_code_has_a_distinct_snake_case_wire_value_matching_as_str() {
-        let codes = [
-            ConversationToolErrorCode::CallerIsTeam,
-            ConversationToolErrorCode::WorkspaceNotAbsolute,
-            ConversationToolErrorCode::WorkspaceUnavailable,
-            ConversationToolErrorCode::AssistantNotFound,
-            ConversationToolErrorCode::AssistantDisabled,
-            ConversationToolErrorCode::AssistantModelUnresolved,
-            ConversationToolErrorCode::RuntimeAuthFailed,
-            ConversationToolErrorCode::SchemaValidationFailed,
-            ConversationToolErrorCode::TransportUnavailable,
-        ];
+        let codes = ConversationToolErrorCode::ALL;
         let mut wire: Vec<String> = codes
             .iter()
             .map(|code| {

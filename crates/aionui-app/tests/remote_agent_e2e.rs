@@ -44,7 +44,7 @@ async fn create_agent(app: &mut axum::Router, token: &str, csrf: &str, body: ser
 #[tokio::test]
 async fn t1_1_create_bearer_agent() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let json = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
 
@@ -65,7 +65,7 @@ async fn t1_1_create_bearer_agent() {
 #[tokio::test]
 async fn t1_2_create_openclaw_agent_generates_device_keys() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let json = create_agent(&mut app, &token, &csrf, openclaw_agent_body()).await;
 
@@ -80,8 +80,8 @@ async fn t1_2_create_openclaw_agent_generates_device_keys() {
 
 #[tokio::test]
 async fn t1_3_create_missing_required_fields() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({ "name": "test" });
     let req = json_with_token("POST", "/api/remote-agents", body, &token, &csrf);
@@ -109,7 +109,7 @@ async fn t1_4_create_unauthenticated() {
 #[tokio::test]
 async fn t2_1_list_returns_agents_without_auth_token() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
 
@@ -145,7 +145,7 @@ async fn t2_2_list_empty() {
 #[tokio::test]
 async fn t3_1_get_single_agent_with_masked_token() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
     let id = created["data"]["id"].as_str().unwrap();
@@ -176,7 +176,7 @@ async fn t3_2_get_nonexistent_agent() {
 #[tokio::test]
 async fn t4_1_update_name_only() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
     let id = created["data"]["id"].as_str().unwrap();
@@ -196,7 +196,7 @@ async fn t4_1_update_name_only() {
 #[tokio::test]
 async fn t4_2_update_multiple_fields() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
     let id = created["data"]["id"].as_str().unwrap();
@@ -218,8 +218,8 @@ async fn t4_2_update_multiple_fields() {
 
 #[tokio::test]
 async fn t4_3_update_nonexistent_agent() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({ "name": "Doesn't Matter" });
     let req = json_with_token("PUT", "/api/remote-agents/nonexistent-uuid", body, &token, &csrf);
@@ -232,7 +232,7 @@ async fn t4_3_update_nonexistent_agent() {
 #[tokio::test]
 async fn t5_1_delete_agent() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
     let id = created["data"]["id"].as_str().unwrap();
@@ -249,8 +249,8 @@ async fn t5_1_delete_agent() {
 
 #[tokio::test]
 async fn t5_2_delete_nonexistent_agent() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = delete_with_token("/api/remote-agents/nonexistent-uuid", &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -261,8 +261,8 @@ async fn t5_2_delete_nonexistent_agent() {
 
 #[tokio::test]
 async fn t6_1_test_connection_invalid_protocol() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let body = json!({
         "url": "http://example.com",
@@ -298,7 +298,7 @@ async fn t6_2_test_connection_unauthenticated() {
 #[tokio::test]
 async fn t7_1_handshake_non_openclaw_protocol() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let created = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;
     let id = created["data"]["id"].as_str().unwrap();
@@ -316,8 +316,8 @@ async fn t7_1_handshake_non_openclaw_protocol() {
 
 #[tokio::test]
 async fn t7_2_handshake_nonexistent_agent() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -335,7 +335,7 @@ async fn t7_2_handshake_nonexistent_agent() {
 #[tokio::test]
 async fn t8_full_crud_lifecycle() {
     let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Create
     let created = create_agent(&mut app, &token, &csrf, bearer_agent_body()).await;

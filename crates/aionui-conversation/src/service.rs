@@ -10,6 +10,7 @@ use aionui_ai_agent::{
     RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
 };
 
+use crate::handoff_excerpt::{Excerpt, build_excerpt, wrap_for_target};
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
@@ -20,12 +21,12 @@ use aionui_api_types::{
     ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
-    assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
+    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, HandoffConversationRequest,
+    HandoffPreviewResponse, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse,
+    MessageResponse, MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection,
+    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    assistant_avatar_response_value, assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, SessionRef};
 use aionui_common::{
@@ -285,6 +286,25 @@ impl McpSupportPolicy {
         }
     }
 }
+
+/// An unready handoff target older than this is a crashed attempt's leftover.
+const HANDOFF_STALE_MS: i64 = 60_000;
+
+fn handoff_in_progress() -> ConversationError {
+    ConversationError::Busy {
+        reason: "HANDOFF_IN_PROGRESS: this handoff is still being created; retry shortly".into(),
+    }
+}
+
+fn handoff_meta(row: &ConversationRow) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(&row.extra)
+        .ok()
+        .and_then(|extra| extra.get("handoff").cloned())
+        .unwrap_or_default()
+}
+
+/// Rows scanned for the handoff excerpt (dialog is filtered from them).
+const HANDOFF_SCAN_ROWS: u32 = 200;
 
 fn parse_agent_type_from_row(row: &ConversationRow) -> Option<AgentType> {
     serde_json::from_value::<AgentType>(serde_json::Value::String(row.r#type.clone())).ok()
@@ -1077,7 +1097,18 @@ impl ConversationService {
         user_id: &str,
         req: CreateConversationRequest,
     ) -> Result<ConversationResponse, ConversationError> {
-        let id = generate_short_id();
+        self.create_with_id(user_id, generate_short_id(), req, None).await
+    }
+
+    /// `first_context` (handoff excerpt) is appended to the agent's preset context
+    /// in the same insert as the row, so the row never exists without it.
+    async fn create_with_id(
+        &self,
+        user_id: &str,
+        id: String,
+        req: CreateConversationRequest,
+        first_context: Option<&str>,
+    ) -> Result<ConversationResponse, ConversationError> {
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
@@ -1456,6 +1487,19 @@ impl ConversationService {
                     })?,
                 );
             }
+        }
+
+        if let Some(context) = first_context {
+            let field = if effective_type == AgentType::Aionrs {
+                "preset_rules"
+            } else {
+                "preset_context"
+            };
+            let merged = match extra.get(field).and_then(serde_json::Value::as_str) {
+                Some(existing) if !existing.trim().is_empty() => format!("{existing}\n\n{context}"),
+                _ => context.to_owned(),
+            };
+            extra[field] = serde_json::Value::String(merged);
         }
 
         let row = aionui_db::models::ConversationRow {
@@ -2688,21 +2732,23 @@ impl ConversationService {
         // then waits for the next startup sweep.
         self.skill_resolver.remove_skill_view(user_id, id).await;
 
+        // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
+        // conversations that used to be ACP (shouldn't happen but is
+        // cheap to cover) still drop their orphaned session row.
+        // Before the row delete: `delete_for_user` scopes through the conversation
+        // row, so after it the session row could no longer be matched (orphan).
+        if let Err(err) = self.acp_session_repo.delete_for_user(user_id, id).await {
+            warn!(
+                error = %ErrorChain(&err),
+                "Failed to delete acp_session row on conversation delete"
+            );
+        }
         if let Err(err) = self.conversation_repo.delete(user_id, id).await {
             self.runtime_state.clear_deleting(id);
             return Err(err.into());
         }
         if !had_active_turn {
             self.runtime_state.clear_deleting(id);
-        }
-        // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
-        // conversations that used to be ACP (shouldn't happen but is
-        // cheap to cover) still drop their orphaned session row.
-        if let Err(err) = self.acp_session_repo.delete_for_user(user_id, id).await {
-            warn!(
-                error = %ErrorChain(&err),
-                "Failed to delete acp_session row on conversation delete"
-            );
         }
         if let Some(workspace) = auto_workspace_to_delete {
             let workspace_removed = match tokio::fs::remove_dir_all(&workspace).await {
@@ -2769,6 +2815,202 @@ impl ConversationService {
     /// 403 team / 404 conversation or message / 409 `FORK_TURN_IN_FLIGHT`,
     /// `FORK_PARENT_UNBOUND` / 422 `FORK_UNSUPPORTED`, `FORK_POINT_UNSUPPORTED`.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
+    /// Handoff source (ADR-023): the caller's own conversation (else 404), never a
+    /// Team conversation or a LAN share (Jev 059 Q5).
+    async fn handoff_source(&self, user_id: &str, id: &str) -> Result<ConversationRow, ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user_id, id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound { id: id.to_owned() })?;
+        if team_id_from_extra(&row.extra).is_some() {
+            return Err(ConversationError::Forbidden {
+                reason: "HANDOFF_TEAM_SOURCE: team conversations cannot be handed off".into(),
+            });
+        }
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_default();
+        if extra.get("lan_remote").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Err(ConversationError::Forbidden {
+                reason: "HANDOFF_LAN_SHARE_SOURCE: LAN share conversations cannot be handed off".into(),
+            });
+        }
+        Ok(row)
+    }
+
+    async fn handoff_excerpt(&self, user_id: &str, id: &str) -> Result<Excerpt, ConversationError> {
+        let page = self
+            .conversation_repo
+            .list_messages_page(
+                user_id,
+                id,
+                &MessagePageParams {
+                    limit: HANDOFF_SCAN_ROWS,
+                    direction: MessagePageDirection::InitialLatest,
+                },
+            )
+            .await?;
+        Ok(build_excerpt(&page.items, page.has_more_before))
+    }
+
+    /// `POST /api/conversations/{id}/handoff/preview`: what a handoff would carry.
+    pub async fn handoff_preview(&self, user_id: &str, id: &str) -> Result<HandoffPreviewResponse, ConversationError> {
+        self.handoff_source(user_id, id).await?;
+        let excerpt = self.handoff_excerpt(user_id, id).await?;
+        Ok(HandoffPreviewResponse {
+            excerpt: excerpt.text,
+            turn_count: excerpt.turn_count,
+            truncated: excerpt.truncated,
+        })
+    }
+
+    /// `POST /api/conversations/{id}/handoff`: a NEW conversation (no resume anchor)
+    /// seeded with the excerpt. Returns the target and whether it was created now;
+    /// the same idempotency key for the same source returns the same target.
+    pub async fn handoff(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: HandoffConversationRequest,
+    ) -> Result<(ConversationResponse, bool), ConversationError> {
+        let key = req.idempotency_key.trim();
+        if key.is_empty() || key.len() > 128 {
+            return Err(ConversationError::BadRequest {
+                reason: "idempotency_key must be 1-128 characters".into(),
+            });
+        }
+        // Deterministic per (user, source, key), so a replay finds its target
+        // before the source is looked up: it still answers after the source is deleted.
+        let (target_id, fingerprint) = handoff_target_id(user_id, id, key);
+        if let Some(existing) = self.existing_handoff_target(user_id, &target_id, &fingerprint).await? {
+            return Ok((existing, false));
+        }
+        let source = self.handoff_source(user_id, id).await?;
+        let excerpt = self.handoff_excerpt(user_id, id).await?;
+        if excerpt.turn_count == 0 {
+            return Err(ConversationError::Unprocessable {
+                reason: "HANDOFF_EMPTY: the conversation has no dialog to hand off".into(),
+            });
+        }
+
+        let attempt = generate_short_id();
+        let mut target = req.target;
+        if !target.extra.is_object() {
+            target.extra = serde_json::json!({});
+        }
+        strip_server_owned_extra(&mut target.extra);
+        if let Some(obj) = target.extra.as_object_mut() {
+            obj.remove("teamId");
+            // Same project unless the owner explicitly picked another (Jev 059 Q6).
+            if !req.cross_project {
+                obj.remove("workspace");
+                let source_extra: serde_json::Value = serde_json::from_str(&source.extra).unwrap_or_default();
+                if auto_provisioned_workspace_to_delete(&self.workspace_root, &source, id).is_none()
+                    && let Some(workspace) = source_extra.get("workspace").filter(|w| w.is_string())
+                {
+                    obj.insert("workspace".into(), workspace.clone());
+                }
+            }
+            obj.insert(
+                "handoff".into(),
+                serde_json::json!({
+                    "source_conversation_id": id,
+                    "created_at": now_ms(),
+                    "turn_count": excerpt.turn_count,
+                    "truncated": excerpt.truncated,
+                    "key_fingerprint": fingerprint,
+                    "attempt": attempt,
+                    "ready": false,
+                }),
+            );
+        }
+        // The row is inserted with provenance and excerpt but `ready: false`; the
+        // create sequence (snapshot, acp_session, preferences) then runs, and only
+        // after all of it succeeds is the row marked ready. Lookups never return an
+        // unready row; this attempt removes its own partial row on any failure.
+        let wrapped = wrap_for_target(&excerpt.text);
+        let created = self
+            .create_with_id(user_id, target_id.clone(), target, Some(&wrapped))
+            .await;
+        let result = match created {
+            Ok(_) => self
+                .conversation_repo
+                .mark_handoff_ready(user_id, &target_id, &attempt)
+                .await
+                .map_err(ConversationError::from),
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(true) => {
+                info!(source = %id, target = %target_id, turns = excerpt.turn_count, "conversation handoff created");
+                Ok((self.get(user_id, &target_id).await?, true))
+            }
+            // Our row was replaced by another attempt (stale recovery): not ours to report.
+            Ok(false) => Err(handoff_in_progress()),
+            Err(err) => {
+                match self
+                    .conversation_repo
+                    .delete_unready_handoff(user_id, &target_id, &attempt)
+                    .await
+                {
+                    Ok(true) => {
+                        warn!(target = %target_id, error = %err, "handoff create failed; removed own partial target");
+                        return Err(err);
+                    }
+                    Ok(false) => {}
+                    Err(cleanup) => {
+                        error!(target = %target_id, error = %cleanup, "handoff partial target cleanup failed");
+                        return Err(err);
+                    }
+                }
+                // Lost the primary-key race to another attempt with this key.
+                match self.existing_handoff_target(user_id, &target_id, &fingerprint).await? {
+                    Some(existing) => Ok((existing, false)),
+                    None => Err(err),
+                }
+            }
+        }
+    }
+
+    /// The finished target for this (user, source, key), if any. Another fingerprint
+    /// at that id is a conflict, never an alias. An unready row is another attempt
+    /// still creating it (409, retry), or, once stale, a crashed attempt's leftover
+    /// that is removed so this attempt can create the target.
+    async fn existing_handoff_target(
+        &self,
+        user_id: &str,
+        target_id: &str,
+        fingerprint: &str,
+    ) -> Result<Option<ConversationResponse>, ConversationError> {
+        let Some(row) = self.conversation_repo.get(user_id, target_id).await? else {
+            return Ok(None);
+        };
+        let meta = handoff_meta(&row);
+        if meta["key_fingerprint"].as_str() != Some(fingerprint) {
+            warn!(target = %target_id, "handoff target id taken by another handoff");
+            return Err(ConversationError::Busy {
+                reason: "HANDOFF_KEY_CONFLICT: this idempotency key cannot be used; pick another".into(),
+            });
+        }
+        if meta["ready"].as_bool() == Some(true) {
+            return Ok(Some(self.get(user_id, target_id).await?));
+        }
+        let attempt = meta["attempt"].as_str().unwrap_or_default();
+        if now_ms() - row.created_at < HANDOFF_STALE_MS {
+            return Err(handoff_in_progress());
+        }
+        // Conditional on the exact unready attempt read above: never removes a row
+        // that has since been marked ready or recreated by another recovery.
+        if self
+            .conversation_repo
+            .delete_unready_handoff(user_id, target_id, attempt)
+            .await?
+        {
+            warn!(target = %target_id, "removed stale unfinished handoff target");
+            return Ok(None);
+        }
+        Err(handoff_in_progress())
+    }
+
     pub async fn fork(
         &self,
         user_id: &str,
@@ -4899,7 +5141,17 @@ impl ConversationService {
     pub(crate) async fn refresh_resume_anchor_for_replay(&self, conv_id: &str, options: &mut BuildTaskOptions) {
         let builder =
             SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo);
-        if let Err(err) = builder.refresh_resume_anchor(conv_id, options).await {
+        let user_id = options.context.conversation.user_id.clone();
+        // Without the share lookup the reload could not be clamped, so keep the
+        // (already clamped) turn-start snapshot instead.
+        let locked = match self.lan_locked_mode(&user_id, conv_id).await {
+            Ok(locked) => locked,
+            Err(err) => {
+                warn!(conversation_id = %conv_id, error = %err, "replay: LAN share lookup failed — keeping the turn-start snapshot");
+                return;
+            }
+        };
+        if let Err(err) = builder.refresh_resume_anchor(conv_id, options, locked.as_deref()).await {
             warn!(
                 conversation_id = %conv_id,
                 error = %err,
@@ -5137,6 +5389,31 @@ fn strip_request_fork_spec(extra: &mut serde_json::Value) {
         && obj.remove("fork").is_some()
     {
         warn!("create: stripped client-supplied `extra.fork` (server-minted only)");
+    }
+}
+
+/// Deterministic handoff target id and fingerprint: SHA-256 over a length-prefixed
+/// (user, source, key) encoding; the id keeps 128 bits, the fingerprint all 256.
+fn handoff_target_id(user_id: &str, source_id: &str, key: &str) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in [user_id, source_id, key] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let fingerprint = hex::encode(hasher.finalize());
+    (format!("ho{}", &fingerprint[..32]), fingerprint)
+}
+
+/// Extra keys only the host sets: `lan_remote` (LAN share runner, which calls the
+/// service directly) and `handoff` (handoff provenance). Stripped from client input.
+pub fn strip_server_owned_extra(extra: &mut serde_json::Value) {
+    if let Some(obj) = extra.as_object_mut() {
+        for key in ["lan_remote", "handoff"] {
+            if obj.remove(key).is_some() {
+                warn!(key, "stripped client-supplied server-owned extra key");
+            }
+        }
     }
 }
 

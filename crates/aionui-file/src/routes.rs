@@ -94,6 +94,8 @@ pub struct FileRouterState {
     /// service; the path is written server-side and never returned to the client.
     pub clipboard: ClipboardWriterRef,
     pub allowed_roots: Vec<std::path::PathBuf>,
+    /// Owner lookup for the upload's `conversation_id`.
+    pub conversations: Arc<dyn aionui_db::IConversationRepository>,
 }
 
 // ---------------------------------------------------------------------------
@@ -657,9 +659,22 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
 
 async fn upload_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let fields = extract_upload_multipart(multipart).await?;
+    // An existing conversation must be the caller's; an unknown id (a draft not yet
+    // created) keeps the legacy behaviour.
+    if let Some(id) = fields.conversation_id.as_deref() {
+        let owner = state
+            .conversations
+            .owner_user_id(id)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        if owner.is_some_and(|owner| owner != user.id) {
+            return Err(ApiError::Forbidden("conversation belongs to another user".to_owned()));
+        }
+    }
 
     let file_name = fields.file_name.or(fields.dispo_file_name).ok_or_else(|| {
         ApiError::BadRequest("missing file name: provide 'file_name' or a multipart filename".to_owned())
@@ -667,7 +682,12 @@ async fn upload_file(
 
     let path = state
         .file_service
-        .create_upload_file(&file_name, &fields.file_data, fields.conversation_id.as_deref())
+        .create_upload_file(
+            &user.id,
+            &file_name,
+            &fields.file_data,
+            fields.conversation_id.as_deref(),
+        )
         .await?;
     Ok(Json(ApiResponse::ok(path)))
 }

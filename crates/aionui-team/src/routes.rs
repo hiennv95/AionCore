@@ -19,7 +19,9 @@ use aionui_api_types::{
     TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
     TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
 };
-use aionui_auth::{CurrentDevice, CurrentUser, RuntimeHelperCaller, ensure_no_local_files, is_paired_device};
+use aionui_auth::{
+    CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller, ensure_no_local_files, from_paired_device,
+};
 use aionui_common::ApiError;
 use aionui_db::{ActivityCursor, DbError, PageDirection};
 
@@ -191,7 +193,7 @@ fn team_desktop_only_error() -> ApiError {
 }
 
 async fn team_desktop_only(request: Request, next: Next) -> Result<Response, ApiError> {
-    if is_paired_device(request.extensions().get::<CurrentDevice>()) {
+    if from_paired_device(request.extensions()) {
         return Err(team_desktop_only_error());
     }
     Ok(next.run(request).await)
@@ -537,12 +539,18 @@ async fn send_message(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Path(id): Path<String>,
     body: Result<Json<SendTeamMessageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TeamRunAckResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    ensure_no_local_files(req.files.iter().flatten(), device.as_deref(), helper.as_deref())?;
+    ensure_no_local_files(
+        req.files.iter().flatten(),
+        device.as_deref(),
+        deviceless.as_deref(),
+        helper.as_deref(),
+    )?;
     let ack = state
         .service
         .send_message(&user.id, &id, &req.content, req.files)
@@ -554,12 +562,18 @@ async fn send_message_to_agent(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Path(params): Path<AgentPathParams>,
     body: Result<Json<SendAgentMessageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TeamRunAckResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    ensure_no_local_files(req.files.iter().flatten(), device.as_deref(), helper.as_deref())?;
+    ensure_no_local_files(
+        req.files.iter().flatten(),
+        device.as_deref(),
+        deviceless.as_deref(),
+        helper.as_deref(),
+    )?;
     let ack = state
         .service
         .send_message_to_agent(&user.id, &params.id, &params.slot_id, &req.content, req.files)
@@ -571,12 +585,18 @@ async fn interrupt_agent(
     State(state): State<TeamRouterState>,
     Extension(user): Extension<CurrentUser>,
     device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
     helper: Option<Extension<RuntimeHelperCaller>>,
     Path(params): Path<AgentPathParams>,
     body: Result<Json<InterruptTeamAgentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<TeamInterruptAgentResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    ensure_no_local_files(req.files.iter().flatten(), device.as_deref(), helper.as_deref())?;
+    ensure_no_local_files(
+        req.files.iter().flatten(),
+        device.as_deref(),
+        deviceless.as_deref(),
+        helper.as_deref(),
+    )?;
     let response = state
         .service
         .interrupt_agent(&user.id, &params.id, &params.slot_id, req)

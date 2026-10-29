@@ -13,14 +13,12 @@ use axum::routing::get;
 use axum::{Router, middleware};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use aionui_ai_agent::{
-    RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION, agent_routes, remote_agent_routes,
-};
+use aionui_ai_agent::{HelperAccess, HelperDenied, HelperUse, agent_routes, remote_agent_routes};
 use aionui_api_types::{ErrorResponse, WebSocketMessage};
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, RefreshCoalescer,
+    AuthIdentityMode, AuthRouterState, AuthState, HelperVerdict, IRuntimeTokenVerifier, RefreshCoalescer,
     SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
 };
 use aionui_channel::channel_routes;
@@ -276,6 +274,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         local: services.local,
         aionpro_mode: services.identity_mode == crate::config::IdentityMode::AionPro,
         device_repo: Some(super::device_state::device_repo(services)),
+        desktop_requires_loopback_tls: services.desktop_requires_loopback_tls,
     };
 
     let auth_mw_state = AuthState {
@@ -283,9 +282,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         user_repo: services.user_repo.clone(),
         identity_mode: auth_identity_mode(services.identity_mode),
         runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
-            runtime_token_service: services.runtime_token_service.clone(),
+            access: super::state::helper_access(services),
         })),
         device_repo: Some(super::device_state::device_repo(services)),
+        desktop_requires_loopback_tls: services.desktop_requires_loopback_tls,
     };
 
     // Client devices (ADR-011): pairing endpoints are rate limited like /login,
@@ -415,7 +415,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // as the two groups above, so it is also mounted after the CSRF layer.
     let conversation_runtime = conversation_runtime_routes(ConversationRuntimeRouterState {
         service: services.conversation_service.clone(),
-        runtime_token_service: services.runtime_token_service.clone(),
+        helper_access: super::state::helper_access(services),
     });
     // Channel A. Same runtime-token self-authentication: the caller is an agent
     // process holding a conversation-scoped token, not a browser session.
@@ -437,7 +437,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     let router = Router::new()
         .merge(antigravity_hook)
-        .route("/health", get(health_check))
+        .route(
+            "/health",
+            get(health_check).with_state(services.database.pool().clone()),
+        )
         .merge(auth_routes(auth_state))
         .merge(system_authenticated)
         .merge(conversation_authenticated)
@@ -568,20 +571,22 @@ impl SystemDefaultFilesystemAdopter for SkillFilesystemAdopter {
 /// as the conversation-helper credential channel (aionui-auth cannot depend on
 /// aionui-ai-agent, so the binding happens here in the composition layer).
 struct ConversationHelperTokenVerifier {
-    runtime_token_service: Arc<RuntimeTokenService>,
+    access: Arc<HelperAccess>,
 }
 
+#[async_trait::async_trait]
 impl IRuntimeTokenVerifier for ConversationHelperTokenVerifier {
-    fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool {
-        self.runtime_token_service
-            .validate(
-                Some(token),
-                user_id,
-                conversation_id,
-                RuntimeTokenScope::ConversationHelper,
-                TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
-            )
-            .is_ok()
+    async fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> HelperVerdict {
+        match self
+            .access
+            .authorize(Some(token), user_id, conversation_id, HelperUse::Other)
+            .await
+        {
+            Ok(_) => HelperVerdict::Allowed,
+            Err(HelperDenied::Unauthenticated | HelperDenied::ConversationGone) => HelperVerdict::Invalid,
+            Err(HelperDenied::LanShare) => HelperVerdict::LanShare,
+            Err(HelperDenied::Unavailable) => HelperVerdict::Unavailable,
+        }
     }
 }
 

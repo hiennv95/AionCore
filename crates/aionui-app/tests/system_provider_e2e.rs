@@ -8,7 +8,7 @@ use tower::ServiceExt;
 use wiremock::matchers::{header as match_header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use common::{body_json, build_app, delete_with_token, get_with_token, json_with_token, setup_and_login};
+use common::{body_json, build_app, delete_with_token, get_with_token, json_with_token};
 
 // ===========================================================================
 // Provider CRUD
@@ -16,8 +16,8 @@ use common::{body_json, build_app, delete_with_token, get_with_token, json_with_
 
 #[tokio::test]
 async fn provider_full_crud_with_auth() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // 1. List — empty
     let resp = app
@@ -93,8 +93,8 @@ async fn provider_full_crud_with_auth() {
 
 #[tokio::test]
 async fn provider_create_validation_with_auth() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Missing platform
     let req = json_with_token(
@@ -121,8 +121,8 @@ async fn provider_create_validation_with_auth() {
 
 #[tokio::test]
 async fn provider_update_nonexistent_with_auth() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("PUT", "/api/providers/nonexistent", json!({"name": "X"}), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -131,8 +131,8 @@ async fn provider_update_nonexistent_with_auth() {
 
 #[tokio::test]
 async fn provider_delete_nonexistent_with_auth() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let resp = app
         .oneshot(delete_with_token("/api/providers/nonexistent", &token, &csrf))
@@ -156,8 +156,8 @@ async fn model_fetch_openai_with_auth() {
         .mount(&mock_server)
         .await;
 
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -193,8 +193,8 @@ async fn model_fetch_openai_with_auth() {
 
 #[tokio::test]
 async fn model_fetch_nonexistent_provider_with_auth() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token("POST", "/api/providers/nonexistent/models", json!({}), &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
@@ -217,8 +217,8 @@ async fn protocol_detect_openai_with_auth() {
         .mount(&mock_server)
         .await;
 
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -247,8 +247,8 @@ async fn protocol_detect_all_fail_with_auth() {
         .mount(&mock_server)
         .await;
 
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
@@ -269,8 +269,8 @@ async fn protocol_detect_all_fail_with_auth() {
 
 #[tokio::test]
 async fn protocol_detect_validation_with_auth() {
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     // Missing baseUrl
     let req = json_with_token(
@@ -307,8 +307,8 @@ async fn protocol_detect_switch_platform_suggestion_with_auth() {
         .mount(&mock_server)
         .await;
 
-    let (mut app, services) = build_app().await;
-    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let (app, services) = build_app().await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
 
     let req = json_with_token(
         "POST",
