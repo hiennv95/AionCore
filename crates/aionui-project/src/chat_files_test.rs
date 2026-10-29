@@ -844,3 +844,31 @@ async fn upload_refs_resolve_only_for_their_owner() {
     }
     assert!(resolve("system_default_user", legacy_ref).await.is_ok());
 }
+
+/// A user-owned upload tied to one conversation cannot be attached to a
+/// different conversation by reusing the returned absolute path.
+#[tokio::test]
+async fn conversation_scoped_upload_refs_resolve_only_in_their_conversation() {
+    let (service, _pe_id, _dir, upload_root) = setup().await;
+    let root = upload_root.path();
+    let dir = root.join("users").join("alice").join("conversation-a");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("a.txt");
+    std::fs::write(&path, b"a").unwrap();
+    let file = ChatFileRef::Upload {
+        path: path.to_string_lossy().into_owned(),
+    };
+
+    assert!(
+        service
+            .resolve_chat_message_for_conversation("user_alice", "conversation-a", "", &[file.clone()], root)
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        service
+            .resolve_chat_message_for_conversation("user_alice", "conversation-b", "", &[file], root)
+            .await,
+        Err(ProjectError::UploadPathOutsideRoot { .. })
+    ));
+}

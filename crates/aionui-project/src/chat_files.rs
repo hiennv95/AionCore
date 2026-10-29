@@ -44,10 +44,40 @@ impl ProjectService {
         files: &[ChatFileRef],
         upload_root: &Path,
     ) -> Result<ResolvedChatMessage, ProjectError> {
+        self.resolve_chat_message_scoped(user_id, None, content, files, upload_root)
+            .await
+    }
+
+    /// Resolve attachments for a message in a specific conversation.
+    ///
+    /// Conversation-scoped uploads can only be attached to the conversation
+    /// named by their managed path. Unscoped (`general`) uploads remain valid
+    /// for callers that do not bind an upload to a conversation (for example,
+    /// team messages).
+    pub async fn resolve_chat_message_for_conversation(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        content: &str,
+        files: &[ChatFileRef],
+        upload_root: &Path,
+    ) -> Result<ResolvedChatMessage, ProjectError> {
+        self.resolve_chat_message_scoped(user_id, Some(conversation_id), content, files, upload_root)
+            .await
+    }
+
+    async fn resolve_chat_message_scoped(
+        &self,
+        user_id: &str,
+        conversation_id: Option<&str>,
+        content: &str,
+        files: &[ChatFileRef],
+        upload_root: &Path,
+    ) -> Result<ResolvedChatMessage, ProjectError> {
         let mut paths = Vec::with_capacity(files.len());
         for file in files {
             paths.push(
-                self.resolve_chat_file_ref(user_id, file, upload_root, FileOp::Read)
+                self.resolve_chat_file_ref_scoped(user_id, conversation_id, file, upload_root, FileOp::Read)
                     .await?,
             );
         }
@@ -77,6 +107,18 @@ impl ProjectService {
     pub async fn resolve_chat_file_ref(
         &self,
         user_id: &str,
+        file: &ChatFileRef,
+        upload_root: &Path,
+        op: FileOp,
+    ) -> Result<String, ProjectError> {
+        self.resolve_chat_file_ref_scoped(user_id, None, file, upload_root, op)
+            .await
+    }
+
+    async fn resolve_chat_file_ref_scoped(
+        &self,
+        user_id: &str,
+        conversation_id: Option<&str>,
         file: &ChatFileRef,
         upload_root: &Path,
         op: FileOp,
@@ -111,7 +153,7 @@ impl ProjectService {
                 let rest = upload_path_in_root(upload_root, candidate, path)?;
                 // Same refusal as outside the root, so another user's upload is not
                 // told apart from a missing one.
-                if !upload_owned_by(&rest, user_id) {
+                if !upload_owned_by(&rest, user_id) || !upload_matches_conversation(&rest, conversation_id) {
                     return Err(ProjectError::UploadPathOutsideRoot { path: path.clone() });
                 }
                 if !path_within(upload_root, candidate) {
@@ -324,6 +366,22 @@ fn upload_owned_by(rest: &Path, user_id: &str) -> bool {
         Some(first) if first == UPLOAD_USERS_DIR => aionui_common::user_dir_name(user_id)
             .is_ok_and(|dir| parts.next().is_some_and(|owner| owner == dir.as_str())),
         _ => user_id == LEGACY_UPLOAD_OWNER,
+    }
+}
+
+/// Whether a namespaced upload belongs to the conversation at the send
+/// boundary. Generic file endpoints pass `None` because their request does not
+/// carry a conversation identity.
+fn upload_matches_conversation(rest: &Path, conversation_id: Option<&str>) -> bool {
+    let mut parts = rest.components().map(|c| c.as_os_str());
+    if parts.next() != Some(std::ffi::OsStr::new(UPLOAD_USERS_DIR)) {
+        return conversation_id.is_none();
+    }
+    let _owner = parts.next();
+    let Some(scope) = parts.next() else { return false };
+    match conversation_id {
+        None => true,
+        Some(id) => scope == std::ffi::OsStr::new("general") || scope == std::ffi::OsStr::new(id),
     }
 }
 

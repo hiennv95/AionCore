@@ -1151,6 +1151,27 @@ fn enforce_skill_import_budget(
 
 /// Export a skill by creating a symlink in the target directory.
 pub async fn export_skill_with_symlink(skill_path: &Path, target_dir: &Path) -> Result<(), ExtensionError> {
+    validate_export_target_path(target_dir)?;
+    export_skill_with_symlink_unchecked(skill_path, target_dir).await
+}
+
+/// Export a skill only below one of the caller's known skill roots.
+pub async fn export_skill_with_symlink_in_roots(
+    skill_path: &Path,
+    target_dir: &Path,
+    allowed_roots: &[PathBuf],
+) -> Result<(), ExtensionError> {
+    validate_export_target_path(target_dir)?;
+    if !path_is_below_known_root(target_dir, allowed_roots) {
+        return Err(ExtensionError::InvalidRequest(format!(
+            "skill export target is outside known skill roots: {}",
+            target_dir.display()
+        )));
+    }
+    export_skill_with_symlink_unchecked(skill_path, target_dir).await
+}
+
+async fn export_skill_with_symlink_unchecked(skill_path: &Path, target_dir: &Path) -> Result<(), ExtensionError> {
     let skill_name = skill_path
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
@@ -1179,6 +1200,77 @@ pub async fn export_skill_with_symlink(skill_path: &Path, target_dir: &Path) -> 
         "skill exported (symlink)"
     );
     Ok(())
+}
+
+/// Reject traversal and symlinked target components before any directory is
+/// created or target entry is removed. This keeps the operation on the path
+/// the caller supplied, rather than following a redirecting parent.
+fn validate_export_target_path(target_dir: &Path) -> Result<(), ExtensionError> {
+    if !target_dir.is_absolute()
+        || target_dir
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(ExtensionError::InvalidRequest(format!(
+            "skill export target must be an absolute path without traversal: {}",
+            target_dir.display()
+        )));
+    }
+
+    let mut current = PathBuf::new();
+    for component in target_dir.components() {
+        current.push(component.as_os_str());
+        if let Ok(metadata) = std::fs::symlink_metadata(&current)
+            && metadata.file_type().is_symlink()
+            && symlink_is_user_owned(&metadata)
+        {
+            return Err(ExtensionError::InvalidRequest(format!(
+                "skill export target contains a symlink: {}",
+                current.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn symlink_is_user_owned(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.uid() == unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        true
+    }
+}
+
+fn path_is_below_known_root(target_dir: &Path, roots: &[PathBuf]) -> bool {
+    let target = canonicalize_existing_prefix(target_dir);
+    roots.iter().any(|root| {
+        canonicalize_existing_prefix(root)
+            .is_some_and(|root| target.as_ref().is_some_and(|target| target.starts_with(root)))
+    })
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> Option<PathBuf> {
+    let mut suffix = Vec::new();
+    let mut current = path.to_path_buf();
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(&current) {
+            let mut resolved = canonical;
+            for component in suffix.iter().rev() {
+                resolved.push(component);
+            }
+            return Some(resolved);
+        }
+        let name = current.file_name()?.to_os_string();
+        suffix.push(name);
+        if !current.pop() {
+            return None;
+        }
+    }
 }
 
 /// Delete a user-custom skill by name.
@@ -3129,6 +3221,40 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path().join("gone"), &link).unwrap();
         export_skill_with_symlink(&source_dir, &target_dir).await.unwrap();
         assert_eq!(std::fs::read_link(&link).unwrap(), source_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_skill_refuses_symlinked_target_parent() {
+        let tmp = TempDir::new().unwrap();
+        let source_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let real_target = tmp.path().join("real-target");
+        std::fs::create_dir_all(real_target.join("my-skill")).unwrap();
+        std::fs::write(real_target.join("my-skill/keep.txt"), "keep").unwrap();
+        let redirected = tmp.path().join("redirected");
+        std::os::unix::fs::symlink(&real_target, &redirected).unwrap();
+
+        assert!(export_skill_with_symlink(&source_dir, &redirected).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(real_target.join("my-skill/keep.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_skill_in_roots_refuses_target_outside_known_roots() {
+        let tmp = TempDir::new().unwrap();
+        let source_dir = tmp.path().join("source").join("my-skill");
+        let known_root = tmp.path().join("known");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&known_root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let err = export_skill_with_symlink_in_roots(&source_dir, &outside, &[known_root]).await;
+        assert!(matches!(err, Err(ExtensionError::InvalidRequest(_))));
+        assert!(!outside.join("my-skill").exists());
     }
 
     // -----------------------------------------------------------------------

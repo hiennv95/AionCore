@@ -1401,11 +1401,11 @@ async fn upload_bytes_are_bound_to_the_uploader() {
             csrf,
         )
     };
-    let send_upload = |conversation: &str, token: &str, csrf: &str| {
+    let send_upload = |conversation: &str, token: &str, csrf: &str, file_ref: serde_json::Value| {
         json_with_token(
             "POST",
             &format!("/api/conversations/{conversation}/messages"),
-            json!({"content": "see file", "files": [file.clone()]}),
+            json!({"content": "see file", "files": [file_ref]}),
             token,
             csrf,
         )
@@ -1414,7 +1414,7 @@ async fn upload_bytes_are_bound_to_the_uploader() {
     let bob_chat = bob_chat["data"]["id"].as_str().expect("bob chat").to_owned();
     let resp = app
         .clone()
-        .oneshot(send_upload(&bob_chat, &bob, &bob_csrf))
+        .oneshot(send_upload(&bob_chat, &bob, &bob_csrf, file.clone()))
         .await
         .unwrap();
     assert!(!resp.status().is_success(), "bob sends alice's upload");
@@ -1432,10 +1432,52 @@ async fn upload_bytes_are_bound_to_the_uploader() {
     let alice_chat = alice_chat["data"]["id"].as_str().expect("alice chat").to_owned();
     let resp = app
         .clone()
-        .oneshot(send_upload(&alice_chat, &alice, &alice_csrf))
+        .oneshot(send_upload(&alice_chat, &alice, &alice_csrf, file.clone()))
         .await
         .unwrap();
     let status = resp.status();
     assert!(status.is_success(), "alice sends her upload: {}", body_json(resp).await);
     let _ = std::fs::remove_file(&path);
+
+    // Conversation-scoped uploads cannot be replayed in another chat owned by
+    // the same user. The path remains a capability only within its scope.
+    let scoped_name = format!("h9-conversation-{}.txt", std::process::id());
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", &scoped_name, "text/plain", b"conversation secret")
+        .add_text("conversation_id", &alice_chat)
+        .build();
+    let resp = app
+        .clone()
+        .oneshot(upload_request(&content_type, body, &alice, &alice_csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let scoped_path = body_json(resp).await["data"].as_str().unwrap().to_owned();
+    let resp = app
+        .clone()
+        .oneshot(send_upload(
+            &alice_chat,
+            &alice,
+            &alice_csrf,
+            json!({"kind": "upload", "path": scoped_path.clone()}),
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "alice sends scoped upload");
+    let other_chat = body_json(app.clone().oneshot(chat(&alice, &alice_csrf)).await.unwrap()).await;
+    let other_chat = other_chat["data"]["id"].as_str().expect("second alice chat").to_owned();
+    let scoped_file = json!({"kind": "upload", "path": scoped_path.clone()});
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/conversations/{other_chat}/messages"),
+            json!({"content": "wrong chat", "files": [scoped_file]}),
+            &alice,
+            &alice_csrf,
+        ))
+        .await
+        .unwrap();
+    assert!(!resp.status().is_success(), "alice reuses a conversation-scoped upload");
+    let _ = std::fs::remove_file(&scoped_path);
 }

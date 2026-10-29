@@ -550,6 +550,7 @@ impl ConversationService {
     async fn resolve_message_attachments(
         &self,
         user_id: &str,
+        conversation_id: &str,
         content: &str,
         files: &[ChatFileRef],
     ) -> Result<ResolvedChatMessage, ConversationError> {
@@ -569,7 +570,7 @@ impl ConversationService {
             })?;
         let upload_root = std::env::temp_dir().join("aionui");
         project
-            .resolve_chat_message(user_id, content, files, &upload_root)
+            .resolve_chat_message_for_conversation(user_id, conversation_id, content, files, &upload_root)
             .await
             .map_err(|err| ConversationError::BadRequest {
                 reason: err.to_string(),
@@ -4176,7 +4177,7 @@ impl ConversationService {
         // (atomic: a bad reference fails the whole send). Produces the inlined
         // `[[AION_FILES]]` content used for persistence, broadcast, and the turn.
         let resolved = self
-            .resolve_message_attachments(user_id, &content_with_sessions, &req.files)
+            .resolve_message_attachments(user_id, conversation_id, &content_with_sessions, &req.files)
             .await?;
 
         // ── Mid-turn delivery (B5, spec §4.3) ────────────────────────────

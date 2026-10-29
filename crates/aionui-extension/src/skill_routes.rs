@@ -269,10 +269,42 @@ async fn import_skill(
 
 /// `POST /api/skills/export-symlink` — export a skill symlink.
 async fn export_skill_symlink(
+    State(state): State<SkillRouterState>,
     body: Result<Json<ExportSkillRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    skill_service::export_skill_with_symlink(Path::new(&req.skill_path), Path::new(&req.target_dir)).await?;
+    let mut allowed_roots = vec![
+        state.skill_paths.user_skills_dir.clone(),
+        state.skill_paths.builtin_skills_dir.clone(),
+        state.skill_paths.cron_skills_dir.clone(),
+    ];
+    allowed_roots.extend(
+        skill_service::detect_common_skill_paths()
+            .await
+            .into_iter()
+            .map(|path| std::path::PathBuf::from(path.path)),
+    );
+    if let Some(home) = dirs::home_dir() {
+        allowed_roots.extend(
+            crate::constants::COMMON_SKILL_DIRS
+                .iter()
+                .map(|(_, relative, _)| home.join(relative)),
+        );
+    }
+    allowed_roots.extend(
+        state
+            .external_paths_manager
+            .get_custom_external_paths()
+            .await
+            .into_iter()
+            .map(|path| std::path::PathBuf::from(path.path)),
+    );
+    skill_service::export_skill_with_symlink_in_roots(
+        Path::new(&req.skill_path),
+        Path::new(&req.target_dir),
+        &allowed_roots,
+    )
+    .await?;
     Ok(Json(ApiResponse::success()))
 }
 

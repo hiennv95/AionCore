@@ -1325,6 +1325,51 @@ async fn si3_read_skill_info_returns_not_found_for_missing_path() {
 }
 
 #[tokio::test]
+async fn si4_export_skill_refuses_target_outside_known_skill_roots() {
+    let tmp = TempDir::new().unwrap();
+    let (app, services, paths) = build_app_with_skill_paths(tmp.path()).await;
+    let (token, csrf) = common::desktop_login(&app, &services).await;
+    let source = tmp.path().join("source-skill");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/export-symlink",
+            json!({
+                "skill_path": source.to_string_lossy(),
+                "target_dir": outside.to_string_lossy(),
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(!outside.join("source-skill").exists());
+
+    // A configured skill root remains a valid export destination.
+    let resp = app
+        .oneshot(json_with_token(
+            "POST",
+            "/api/skills/export-symlink",
+            json!({
+                "skill_path": source.to_string_lossy(),
+                "target_dir": paths.user_skills_dir.to_string_lossy(),
+            }),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let _ = std::fs::remove_file(paths.user_skills_dir.join("source-skill"));
+}
+
+#[tokio::test]
 async fn skill_import_returns_specific_code_for_oversized_file() {
     let tmp = TempDir::new().unwrap();
     let (app, services, _paths) = build_app_with_skill_paths(tmp.path()).await;
