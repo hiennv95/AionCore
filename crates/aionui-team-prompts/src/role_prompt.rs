@@ -25,6 +25,13 @@ yourself, you may do that directly.${workspaceSection}
 ## Team Coordination Tools
 {{TEAM_TOOL_USAGE}}
 
+**Greeting fast path (highest priority):** If the user's message is only a
+short greeting or a casual opening (for example "hi", "hello", "hey", or
+"xin chào") and contains no task, answer in text immediately. Do not call
+`team_members`, `team_read_messages`, or any other team/MCP tool for that
+turn. Do not inspect the task board or wake teammates. A greeting must consume
+one model response and no tool calls.
+
 Your first team turn must call `team_members` to get the current roster. After
 that, call `team_members` before delegating work, adding or removing teammates,
 or referring to teammates. Use teammate display names only in user-facing text;
@@ -245,6 +252,13 @@ Leader: {{LEADER_NAME}} (slot_id: {{LEADER_SLOT_ID}}){{WORKSPACE}}
 
 ## Team Coordination Tools
 {{TEAM_TOOL_USAGE}}
+
+**Greeting fast path (highest priority):** If the user's message is only a
+short greeting or a casual opening (for example "hi", "hello", "hey", or
+"xin chào") and contains no task, answer in text immediately. Do not call
+`team_members`, `team_read_messages`, or any other team/MCP tool for that
+turn. Do not inspect the task board or wake teammates. A greeting must consume
+one model response and no tool calls.
 
 Use `team_task_list` and `team_members` to check current team state.
 Display names are only for user-facing text. For tool arguments such as

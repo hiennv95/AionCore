@@ -289,6 +289,13 @@ mod tests {
     }
 
     #[test]
+    fn lead_prompt_has_zero_tool_greeting_fast_path() {
+        let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &[]);
+        assert!(prompt.contains("Greeting fast path (highest priority)"));
+        assert!(prompt.contains("A greeting must consume\none model response and no tool calls."));
+    }
+
+    #[test]
     fn lead_prompt_omits_dynamic_available_assistants_section() {
         let assistants = default_assistants();
         let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &assistants);
@@ -363,6 +370,14 @@ mod tests {
         assert!(prompt.contains("shutdown_request"));
         assert!(prompt.contains("shutdown_approved"));
         assert!(prompt.contains("STOP GENERATING"));
+    }
+
+    #[test]
+    fn teammate_prompt_has_zero_tool_greeting_fast_path() {
+        let agent = make_teammate("w1", "Worker1");
+        let prompt = build_teammate_prompt(&agent, "Alpha", &[make_lead(), agent.clone()]);
+        assert!(prompt.contains("Greeting fast path (highest priority)"));
+        assert!(prompt.contains("A greeting must consume\none model response and no tool calls."));
     }
 
     #[test]
