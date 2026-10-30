@@ -60,7 +60,8 @@ fn dialog_turn(row: &MessageRow) -> Option<String> {
     let content: serde_json::Value = serde_json::from_str(&row.content).ok()?;
     let text = strip_think_tags(content.get("content")?.as_str()?);
     // Neutralize frame markers so dialog text cannot open or close the untrusted frame.
-    let text = redact_text(text.trim()).replace("[[", "[ [").replace("]]", "] ]");
+    // Per character: chained pair replaces would leave `[[[` as `[ [[`.
+    let text = redact_text(text.trim()).replace('[', "[ ").replace(']', " ]");
     (!text.is_empty()).then(|| format!("{speaker}: {text}"))
 }
 
