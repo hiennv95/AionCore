@@ -16,14 +16,17 @@
 //! resolution) lives here.
 //!
 //! `set-password` on an existing account bumps its `session_generation`, so its
-//! live sessions (desktop app and paired devices included) are revoked at once,
-//! even on a running server, as with `POST /api/auth/change-password`.
+//! sessions (desktop app and paired devices included) are revoked, as with
+//! `POST /api/auth/change-password`. It refuses to run while a host holds the data dir
+//! (the instance guard), so it is an offline operation: stop the host first.
 
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::process::ExitCode;
 
-use aionui_auth::{AccountError, PasswordOutcome, create_local_user, set_local_password, validate_username};
+use aionui_auth::{
+    AccountError, PasswordOutcome, create_local_user, reset_existing_password, set_local_password, validate_username,
+};
 use aionui_db::{
     DataDirInstanceGuard, Database, IUserRepository, SqliteUserRepository, init_database, maybe_copy_legacy_database,
     models::{User, UserStatus},
@@ -63,7 +66,13 @@ async fn set_password(cli: &Cli, args: &SetPasswordArgs) -> Result<ExitCode, Cli
 
     let database = open_database(cli).await?;
     let repo = SqliteUserRepository::new(database.pool().clone());
-    let outcome = set_local_password(&repo, args.username.as_deref(), &password).await;
+    // Recovery (`--require-existing`) resets an account that must exist: a mistyped username fails
+    // instead of creating one. The lookup and the write both run under the exclusive guard held above.
+    let outcome = if args.require_existing {
+        reset_existing_password(&repo, args.username.as_deref(), &password).await
+    } else {
+        set_local_password(&repo, args.username.as_deref(), &password).await
+    };
     database.close().await;
     let outcome = outcome.map_err(map_account_error)?;
 
@@ -174,6 +183,7 @@ fn map_account_error(err: AccountError) -> CliBoundaryError {
         AccountError::InvalidUsername(_) => input_error("username does not meet the required format"),
         AccountError::WeakPassword(_) => input_error("password does not meet strength requirements"),
         AccountError::AlreadyExists(_) => already_exists_error(),
+        AccountError::NotFound(_) => user_not_found_error(),
         AccountError::Hash => hash_error(),
         AccountError::Db(_) => database_error(),
     }

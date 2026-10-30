@@ -48,6 +48,9 @@ pub enum AccountError {
     /// existing account was left untouched.
     #[error("a local user named {0} already exists")]
     AlreadyExists(String),
+    /// A reset named an account that does not exist; nothing was created or changed.
+    #[error("no local user named {0}")]
+    NotFound(String),
     #[error("failed to hash password")]
     Hash,
     #[error("database error: {0}")]
@@ -76,10 +79,39 @@ pub async fn set_local_password(
     username: Option<&str>,
     plaintext: &str,
 ) -> Result<PasswordOutcome, AccountError> {
+    set_password(repo, username, plaintext, true).await
+}
+
+/// Reset an account that must already exist: [`set_local_password`] without the create branch.
+///
+/// A username that names no account fails with [`AccountError::NotFound`] and writes nothing, so a
+/// mistyped name during recovery can never create a new account (and `None` still targets the seed
+/// admin, which always exists). Everything else (validation, hashing, session revocation) is shared
+/// with [`set_local_password`].
+pub async fn reset_existing_password(
+    repo: &dyn IUserRepository,
+    username: Option<&str>,
+    plaintext: &str,
+) -> Result<PasswordOutcome, AccountError> {
+    set_password(repo, username, plaintext, false).await
+}
+
+async fn set_password(
+    repo: &dyn IUserRepository,
+    username: Option<&str>,
+    plaintext: &str,
+    create_missing: bool,
+) -> Result<PasswordOutcome, AccountError> {
     if let Some(name) = username {
         validate_username(name).map_err(|e| AccountError::InvalidUsername(e.to_string()))?;
     }
     validate_password(plaintext).map_err(|e| AccountError::WeakPassword(e.to_string()))?;
+
+    if let (false, Some(name)) = (create_missing, username)
+        && repo.find_by_username(name).await?.is_none()
+    {
+        return Err(AccountError::NotFound(name.to_owned()));
+    }
 
     // bcrypt hashing is CPU-bound and blocking; keep it off the async reactor.
     let owned = plaintext.to_owned();
@@ -103,6 +135,7 @@ pub async fn set_local_password(
                     username: name.to_owned(),
                 }
             }
+            None if !create_missing => return Err(AccountError::NotFound(name.to_owned())),
             None => {
                 let user = repo.create_user(name, &hash).await?;
                 PasswordOutcome::Created {

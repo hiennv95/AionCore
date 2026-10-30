@@ -23,7 +23,7 @@ mod validation;
 pub use error::AuthError;
 
 // Local-account password provisioning
-pub use account::{AccountError, PasswordOutcome, create_local_user, set_local_password};
+pub use account::{AccountError, PasswordOutcome, create_local_user, reset_existing_password, set_local_password};
 
 // Storage-encryption-secret provisioning and inspection
 pub use secret::{

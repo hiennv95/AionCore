@@ -149,6 +149,12 @@ fn walk(value: Value, depth: usize, budget: &mut Budget) -> Value {
                 .any(|k| map.get(*k).and_then(Value::as_str).is_some_and(is_secret_key));
             let mut out = Map::new();
             for (key, value) in map {
+                // A key's serialized length is at least its byte length: a key that cannot fit ends the object
+                // here, before any per-character work (counting, lowercasing) on a huge key.
+                if key.len() + 4 > budget.left {
+                    budget.truncated = true;
+                    break;
+                }
                 let start = budget.left;
                 // `"key":`, preceded by a comma for every entry but the first.
                 if !budget.take(escaped_len(&key) + 2 + 1 + usize::from(!out.is_empty())) {
@@ -677,6 +683,17 @@ mod tests {
             assert!(!text.contains(&format!(":{leaked}")), "leaked {leaked}: {text}");
         }
         assert!(text.contains("visible"));
+    }
+
+    #[test]
+    fn a_key_larger_than_the_budget_is_cut_before_any_per_character_work() {
+        let mut map = serde_json::Map::new();
+        map.insert("ok".into(), json!(1));
+        map.insert("z".repeat(5_000_000), json!("v")); // keys iterate in order: "ok" first
+        let out = redact_and_bound(Value::Object(map), Limits::BOUNDED);
+        assert!(out.truncated);
+        assert_eq!(out.value, json!({"ok": 1}));
+        assert!(out.value.to_string().len() <= TOOL_FIELD_MAX_BYTES);
     }
 
     #[test]

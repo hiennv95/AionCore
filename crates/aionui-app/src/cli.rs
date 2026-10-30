@@ -821,9 +821,9 @@ pub(crate) struct SetPasswordArgs {
     #[arg(long)]
     pub password_stdin: bool,
 
-    /// Fail with `CLI_USER_DATA_DIR_NOT_FOUND` unless `--data-dir` already
-    /// holds the application database, before anything is created. Use for
-    /// recovery of an existing deployment; leave it off for a fresh bootstrap.
+    /// Recovery of an existing deployment: fail with `CLI_USER_DATA_DIR_NOT_FOUND` unless `--data-dir`
+    /// already holds the application database, and with `CLI_USER_NOT_FOUND` when `--username` names no
+    /// existing account (never create one). Leave it off for a fresh bootstrap.
     #[arg(long)]
     pub require_existing: bool,
 }

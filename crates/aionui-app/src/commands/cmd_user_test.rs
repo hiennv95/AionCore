@@ -246,3 +246,12 @@ async fn password_change_refuses_while_a_host_holds_the_data_dir() {
     drop(guard);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// A recovery run that names an unknown account is refused as a config-class error (exit 2), not
+// reported as a success or an internal failure; the service itself writes nothing (aionui-auth tests).
+#[test]
+fn a_reset_naming_an_unknown_account_maps_to_user_not_found() {
+    let err = map_account_error(AccountError::NotFound("bbo".into()));
+    assert_eq!(err.code(), CliBoundaryCode::CliUserNotFound);
+    assert_eq!(err.exit_code(), ExitCode::from(2));
+}

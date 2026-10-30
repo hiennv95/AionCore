@@ -1,6 +1,6 @@
 use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
 
-use super::{AccountError, PasswordOutcome, create_local_user, set_local_password};
+use super::{AccountError, PasswordOutcome, create_local_user, reset_existing_password, set_local_password};
 use crate::verify_password;
 
 // Happy path: no username targets the seed `system_default_user`, and the
@@ -197,4 +197,75 @@ async fn setting_an_existing_password_bumps_the_session_generation() {
     set_local_password(&repo, Some("alice"), "An0ther#Pass").await.unwrap();
     let second = repo.find_by_id(&id).await.unwrap().unwrap().session_generation;
     assert!(second > first, "existing user: {first} -> {second}");
+}
+
+// Recovery must RESET an account, never create one: a mistyped username fails, writes nothing, and
+// leaves every existing account (the seed admin included) exactly as it was.
+#[tokio::test]
+async fn reset_existing_refuses_an_unknown_username_and_creates_nothing() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteUserRepository::new(db.pool().clone());
+    set_local_password(&repo, Some("bob"), "StrongP@ss1").await.unwrap();
+    let before = repo.list_users().await.unwrap();
+
+    let err = reset_existing_password(&repo, Some("bbo"), "An0ther#Pass")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, AccountError::NotFound(name) if name == "bbo"),
+        "got {err:?}"
+    );
+
+    let after = repo.list_users().await.unwrap();
+    assert_eq!(after.len(), before.len(), "no account was created");
+    assert!(repo.find_by_username("bbo").await.unwrap().is_none());
+    let bob = repo.find_by_username("bob").await.unwrap().unwrap();
+    assert!(
+        verify_password("StrongP@ss1", &bob.password_hash.unwrap()).unwrap(),
+        "bob untouched"
+    );
+    let admin = repo.get_system_user().await.unwrap().unwrap();
+    assert_eq!(
+        admin.password_hash,
+        before.iter().find(|u| u.id == admin.id).unwrap().password_hash
+    );
+}
+
+// The same service resets an existing named account and the default admin, and revokes their sessions.
+#[tokio::test]
+async fn reset_existing_updates_a_known_account_and_the_default_admin() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteUserRepository::new(db.pool().clone());
+    set_local_password(&repo, Some("bob"), "StrongP@ss1").await.unwrap();
+    let bob_before = repo.find_by_username("bob").await.unwrap().unwrap();
+
+    let outcome = reset_existing_password(&repo, Some("bob"), "An0ther#Pass")
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, PasswordOutcome::UpdatedExisting { .. }),
+        "got {outcome:?}"
+    );
+    let bob = repo.find_by_username("bob").await.unwrap().unwrap();
+    assert!(verify_password("An0ther#Pass", &bob.password_hash.unwrap()).unwrap());
+    assert!(
+        bob.session_generation > bob_before.session_generation,
+        "bob's sessions were revoked"
+    );
+
+    let outcome = reset_existing_password(&repo, None, "Admin#Pass12").await.unwrap();
+    assert_eq!(outcome, PasswordOutcome::DefaultUser);
+}
+
+// Bad input is rejected before any lookup or write, as with the upsert path.
+#[tokio::test]
+async fn reset_existing_validates_before_touching_the_database() {
+    let db = init_database_memory().await.unwrap();
+    let repo = SqliteUserRepository::new(db.pool().clone());
+    let weak = reset_existing_password(&repo, None, "x").await.unwrap_err();
+    assert!(matches!(weak, AccountError::WeakPassword(_)), "got {weak:?}");
+    let bad_name = reset_existing_password(&repo, Some("a b"), "StrongP@ss1")
+        .await
+        .unwrap_err();
+    assert!(matches!(bad_name, AccountError::InvalidUsername(_)), "got {bad_name:?}");
 }
