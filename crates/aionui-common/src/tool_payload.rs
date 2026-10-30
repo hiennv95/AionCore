@@ -340,6 +340,25 @@ fn is_delimiter(c: char) -> bool {
     c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '}' | ']' | ')')
 }
 
+/// End of an unquoted value starting at `start`: the first `stop` character, with an existing `[redacted]`
+/// placeholder skipped as one unit (its closing `]` is itself a delimiter, so scanning into it would cut it
+/// in half and make masking grow `[redacted]]` each time text passes another filter).
+fn value_end(text: &str, start: usize, stop: impl Fn(char) -> bool) -> usize {
+    let mut i = start;
+    while i < text.len() {
+        if text[i..].starts_with(REDACTED) {
+            i += REDACTED.len();
+            continue;
+        }
+        let c = text[i..].chars().next().unwrap_or(' ');
+        if stop(c) {
+            break;
+        }
+        i += c.len_utf8();
+    }
+    i
+}
+
 /// Replaces the secret after `prefix` (matched case-insensitively, only at a word boundary) up to the next
 /// delimiter. `keep_prefix` keeps the original prefix text (`Bearer`); otherwise it is rewritten (`sk-`).
 fn redact_prefixed(text: &str, prefix: &str, keep_prefix: bool) -> String {
@@ -354,11 +373,10 @@ fn redact_prefixed(text: &str, prefix: &str, keep_prefix: bool) -> String {
             continue;
         }
         let secret_start = i + prefix.len();
-        let secret_end = text[secret_start..]
-            .find(is_delimiter)
-            .map_or(text.len(), |p| secret_start + p);
-        if secret_end == secret_start {
-            i = secret_start;
+        let secret_end = value_end(text, secret_start, is_delimiter);
+        // Nothing there, or already masked: leave it (masking is idempotent).
+        if secret_end == secret_start || &text[secret_start..secret_end] == REDACTED {
+            i = secret_end.max(secret_start);
             continue;
         }
         out.push_str(&text[copied..i]);
@@ -445,19 +463,18 @@ pub fn redact_assignments(text: &str) -> String {
             (Some((after, backslashes, quote)), _) => {
                 closing_quote(bytes, after, backslashes, quote).map_or(bytes.len(), |p| p + 1)
             }
-            (None, Some(_)) => lower[j..]
-                .find(|c: char| {
-                    if across_spaces {
-                        matches!(c, '\n' | '\r' | '"' | '\'' | ',' | ';' | '}' | ']')
-                    } else {
-                        is_delimiter(c)
-                    }
-                })
-                .map_or(bytes.len(), |p| j + p),
+            (None, Some(_)) => value_end(text, j, |c: char| {
+                if across_spaces {
+                    matches!(c, '\n' | '\r' | '"' | '\'' | ',' | ';' | '}' | ']')
+                } else {
+                    is_delimiter(c)
+                }
+            }),
             (None, None) => j,
         };
-        if end == start {
-            i = j.max(i + name.len());
+        // Nothing there, or already masked: leave it (masking is idempotent).
+        if end == start || &text[start..end] == REDACTED {
+            i = end.max(j.max(i + name.len()));
             continue;
         }
         out.push_str(&text[copied..start]);
@@ -694,6 +711,35 @@ mod tests {
         assert!(out.truncated);
         assert_eq!(out.value, json!({"ok": 1}));
         assert!(out.value.to_string().len() <= TOOL_FIELD_MAX_BYTES);
+    }
+
+    #[test]
+    fn masking_is_idempotent_so_text_that_passes_two_filters_is_not_mangled() {
+        // The placeholder ends in `]`, a delimiter: masking masked text must not grow `[redacted]]`.
+        for text in [
+            r#"curl -H "Authorization: Bearer SECRETVALUE123" https://x"#,
+            "Authorization: Basic dXNlcjpwYXNz",
+            "token=abc password: hunter2 sk-live_ABC",
+            r#"{"access_token":"abc","n":1}"#,
+            "psql postgres://admin:URL1@db:5432/app --password FLAG1",
+            "key=[redacted] and Bearer [redacted] and token: [redacted]",
+        ] {
+            let once = redact_secrets(text);
+            assert_eq!(redact_secrets(&once), once, "second pass changed: {once}");
+            assert_eq!(
+                redact_secrets(&redact_secrets(&once)),
+                once,
+                "third pass changed: {once}"
+            );
+            assert!(!once.contains("]]"), "doubled bracket in {once}");
+        }
+        let through_the_sanitizer = redact_and_bound(
+            json!({"command": "curl -H \"Authorization: Bearer SECRETVALUE123\" x"}),
+            Limits::BOUNDED,
+        )
+        .value;
+        let again = redact_and_bound(through_the_sanitizer.clone(), Limits::BOUNDED).value;
+        assert_eq!(again, through_the_sanitizer);
     }
 
     #[test]
