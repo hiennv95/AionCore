@@ -149,17 +149,6 @@ pub fn build_wake_payload(
     payload
 }
 
-/// Classify the small, task-free openings that should take the greeting fast
-/// path. Keep this deliberately narrow: a greeting followed by any request is
-/// a real task and must reach the agent normally.
-pub fn is_greeting_message(content: &str) -> bool {
-    let normalized = content
-        .trim()
-        .trim_end_matches(|character: char| character.is_ascii_punctuation())
-        .to_lowercase();
-    matches!(normalized.as_str(), "hi" | "hello" | "hey" | "xin chao" | "xin chào")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,13 +289,6 @@ mod tests {
     }
 
     #[test]
-    fn lead_prompt_has_zero_tool_greeting_fast_path() {
-        let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &[]);
-        assert!(prompt.contains("Greeting fast path (highest priority)"));
-        assert!(prompt.contains("A greeting must consume\none model response and no tool calls."));
-    }
-
-    #[test]
     fn lead_prompt_omits_dynamic_available_assistants_section() {
         let assistants = default_assistants();
         let prompt = build_lead_prompt(&make_lead(), "Alpha", &[], &assistants);
@@ -381,14 +363,6 @@ mod tests {
         assert!(prompt.contains("shutdown_request"));
         assert!(prompt.contains("shutdown_approved"));
         assert!(prompt.contains("STOP GENERATING"));
-    }
-
-    #[test]
-    fn teammate_prompt_has_zero_tool_greeting_fast_path() {
-        let agent = make_teammate("w1", "Worker1");
-        let prompt = build_teammate_prompt(&agent, "Alpha", &[make_lead(), agent.clone()]);
-        assert!(prompt.contains("Greeting fast path (highest priority)"));
-        assert!(prompt.contains("A greeting must consume\none model response and no tool calls."));
     }
 
     #[test]
@@ -493,13 +467,5 @@ mod tests {
         let task = make_task("short", "Short ID Task", TaskStatus::Pending);
         let payload = build_wake_payload(&agent, &[task], &[], &roster(&["lead-1", "worker-1"]));
         assert!(payload.contains("short…"));
-    }
-
-    #[test]
-    fn greeting_classifier_stays_narrow() {
-        assert!(is_greeting_message(" hi! "));
-        assert!(is_greeting_message("Xin chào?"));
-        assert!(!is_greeting_message("hi, fix the login bug"));
-        assert!(!is_greeting_message("hello team please inspect this"));
     }
 }
