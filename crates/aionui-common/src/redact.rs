@@ -25,7 +25,7 @@ pub fn redact_value(value: Value) -> Value {
     }
 }
 
-fn should_redact_key(key: &str) -> bool {
+pub(crate) fn should_redact_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     matches!(
         key.as_str(),
@@ -43,7 +43,7 @@ fn should_redact_key(key: &str) -> bool {
         || key.contains("password")
 }
 
-fn redacted_secret_summary(value: Value) -> Value {
+pub(crate) fn redacted_secret_summary(value: Value) -> Value {
     match value {
         Value::String(text) => json!({
             "redacted": true,

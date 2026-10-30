@@ -56,7 +56,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::convert::{
     TOOL_CONTENT_COMPACT_THRESHOLD_BYTES, row_to_artifact_response, row_to_message_response,
-    row_to_message_response_compact, row_to_response, row_to_response_with_extra, search_row_to_item, string_to_enum,
+    row_to_message_response_compact, row_to_message_response_full, row_to_response, row_to_response_with_extra,
+    search_row_to_item, string_to_enum,
 };
 use crate::error::ConversationError;
 use crate::session_context::{AionrsRuntimePermissionSeed, SessionContextBuilder};
@@ -3585,7 +3586,8 @@ impl ConversationService {
             })?;
 
         let content_bytes = row.content.len();
-        let response = row_to_message_response(row)?;
+        // An explicit fetch of one message: tool payloads are redacted but not cut to the byte budget.
+        let response = row_to_message_response_full(row)?;
         if is_tool_message_type(response.r#type) || content_bytes > TOOL_CONTENT_COMPACT_THRESHOLD_BYTES {
             info!(
                 conversation_id,
@@ -4600,6 +4602,8 @@ impl ConversationService {
             "hidden": row.hidden,
             "replace": true,
         });
+        let mut payload = payload;
+        crate::tool_wire::sanitize_stream_payload(&mut payload);
         self.broadcaster
             .broadcast(WebSocketMessage::new("message.stream", payload));
         Ok(())

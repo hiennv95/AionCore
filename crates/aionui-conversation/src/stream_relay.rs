@@ -1067,6 +1067,8 @@ impl StreamRelay {
     }
 
     fn broadcast_stream_payload(&self, mut payload: serde_json::Value) {
+        // Every tool frame leaves through here: redact and bound it for the client (persistence stays raw).
+        crate::tool_wire::sanitize_stream_payload(&mut payload);
         if let Some(obj) = payload.as_object_mut() {
             obj.entry("user_id")
                 .or_insert_with(|| serde_json::Value::String(self.user_id.clone()));
@@ -1317,6 +1319,66 @@ mod tests {
             }
         }
         assert!(saw_forward, "AcpSessionInfo frame must still be forwarded");
+    }
+
+    /// L03.IO: a tool frame is redacted and bounded for the client on the live path, while the row the
+    /// relay persists stays raw (the agent's own record is not rewritten).
+    #[tokio::test]
+    async fn live_tool_frames_are_sanitized_for_clients_but_persisted_raw() {
+        use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, _) = broadcast::channel(64);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus.clone(),
+        );
+        let rx = tx.subscribe();
+        let output = format!("{} Bearer RAWSECRET", "line of output\n".repeat(20_000));
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "toolu_1".into(),
+            name: "Run curl".into(),
+            args: serde_json::json!({"command": "curl", "env": {"API_TOKEN": "ENVSECRET"}}),
+            status: ToolCallStatus::Completed,
+            input: Some(serde_json::json!({"command": "curl"})),
+            output: Some(output.clone()),
+            description: None,
+            parent_call_id: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        relay.consume(rx).await;
+
+        let mut frame = None;
+        while let Ok(msg) = ws_rx.try_recv() {
+            if msg.name == "message.stream" && msg.data["type"] == "tool_call" {
+                frame = Some(msg.data);
+            }
+        }
+        let frame = frame.expect("the tool frame reaches the client");
+        let wire = frame.to_string();
+        assert!(
+            !wire.contains("RAWSECRET") && !wire.contains("ENVSECRET"),
+            "secret on the wire"
+        );
+        assert_eq!(frame["data"]["call_id"], "toolu_1");
+        assert_eq!(frame["data"]["status"], "completed");
+        assert_eq!(frame["data"]["output_truncated"], true);
+        assert!(wire.len() < 200_000, "wire size {}", wire.len());
+
+        let persisted = repo
+            .take_inserts()
+            .into_iter()
+            .find(|m| m.r#type == "tool_call")
+            .expect("the tool row is persisted");
+        assert!(persisted.content.contains("RAWSECRET"), "persistence stays raw");
+        assert!(persisted.content.len() > 200_000);
     }
 
     #[tokio::test]

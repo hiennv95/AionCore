@@ -338,18 +338,18 @@ impl BackgroundStreamWatcher {
                 }
             };
             normalize_keys_to_snake_case(&mut body);
-            self.broadcaster.broadcast(aionui_api_types::WebSocketMessage::new(
-                "message.stream",
-                json!({
-                    "conversation_id": self.conversation_id,
-                    "user_id": self.user_id,
-                    "msg_id": msg_id,
-                    "turn_id": "",
-                    "type": kind,
-                    "data": body,
-                    "hidden": false,
-                }),
-            ));
+            let mut payload = json!({
+                "conversation_id": self.conversation_id,
+                "user_id": self.user_id,
+                "msg_id": msg_id,
+                "turn_id": "",
+                "type": kind,
+                "data": body,
+                "hidden": false,
+            });
+            crate::tool_wire::sanitize_stream_payload(&mut payload);
+            self.broadcaster
+                .broadcast(aionui_api_types::WebSocketMessage::new("message.stream", payload));
         }
     }
 
@@ -369,18 +369,18 @@ impl BackgroundStreamWatcher {
             }
         };
         normalize_keys_to_snake_case(&mut event_data);
-        self.broadcaster.broadcast(aionui_api_types::WebSocketMessage::new(
-            "message.stream",
-            json!({
-                "conversation_id": self.conversation_id,
-                "user_id": self.user_id,
-                "msg_id": "",
-                "turn_id": "",
-                "type": event_data.get("type").cloned().unwrap_or(json!("unknown")),
-                "data": event_data.get("data").cloned().unwrap_or(json!({})),
-                "hidden": false,
-            }),
-        ));
+        let mut payload = json!({
+            "conversation_id": self.conversation_id,
+            "user_id": self.user_id,
+            "msg_id": "",
+            "turn_id": "",
+            "type": event_data.get("type").cloned().unwrap_or(json!("unknown")),
+            "data": event_data.get("data").cloned().unwrap_or(json!({})),
+            "hidden": false,
+        });
+        crate::tool_wire::sanitize_stream_payload(&mut payload);
+        self.broadcaster
+            .broadcast(aionui_api_types::WebSocketMessage::new("message.stream", payload));
     }
 
     /// Run a CLI-initiated turn through a REGULAR relay so it gets everything a

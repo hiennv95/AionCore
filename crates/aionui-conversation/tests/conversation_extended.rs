@@ -450,12 +450,17 @@ async fn t8_6_compact_mode_truncates_large_tool_content_only_for_list_response()
         .list_messages(USER_ID, &conv.id, ListMessagesQuery::default())
         .await
         .unwrap();
-    assert_eq!(
-        full.items[0].content["update"]["content"][0]["content"]["text"]
-            .as_str()
-            .unwrap(),
-        large_output
+    // L03.IO: the default list is bounded to the tool-payload byte budget and says so; the full text
+    // comes from `get_message` (t8_7). It used to return the whole 110 KB here.
+    let listed = full.items[0].content["update"]["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(listed.len() <= aionui_common::tool_payload::TOOL_FIELD_MAX_BYTES);
+    assert!(
+        large_output.starts_with(listed),
+        "the cut keeps the start of the output"
     );
+    assert_eq!(full.items[0].content["update"]["content_truncated"], true);
 
     let compact = svc
         .list_messages(

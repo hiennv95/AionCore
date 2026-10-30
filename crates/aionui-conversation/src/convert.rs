@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use aionui_api_types::{ConversationArtifactResponse, ConversationResponse, MessageResponse, MessageSearchItem};
+use aionui_common::tool_payload::Limits;
 use aionui_common::{
     AgentType, ConversationSource, ConversationStatus, MessagePosition, MessageStatus, MessageType, ProviderWithModel,
 };
@@ -9,9 +10,23 @@ use aionui_db::models::{ConversationArtifactRow, ConversationRow, MessageRow};
 
 use crate::ConversationError;
 use crate::service::is_temp_session_workspace;
+use crate::tool_wire::sanitize_message_content;
 
 pub(crate) const TOOL_CONTENT_COMPACT_THRESHOLD_BYTES: usize = 64 * 1024;
 const TOOL_CONTENT_PREVIEW_CHARS: usize = 4096;
+/// A search hit shows a snippet, never a whole tool payload.
+const TOOL_SEARCH_PREVIEW_BYTES: usize = 8 * 1024;
+
+fn cap_preview(mut text: String, message_type: &str) -> String {
+    if matches!(
+        message_type,
+        "tool_call" | "acp_tool_call" | "acp_terminal_output" | "tool_group"
+    ) && text.len() > TOOL_SEARCH_PREVIEW_BYTES
+    {
+        text.truncate(text.floor_char_boundary(TOOL_SEARCH_PREVIEW_BYTES));
+    }
+    text
+}
 
 /// Convert a database row into an API response DTO.
 ///
@@ -149,16 +164,28 @@ pub fn string_to_enum<T: serde::de::DeserializeOwned>(s: &str) -> Result<T, Conv
         .map_err(|e| ConversationError::internal(format!("Invalid enum value '{s}': {e}")))
 }
 
-/// Convert a message database row into an API response DTO.
+/// Convert a message database row into an API response DTO. Tool input and output are redacted and
+/// bounded in the copy (see `tool_wire`); the row itself stays raw.
 pub fn row_to_message_response(row: MessageRow) -> Result<MessageResponse, ConversationError> {
+    message_response(row, Limits::BOUNDED)
+}
+
+/// [`row_to_message_response`] for an explicit fetch of one message: tool payloads are still redacted
+/// but not cut to the byte budget.
+pub fn row_to_message_response_full(row: MessageRow) -> Result<MessageResponse, ConversationError> {
+    message_response(row, Limits::UNBOUNDED_BYTES)
+}
+
+fn message_response(row: MessageRow, limits: Limits) -> Result<MessageResponse, ConversationError> {
     let msg_type: MessageType = string_to_enum(&row.r#type)?;
 
     let position: Option<MessagePosition> = row.position.as_deref().map(string_to_enum).transpose()?;
 
     let status: Option<MessageStatus> = row.status.as_deref().map(string_to_enum).transpose()?;
 
-    let content: serde_json::Value = serde_json::from_str(&row.content)
+    let mut content: serde_json::Value = serde_json::from_str(&row.content)
         .map_err(|e| ConversationError::internal(format!("Invalid message content JSON: {e}")))?;
+    sanitize_message_content(&row.r#type, &mut content, limits);
 
     Ok(MessageResponse {
         id: row.id,
@@ -313,7 +340,23 @@ pub fn search_row_to_item(row: MessageSearchRow, data_dir: &Path) -> Result<Mess
     };
 
     let conversation = row_to_response(conversation_row, data_dir)?;
-    let preview_text = extract_preview_text(&row.content);
+    // A search snippet is an outbound path too: a tool payload is redacted and bounded first.
+    let preview_text = match row.r#type.as_str() {
+        "tool_call" | "acp_tool_call" | "acp_terminal_output" | "tool_group" => {
+            match serde_json::from_str::<serde_json::Value>(&row.content) {
+                Ok(mut content) => {
+                    sanitize_message_content(&row.r#type, &mut content, Limits::BOUNDED);
+                    extract_preview_text(&content.to_string())
+                }
+                // Malformed tool JSON: never fall back to the raw text. Redact and bound it as plain text.
+                Err(_) => extract_preview_text(
+                    &aionui_common::tool_payload::redact_and_bound_text(&row.content, Limits::BOUNDED).0,
+                ),
+            }
+        }
+        _ => extract_preview_text(&row.content),
+    };
+    let preview_text = cap_preview(preview_text, &row.r#type);
 
     Ok(MessageSearchItem {
         message_id: row.message_id,
@@ -649,6 +692,70 @@ mod tests {
         assert_eq!(item.conversation.source, Some(ConversationSource::Aionui));
         assert_eq!(item.conversation.extra["workspace"], "/project");
         assert_eq!(item.conversation.modified_at, 2000);
+    }
+
+    #[test]
+    fn a_search_snippet_of_a_tool_payload_is_redacted() {
+        let content = json!({
+            "call_id": "k", "name": "Run", "status": "completed",
+            "output": "result Bearer SNIPSECRET and password=hunter2"
+        });
+        let row = MessageSearchRow {
+            message_id: "msg_1".into(),
+            r#type: "tool_call".into(),
+            content: content.to_string(),
+            created_at: 5000,
+            conversation_id: "conv_1".into(),
+            conversation_name: "Test Conv".into(),
+            conversation_type: "acp".into(),
+            conversation_extra: "{}".into(),
+            conversation_model: None,
+            conversation_status: Some("finished".into()),
+            conversation_source: Some("aionui".into()),
+            conversation_channel_chat_id: None,
+            conversation_pinned: false,
+            conversation_pinned_at: None,
+            conversation_created_at: 1000,
+            conversation_updated_at: 2000,
+        };
+        let item = search_row_to_item(row, Path::new("/tmp/data")).unwrap();
+        assert!(
+            !item.preview_text.contains("SNIPSECRET") && !item.preview_text.contains("hunter2"),
+            "{}",
+            item.preview_text
+        );
+        assert!(item.preview_text.contains("result"));
+    }
+
+    #[test]
+    fn a_search_snippet_of_malformed_tool_content_is_redacted_and_bounded() {
+        let content = format!("not json Bearer BADSECRET password=hunter2 {}", "x".repeat(200_000));
+        let row = MessageSearchRow {
+            message_id: "msg_1".into(),
+            r#type: "acp_tool_call".into(),
+            content,
+            created_at: 5000,
+            conversation_id: "conv_1".into(),
+            conversation_name: "Test Conv".into(),
+            conversation_type: "acp".into(),
+            conversation_extra: "{}".into(),
+            conversation_model: None,
+            conversation_status: Some("finished".into()),
+            conversation_source: Some("aionui".into()),
+            conversation_channel_chat_id: None,
+            conversation_pinned: false,
+            conversation_pinned_at: None,
+            conversation_created_at: 1000,
+            conversation_updated_at: 2000,
+        };
+        let item = search_row_to_item(row, Path::new("/tmp/data")).unwrap();
+        assert!(!item.preview_text.contains("BADSECRET") && !item.preview_text.contains("hunter2"));
+        assert!(
+            item.preview_text.len() <= 70_000,
+            "bounded: {}",
+            item.preview_text.len()
+        );
+        assert!(item.preview_text.starts_with("not json"));
     }
 
     #[test]

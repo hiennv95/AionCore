@@ -15,6 +15,7 @@ mod id;
 mod pagination;
 pub mod redact;
 mod timestamp;
+pub mod tool_payload;
 mod types;
 
 pub use backend_capabilities::{CapabilityOrigin, McpTransportCapabilities, ResolvedBackendCapabilities};
