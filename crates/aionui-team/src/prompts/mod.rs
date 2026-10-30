@@ -149,6 +149,17 @@ pub fn build_wake_payload(
     payload
 }
 
+/// Classify the small, task-free openings that should take the greeting fast
+/// path. Keep this deliberately narrow: a greeting followed by any request is
+/// a real task and must reach the agent normally.
+pub fn is_greeting_message(content: &str) -> bool {
+    let normalized = content
+        .trim()
+        .trim_end_matches(|character: char| character.is_ascii_punctuation())
+        .to_lowercase();
+    matches!(normalized.as_str(), "hi" | "hello" | "hey" | "xin chao" | "xin chào")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +493,13 @@ mod tests {
         let task = make_task("short", "Short ID Task", TaskStatus::Pending);
         let payload = build_wake_payload(&agent, &[task], &[], &roster(&["lead-1", "worker-1"]));
         assert!(payload.contains("short…"));
+    }
+
+    #[test]
+    fn greeting_classifier_stays_narrow() {
+        assert!(is_greeting_message(" hi! "));
+        assert!(is_greeting_message("Xin chào?"));
+        assert!(!is_greeting_message("hi, fix the login bug"));
+        assert!(!is_greeting_message("hello team please inspect this"));
     }
 }

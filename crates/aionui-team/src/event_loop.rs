@@ -162,6 +162,10 @@ async fn run_event_loop(
                         break;
                     }
                 }
+                Ok(PrepareBatchResult::SettleBackground { batch }) => {
+                    ctx.session.settle_background_batch(&batch).await;
+                    finalize_scheduler_turn(&ctx).await;
+                }
                 Ok(PrepareBatchResult::SettleSignals { intent_ids }) => {
                     ctx.session.handle_signal_intents(&ctx.slot_id, &intent_ids).await;
                 }
@@ -191,6 +195,12 @@ enum ExecuteResult {
 }
 
 async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: WakeInput) -> ExecuteResult {
+    let turn_started_at = std::time::Instant::now();
+    let greeting_fast_path = input
+        .unread
+        .iter()
+        .filter(|message| message.from_agent_id == "user")
+        .any(|message| crate::prompts::is_greeting_message(&message.content));
     ctx.session.mirror_unread_to_conversation(&input).await;
     let _ = ctx.scheduler.set_status(&ctx.slot_id, TeammateStatus::Working).await;
 
@@ -358,6 +368,16 @@ async fn execute_and_finalize(ctx: &AgentLoopContext, batch: WorkBatch, input: W
             batch.team_run_ids.clone(),
         )
     };
+    info!(
+        team_id = %ctx.team_id,
+        slot_id = %ctx.slot_id,
+        duration_ms = turn_started_at.elapsed().as_millis() as u64,
+        greeting_fast_path,
+        model_turns = 1,
+        tool_calls_observed = false,
+        token_usage_observed = false,
+        "team turn efficiency"
+    );
     if let Some(status) = terminal_status {
         let emitter = ctx.session.team_event_emitter();
         for team_run_id in &terminal_team_run_ids {

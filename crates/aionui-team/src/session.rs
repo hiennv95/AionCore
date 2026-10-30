@@ -79,8 +79,18 @@ pub(crate) struct AgentInboxPeek {
 }
 
 pub(crate) enum PrepareBatchResult {
-    Execute { batch: Box<WorkBatch>, input: WakeInput },
-    SettleSignals { intent_ids: Vec<String> },
+    Execute {
+        batch: Box<WorkBatch>,
+        input: WakeInput,
+    },
+    /// Internal idle notifications are bookkeeping, not agent work. Consume
+    /// them without opening a model turn or invoking MCP tools.
+    SettleBackground {
+        batch: Box<WorkBatch>,
+    },
+    SettleSignals {
+        intent_ids: Vec<String>,
+    },
     WaitingForCompletion,
     Blocked,
     Quiescent,
@@ -412,6 +422,13 @@ impl TeamSession {
                         "claimed team mailbox messages are no longer unread".into(),
                     ));
                 }
+                if !claimed_unread.is_empty()
+                    && claimed_unread
+                        .iter()
+                        .all(|message| message.msg_type == MailboxMessageType::IdleNotification)
+                {
+                    return Ok(PrepareBatchResult::SettleBackground { batch: Box::new(batch) });
+                }
                 let tasks = match self.scheduler.list_tasks().await {
                     Ok(tasks) => tasks,
                     Err(error) => {
@@ -518,6 +535,28 @@ impl TeamSession {
                 "team signal intents could not be settled"
             );
         }
+    }
+
+    pub(crate) async fn settle_background_batch(&self, batch: &WorkBatch) {
+        let completion = self.work_coordinator.complete_batch_with_ack(batch);
+        if completion.commit_result == CommitResult::Committed {
+            if let Err(error) = self
+                .mailbox
+                .mark_read_batch(&self.team.id, &completion.ack_message_ids)
+                .await
+            {
+                warn!(team_id = %self.team.id, slot_id = %batch.slot_id, error = %error, "failed to acknowledge idle notifications");
+            }
+        }
+        info!(
+            team_id = %self.team.id,
+            slot_id = %batch.slot_id,
+            mailbox_messages = batch.mailbox_message_ids.len(),
+            model_turns = 0,
+            tool_calls = 0,
+            token_waste = 0,
+            "team background notification settled without model work"
+        );
     }
 
     /// Handle agent Finish/Error events. Delegates to the scheduler's
