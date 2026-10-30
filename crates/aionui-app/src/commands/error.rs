@@ -15,6 +15,8 @@ pub(crate) enum CliBoundaryCode {
     CliUserInputInvalid,
     CliUserNotFound,
     CliUserAlreadyExists,
+    CliUserDataDirNotFound,
+    CliUserHostRunning,
     CliUserDatabaseFailed,
     CliUserHashFailed,
     CliSecretInputInvalid,
@@ -52,6 +54,8 @@ impl CliBoundaryCode {
             Self::CliUserInputInvalid => "CLI_USER_INPUT_INVALID",
             Self::CliUserNotFound => "CLI_USER_NOT_FOUND",
             Self::CliUserAlreadyExists => "CLI_USER_ALREADY_EXISTS",
+            Self::CliUserDataDirNotFound => "CLI_USER_DATA_DIR_NOT_FOUND",
+            Self::CliUserHostRunning => "CLI_USER_HOST_RUNNING",
             Self::CliUserDatabaseFailed => "CLI_USER_DATABASE_FAILED",
             Self::CliUserHashFailed => "CLI_USER_HASH_FAILED",
             Self::CliSecretInputInvalid => "CLI_SECRET_INPUT_INVALID",
@@ -91,6 +95,8 @@ impl CliBoundaryCode {
             | Self::CliUserInputInvalid
             | Self::CliUserNotFound
             | Self::CliUserAlreadyExists
+            | Self::CliUserDataDirNotFound
+            | Self::CliUserHostRunning
             | Self::CliSecretInputInvalid
             | Self::CliSecretConflict => ExitKind::Config,
             Self::McpTcpConnectFailed | Self::McpHttpConnectOrTimeout | Self::McpHttpStatusError => {

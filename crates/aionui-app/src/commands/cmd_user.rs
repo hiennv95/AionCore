@@ -20,11 +20,12 @@
 //! even on a running server, as with `POST /api/auth/change-password`.
 
 use std::io::{self, IsTerminal};
+use std::path::Path;
 use std::process::ExitCode;
 
 use aionui_auth::{AccountError, PasswordOutcome, create_local_user, set_local_password, validate_username};
 use aionui_db::{
-    Database, IUserRepository, SqliteUserRepository, init_database, maybe_copy_legacy_database,
+    DataDirInstanceGuard, Database, IUserRepository, SqliteUserRepository, init_database, maybe_copy_legacy_database,
     models::{User, UserStatus},
 };
 
@@ -51,6 +52,13 @@ async fn set_password(cli: &Cli, args: &SetPasswordArgs) -> Result<ExitCode, Cli
         validate_username(name).map_err(|_| input_error("username does not meet the required format"))?;
     }
 
+    // Checked before the password is read, so a wrong data dir or a running host fails fast and
+    // nothing is created or changed.
+    let db_path = cli.data_dir.join(DATABASE_FILE);
+    check_target(&db_path, args.require_existing)?;
+    let existed = db_path.is_file();
+    let _guard = acquire_exclusive(&db_path).await?;
+
     let password = read_new_password(args.password_stdin)?;
 
     let database = open_database(cli).await?;
@@ -59,8 +67,63 @@ async fn set_password(cli: &Cli, args: &SetPasswordArgs) -> Result<ExitCode, Cli
     database.close().await;
     let outcome = outcome.map_err(map_account_error)?;
 
-    println!("Password set for {}.", describe_outcome(&outcome));
+    if !existed {
+        eprintln!(
+            "warning: no database existed at {}; a new one was created. If you meant to reset an existing \
+             deployment, this is the wrong --data-dir (use --require-existing).",
+            db_path.display()
+        );
+    }
+    println!(
+        "Password set for {}. Database: {}",
+        describe_outcome(&outcome),
+        db_path.display()
+    );
     Ok(ExitCode::SUCCESS)
+}
+
+const DATABASE_FILE: &str = "aionui-backend.db";
+
+/// `--require-existing`: refuse before anything is created when the data dir holds no database.
+fn check_target(db_path: &Path, require_existing: bool) -> Result<(), CliBoundaryError> {
+    if require_existing && !db_path.is_file() {
+        return Err(CliBoundaryError::new(
+            CliBoundaryCode::CliUserDataDirNotFound,
+            SUBCOMMAND,
+            "no application database was found in --data-dir; nothing was created or changed",
+        ));
+    }
+    Ok(())
+}
+
+/// The data-dir instance guard the host holds while it runs: taking it proves no host is using this
+/// database, and keeps one from starting until the guard is dropped. Fails closed: if the host holds it,
+/// or the lock cannot be taken at all, the password is not changed.
+async fn acquire_exclusive(db_path: &Path) -> Result<Option<DataDirInstanceGuard>, CliBoundaryError> {
+    if let Some(parent) = db_path.parent()
+        && !parent.exists()
+    {
+        // Nothing to lock yet (a fresh bootstrap into a new directory); `open_database` creates it.
+        return Ok(None);
+    }
+    let path = db_path.to_path_buf();
+    // The bounded wait sleeps, so keep it off the async worker.
+    let held = tokio::task::spawn_blocking(move || crate::bootstrap::wait_for_instance_guard(&path))
+        .await
+        .map_err(|_| database_error())?;
+    match held {
+        Ok(Some(guard)) => Ok(Some(guard)),
+        Ok(None) => Err(CliBoundaryError::new(
+            CliBoundaryCode::CliUserHostRunning,
+            SUBCOMMAND,
+            "a host holds this data dir (is it running?); stop it first. Nothing was changed",
+        )),
+        Err(_) => Err(CliBoundaryError::new(
+            CliBoundaryCode::CliUserHostRunning,
+            SUBCOMMAND,
+            "cannot verify that no host holds this data dir (lock unavailable); nothing was changed",
+        )),
+    }
 }
 
 /// CLI adapter for `user create`: read the new password, then delegate to the

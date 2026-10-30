@@ -5,7 +5,9 @@ use aionui_db::DbError;
 use aionui_db::models::{User, UserStatus, UserType};
 use aionui_db::{IUserRepository, SqliteUserRepository, init_database_memory};
 
-use super::{apply_user_status, format_user_lines, map_account_error, parse_stdin_password};
+use super::{
+    acquire_exclusive, apply_user_status, check_target, format_user_lines, map_account_error, parse_stdin_password,
+};
 use crate::commands::error::CliBoundaryCode;
 
 // Security: the `user list` rendering must never surface `password_hash`,
@@ -198,4 +200,49 @@ fn parse_stdin_password_rejects_empty_input() {
             "empty stdin line {line:?} must be rejected as invalid input"
         );
     }
+}
+
+// Lost-password recovery: `--require-existing` refuses a data dir with no database BEFORE anything is
+// created, so a mistyped path cannot silently produce (and change) a new empty database. Exit class 2.
+#[test]
+fn require_existing_refuses_a_missing_database_and_creates_nothing() {
+    let dir = std::env::temp_dir().join(format!("aionx-user-missing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db_path = dir.join("aionui-backend.db");
+
+    let err = check_target(&db_path, true).unwrap_err();
+    assert_eq!(err.code(), CliBoundaryCode::CliUserDataDirNotFound);
+    assert_eq!(err.exit_code(), ExitCode::from(2));
+    assert!(!dir.exists(), "the refusal must not create the data dir");
+
+    // Without the flag a fresh bootstrap is still allowed.
+    check_target(&db_path, false).unwrap();
+}
+
+// The host holds the data-dir instance guard while it runs. The password change must refuse, change
+// nothing, and work again once the host has stopped. Fails closed, exit class 2.
+#[tokio::test]
+async fn password_change_refuses_while_a_host_holds_the_data_dir() {
+    let dir = std::env::temp_dir().join(format!("aionx-user-guard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("aionui-backend.db");
+
+    let host = aionui_db::DataDirInstanceGuard::try_acquire(&db_path)
+        .unwrap()
+        .expect("the first holder wins");
+    let err = acquire_exclusive(&db_path).await.unwrap_err();
+    assert_eq!(err.code(), CliBoundaryCode::CliUserHostRunning);
+    assert_eq!(err.exit_code(), ExitCode::from(2));
+
+    drop(host);
+    let guard = acquire_exclusive(&db_path).await.unwrap();
+    assert!(guard.is_some(), "free once the host is gone");
+    // While this command holds it, a host starting now would be refused in turn.
+    assert!(
+        aionui_db::DataDirInstanceGuard::try_acquire(&db_path)
+            .unwrap()
+            .is_none()
+    );
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -772,8 +772,12 @@ pub(crate) struct UserArgs {
 pub(crate) enum UserCommand {
     /// Set (or create) a local user's login password. With no `--username`,
     /// targets the built-in `system_default_user` (login name `admin`) — the
-    /// bootstrap path for a fresh deployment. Does not revoke existing
-    /// sessions; restart the server after a hot password change.
+    /// bootstrap path for a fresh deployment and the lost-password recovery
+    /// path. On an existing account it bumps the session generation, which
+    /// revokes every live session (desktop app and paired devices included).
+    /// It refuses to run while a host holds the data dir (stop the host
+    /// first); use `--require-existing` so a mistyped `--data-dir` cannot
+    /// silently create and change a new empty database.
     SetPassword(SetPasswordArgs),
     /// Create a NEW local user with a login password. `--username` is required
     /// and must not already exist — a conflict (including the built-in `admin`
@@ -816,6 +820,12 @@ pub(crate) struct SetPasswordArgs {
     /// `echo "$PW" | aioncore user set-password --password-stdin`.
     #[arg(long)]
     pub password_stdin: bool,
+
+    /// Fail with `CLI_USER_DATA_DIR_NOT_FOUND` unless `--data-dir` already
+    /// holds the application database, before anything is created. Use for
+    /// recovery of an existing deployment; leave it off for a fresh bootstrap.
+    #[arg(long)]
+    pub require_existing: bool,
 }
 
 #[derive(Args, Debug, Clone)]
