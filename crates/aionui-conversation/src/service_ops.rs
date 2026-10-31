@@ -372,7 +372,19 @@ impl ConversationService {
             .iter()
             .find(|option| option.category.as_deref() == Some("mode"))
             .and_then(|option| option.current_value.as_deref());
-        match live {
+        // Direct CLI sessions can expose the current mode through get_mode()
+        // before they publish a selectable catalog. Keep the same fail-closed
+        // comparison: an empty or different mode is still refused.
+        let live_mode = match live {
+            Some(mode) => Some(mode.to_owned()),
+            None => self
+                .task(conversation_id)?
+                .get_mode()
+                .await
+                .map(|response| response.mode)
+                .ok(),
+        };
+        match live_mode.as_deref() {
             Some(mode) if mode == locked => Ok(()),
             // A missing live mode cannot prove the shared mode, so it fails closed (audit H17).
             None => {
