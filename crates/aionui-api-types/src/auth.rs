@@ -58,6 +58,14 @@ pub struct AuthStatusResponse {
     pub is_authenticated: bool,
 }
 
+/// Capabilities for the authenticated caller. Unlike the device list, this
+/// preserves the distinction between local mode and a device-less login.
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallerCapabilitiesResponse {
+    pub manager: bool,
+    pub cron: String,
+}
+
 /// Refresh token request body for `POST /api/auth/refresh`.
 #[derive(Debug, Deserialize)]
 pub struct RefreshTokenRequest {

@@ -13,7 +13,7 @@ use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
 
 use aionui_api_types::{
-    ApiResponse, AuthStatusResponse, ChangePasswordRequest, EnsureExternalSessionRequest,
+    ApiResponse, AuthStatusResponse, CallerCapabilitiesResponse, ChangePasswordRequest, EnsureExternalSessionRequest,
     EnsureExternalSessionResponse, EnsureExternalUserRequest, EnsureExternalUserResponse, LoginRequest, LoginResponse,
     PublicUser, QrLoginRequest, RefreshResponse, RefreshTokenRequest, RevokeExternalSessionRequest,
     RevokeExternalSessionResponse, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
@@ -26,7 +26,9 @@ use aionui_db::{DbError, IDeviceRepository, IUserRepository, UserStatus, UserTyp
 use crate::error::AuthError;
 use crate::extract::{extract_client_ip, extract_cookie_value, extract_token_from_headers};
 use crate::jwt::TokenType;
-use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
+use crate::middleware::{
+    AuthIdentityMode, AuthState, CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller, auth_middleware,
+};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
 use crate::qr_token::QrTokenStore;
 use crate::rate_limit::{
@@ -369,6 +371,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let authenticated = Router::new()
         .route("/logout", post(logout_handler))
         .route("/api/auth/user", get(user_handler))
+        .route("/api/auth/capabilities", get(capabilities_handler))
         .route("/api/auth/change-password", post(change_password_handler))
         .route("/api/ws-token", get(ws_token_handler))
         .route_layer(from_fn_with_state(
@@ -695,6 +698,19 @@ async fn status_handler(
         user_count: user_count as u64,
         is_authenticated,
     }))
+}
+
+// GET /api/auth/capabilities
+async fn capabilities_handler(
+    device: Option<Extension<CurrentDevice>>,
+    deviceless: Option<Extension<DevicelessSession>>,
+    helper: Option<Extension<RuntimeHelperCaller>>,
+) -> Json<CallerCapabilitiesResponse> {
+    let manager = helper.is_none() && (device.as_ref().is_none_or(|d| d.kind == "desktop_app") && deviceless.is_none());
+    Json(CallerCapabilitiesResponse {
+        manager,
+        cron: if manager { "manage" } else { "pause" }.to_owned(),
+    })
 }
 
 // ---------------------------------------------------------------------------
