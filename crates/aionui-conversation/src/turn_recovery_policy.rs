@@ -143,6 +143,97 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum DropPoint {
+        BeforeEffect,
+        AfterEffectBeforeAck,
+    }
+
+    struct DeterministicSink {
+        drop_point: DropPoint,
+        calls: usize,
+        effects: usize,
+    }
+
+    struct SinkObservation {
+        acknowledged: bool,
+        attempt: TurnAttemptSummary,
+    }
+
+    impl DeterministicSink {
+        fn send(&mut self) -> SinkObservation {
+            self.calls += 1;
+            if self.calls == 1 {
+                if matches!(self.drop_point, DropPoint::AfterEffectBeforeAck) {
+                    self.effects += 1;
+                    return SinkObservation {
+                        acknowledged: false,
+                        attempt: TurnAttemptSummary {
+                            saw_tool_or_side_effect: true,
+                            terminal_error: Some(AgentStreamErrorData::legacy(
+                                "effect committed; acknowledgement lost",
+                                None,
+                            )),
+                            ..TurnAttemptSummary::default()
+                        },
+                    };
+                }
+                return SinkObservation {
+                    acknowledged: false,
+                    attempt: TurnAttemptSummary::default(),
+                };
+            }
+            self.effects += 1;
+            SinkObservation {
+                acknowledged: true,
+                attempt: TurnAttemptSummary::default(),
+            }
+        }
+    }
+
+    fn exercise_sink_drop(point: DropPoint) -> DeterministicSink {
+        let mut sink = DeterministicSink {
+            drop_point: point,
+            calls: 0,
+            effects: 0,
+        };
+        let first = sink.send();
+        let mut outcome = retryable_clean_error();
+        let first_uncertain = !first.acknowledged && first.attempt.saw_tool_or_side_effect;
+        outcome.attempt = first.attempt;
+        let decision = TurnRecoveryPolicy::decide(
+            AgentType::Acp,
+            Some("codex"),
+            &outcome,
+            RuntimeLifecycleState::Active,
+            false,
+        );
+        if matches!(decision, TurnRecoveryDecision::AutoReplayOnce { .. }) {
+            let retry = sink.send();
+            assert!(retry.acknowledged, "a before-effect drop may be retried");
+        } else {
+            assert!(
+                first_uncertain,
+                "an after-effect drop must remain visibly uncertain"
+            );
+        }
+        sink
+    }
+
+    #[test]
+    fn deterministic_drop_before_effect_replays_once_and_applies_one_effect() {
+        let sink = exercise_sink_drop(DropPoint::BeforeEffect);
+        assert_eq!(sink.calls, 2);
+        assert_eq!(sink.effects, 1);
+    }
+
+    #[test]
+    fn deterministic_drop_after_effect_before_ack_does_not_replay() {
+        let sink = exercise_sink_drop(DropPoint::AfterEffectBeforeAck);
+        assert_eq!(sink.calls, 1);
+        assert_eq!(sink.effects, 1);
+    }
+
     /// An exhausted usage allowance is not replayed: a retry cannot succeed before the
     /// provider's reset.
     #[test]
