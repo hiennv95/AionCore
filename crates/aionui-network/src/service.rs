@@ -169,6 +169,29 @@ impl NetworkService {
     pub async fn list_peers(&self, user_id: &str) -> Result<Vec<PeerView>, NetworkError> {
         self.ensure_owner(user_id)?;
         policy::prune_expired_pairings(self.repo.as_ref()).await?;
+        let peers = self.repo.list_peers().await?;
+        // The responder is the only owner who approves a new connection. The
+        // initiator learns that decision through the authenticated hello on the
+        // next poll and becomes trusted locally without a second click.
+        for peer in &peers {
+            if peer.state != PeerState::PendingOutbound.as_str() {
+                continue;
+            }
+            let Some(url) = peer.peer_url.as_deref() else { continue };
+            let Ok((fingerprint, hello)) = self.transport.observe(url).await else { continue };
+            if fingerprint.as_str() != peer.fingerprint || hello.caller_state != Some(PeerState::Trusted) {
+                continue;
+            }
+            self.repo
+                .update_peer(
+                    &peer.id,
+                    UpdatePeerParams {
+                        state: Some(PeerState::Trusted.as_str()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+        }
         Ok(self.repo.list_peers().await?.into_iter().map(peer_view).collect())
     }
 
@@ -258,7 +281,12 @@ impl NetworkService {
         policy::prune_expired_pairings(self.repo.as_ref()).await?;
         let peer = self.peer(id).await?;
         match PeerState::parse(&peer.state) {
-            Some(PeerState::PendingInbound | PeerState::PendingOutbound) => {}
+            Some(PeerState::PendingInbound) => {}
+            Some(PeerState::PendingOutbound) => {
+                return Err(NetworkError::InvalidRequest(
+                    "the other host must approve this connection".into(),
+                ));
+            }
             Some(PeerState::Trusted) => return Ok(peer_view(peer)),
             _ => return Err(NetworkError::PeerRevoked),
         }

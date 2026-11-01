@@ -172,7 +172,7 @@ pub async fn build_host(
     test_host
 }
 
-/// Pair `a` → `b` and have both owners approve.
+/// Pair `a` → `b`; only the receiving host approves.
 pub async fn pair(a: &TestHost, b: &TestHost) {
     let view = a
         .service
@@ -182,7 +182,8 @@ pub async fn pair(a: &TestHost, b: &TestHost) {
     assert_eq!(view.state, PeerState::PendingOutbound);
     let on_b = b.peer_id_of(a).await;
     b.service.approve_peer(OWNER, &on_b).await.unwrap();
-    a.service.approve_peer(OWNER, &view.id).await.unwrap();
+    let peers = a.service.list_peers(OWNER).await.unwrap();
+    assert_eq!(peers.iter().find(|peer| peer.id == view.id).unwrap().state, PeerState::Trusted);
 }
 
 /// Poll `check` until it returns `Some`, up to 10 s.

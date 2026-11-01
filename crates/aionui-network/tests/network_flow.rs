@@ -57,7 +57,7 @@ async fn wait_state(host: &TestHost, id: &str, state: RemoteRequestState) -> aio
 }
 
 #[tokio::test]
-async fn pairing_requires_both_owners_and_matching_codes() {
+async fn pairing_requires_responder_approval_and_matching_codes() {
     let (a, b) = (start_host("A").await, start_host("B").await);
     let on_a = a
         .service
@@ -87,8 +87,24 @@ async fn pairing_requires_both_owners_and_matching_codes() {
     );
 
     b.service.approve_peer(OWNER, &on_b[0].id).await.unwrap();
-    a.service.approve_peer(OWNER, &on_a.id).await.unwrap();
+    let on_a = a.service.list_peers(OWNER).await.unwrap().remove(0);
+    assert_eq!(on_a.state, PeerState::Trusted);
     assert!(a.service.remote_agents(OWNER, &on_a.id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn initiator_is_trusted_after_responder_approval_without_second_click() {
+    let (a, b) = (start_host("A").await, start_host("B").await);
+    let on_a = a
+        .service
+        .add_peer(OWNER, AddPeerRequest { url: b.url() })
+        .await
+        .unwrap();
+    let on_b = b.peer_id_of(&a).await;
+    b.service.approve_peer(OWNER, &on_b).await.unwrap();
+
+    let peers = a.service.list_peers(OWNER).await.unwrap();
+    assert_eq!(peers.iter().find(|p| p.id == on_a.id).unwrap().state, PeerState::Trusted);
 }
 
 #[tokio::test]
