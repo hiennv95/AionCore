@@ -9,13 +9,15 @@ use std::sync::{Arc, RwLock, Weak};
 use aionui_ai_agent::{ActiveLeaseRegistry, AgentError, AgentInstance, IWorkerTaskManager, IdleCleanupCoordinator};
 use aionui_api_types::ChatFileRef;
 use aionui_api_types::{
-    AddAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, GetConfigOptionsResponse,
+    AddAgentRequest, AddRemoteAgentRequest, AssistantMcpBindingChanged, CreateTeamRequest, GetConfigOptionsResponse,
     InterruptTeamAgentRequest, SetConfigOptionRequest, SetConfigOptionResponse, TeamActivityCursor,
     TeamActivityPageResponse, TeamAgentResponse, TeamAgentRuntimeStatus, TeamContextResetAvailability,
     TeamContextResetResponse, TeamContextResetRuntimeStatus, TeamContextResetStatus, TeamInterruptAgentResponse,
-    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamSessionBinding,
-    TeamSessionPhase, TeamSessionStatus, TeamSessionStatusPayload, TeamTaskResponse, TeamToolCall,
-    TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport, WebSocketMessage,
+    TeamMailboxMessageResponse, TeamMessageEnqueueStatus, TeamResponse, TeamRunAckResponse, TeamRunPayload,
+    TeamRunSource, TeamRunStateResponse, TeamRunStatus, TeamRunTargetRole, TeamSessionBinding, TeamSessionPhase,
+    TeamSessionStatus, TeamSessionStatusPayload, TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskResponse,
+    TeamToolCall, TeamToolContextResponse, TeamToolErrorCode, TeamToolErrorPayload, TeamToolTransport,
+    WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, generate_id, now_ms};
 use aionui_db::models::TeamRow;
@@ -44,7 +46,7 @@ use crate::member_runtime::{
 use crate::message_projection::TeamProjectionMessageStore;
 use crate::ports::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, NoopNativeSlashCommandPort,
-    TeamAssistantCatalogPort, TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
+    TeamAssistantCatalogPort, TeamRemoteMessage, TeamRemotePort, TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
 };
 use crate::prompt_dump::TeamPromptDumpConfig;
 use crate::provisioning::{TeamAgentProvisioner, TeamConversationProvisioningPort};
@@ -56,7 +58,9 @@ use crate::session::{
     spawn_attach_agent_process_bg,
 };
 use crate::team_run::TeamRunManager;
-use crate::types::{Team, TeamAgent, TeamTask, TeammateRole};
+use crate::types::{
+    RemoteTeamAgent, Team, TeamAgent, TeamTask, TeammateRole, decode_remote_agent, encode_remote_agent,
+};
 use crate::work_coordinator::{
     McpRefreshDisposition, ObserveMessagesResult, RuntimeConstraint, RuntimeRestartRejection,
 };
@@ -189,6 +193,7 @@ pub struct TeamSessionService {
     /// team's `user_order` rows (design §4.3, path 2). `None` → no-op, so team
     /// deletion behaves exactly as before.
     user_order: Arc<RwLock<Option<Arc<dyn IUserOrderStore>>>>,
+    remote_port: Arc<RwLock<Option<Arc<dyn TeamRemotePort>>>>,
     /// Back-pointer used by [`TeamSession::spawn_agent`] to reach DB-facing
     /// orchestration without threading the service through every session method.
     /// Stored as `Weak` so the session map does not create a strong cycle with
@@ -314,6 +319,7 @@ impl TeamSessionService {
             ensure_session_locks: Arc::new(DashMap::new()),
             project_service: Arc::new(RwLock::new(None)),
             user_order: Arc::new(RwLock::new(None)),
+            remote_port: Arc::new(RwLock::new(None)),
             self_ref: weak.clone(),
         })
     }
@@ -448,6 +454,70 @@ impl TeamSessionService {
         if let Ok(mut guard) = self.user_order.write() {
             *guard = Some(user_order);
         }
+    }
+
+    pub fn with_remote_port(&self, port: Arc<dyn TeamRemotePort>) {
+        if let Ok(mut guard) = self.remote_port.write() {
+            *guard = Some(port);
+        }
+    }
+
+    pub async fn add_remote_agent(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        req: AddRemoteAgentRequest,
+    ) -> Result<TeamAgentResponse, TeamError> {
+        let lock = self
+            .add_agent_locks
+            .entry(team_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        let mut team = Team::from_row(&row)?;
+        let name = req.name.trim();
+        if name.is_empty() || req.peer_id.trim().is_empty() || req.share_id.trim().is_empty() {
+            return Err(TeamError::InvalidRequest("remote leader fields are required".into()));
+        }
+        if team.agents.iter().any(|a| a.name.eq_ignore_ascii_case(name)) {
+            return Err(TeamError::DuplicateAgentName(name.to_owned()));
+        }
+        let slot_id = format!("lan-{}", generate_id());
+        let agent = TeamAgent {
+            slot_id: slot_id.clone(),
+            name: name.to_owned(),
+            role: TeammateRole::Lead,
+            conversation_id: String::new(),
+            backend: if req.backend.trim().is_empty() {
+                "remote".into()
+            } else {
+                req.backend
+            },
+            model: String::new(),
+            assistant_id: None,
+            status: None,
+            conversation_type: Some(encode_remote_agent(&RemoteTeamAgent {
+                peer_id: req.peer_id,
+                share_id: req.share_id,
+                share_label: req.share_label,
+                thread_id: None,
+            })),
+            cli_path: None,
+        };
+        team.agents.push(agent.clone());
+        let agents = serde_json::to_string(&team.agents)?;
+        self.repo
+            .update_team(
+                user_id,
+                team_id,
+                &UpdateTeamParams {
+                    agents: Some(agents),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        Ok(agent.to_response())
     }
 
     /// Best-effort cascade of a removed team's `user_order` row (design §4.3,
@@ -2525,8 +2595,97 @@ impl TeamSessionService {
     ) -> Result<TeamRunAckResponse, TeamError> {
         self.load_owned_team(user_id, team_id).await?;
         ensure_message_not_empty(content, files.as_deref())?;
-        self.ensure_session_inner(team_id, Some(user_id)).await?;
         let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
+        let row = self.load_owned_team_row(user_id, team_id).await?;
+        let team = Team::from_row(&row)?;
+        if let Some(agent) = team.agents.iter().find(|agent| agent.slot_id == slot_id) {
+            if let Some(remote) = decode_remote_agent(agent) {
+                if files.as_ref().is_some_and(|f| !f.is_empty()) {
+                    return Err(TeamError::InvalidRequest(
+                        "files are not supported for LAN team messages".into(),
+                    ));
+                }
+                let port = self
+                    .remote_port
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.clone())
+                    .ok_or_else(|| TeamError::InvalidRequest("LAN team service unavailable".into()))?;
+                let sent = port
+                    .send(
+                        user_id,
+                        TeamRemoteMessage {
+                            peer_id: remote.peer_id,
+                            share_id: remote.share_id,
+                            share_label: remote.share_label,
+                            thread_id: remote.thread_id,
+                            content: content.clone(),
+                        },
+                    )
+                    .await?;
+                let mailbox = crate::mailbox::Mailbox::new_for_user(self.repo.clone(), user_id).with_events(Arc::new(
+                    TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone()),
+                ));
+                mailbox
+                    .write(
+                        team_id,
+                        slot_id,
+                        "user",
+                        crate::types::MailboxMessageType::Message,
+                        &content,
+                        None,
+                    )
+                    .await?;
+                if let Some(reply) = sent.result_text.as_deref().filter(|s| !s.is_empty()) {
+                    mailbox
+                        .write(
+                            team_id,
+                            "user",
+                            slot_id,
+                            crate::types::MailboxMessageType::Message,
+                            reply,
+                            None,
+                        )
+                        .await?;
+                }
+                let mut updated = team;
+                if let Some(target) = updated.agents.iter_mut().find(|a| a.slot_id == slot_id) {
+                    if let Some(mut metadata) = decode_remote_agent(target) {
+                        metadata.thread_id = Some(sent.thread_id);
+                        target.conversation_type = Some(encode_remote_agent(&metadata));
+                    }
+                }
+                self.repo
+                    .update_team(
+                        user_id,
+                        team_id,
+                        &UpdateTeamParams {
+                            agents: Some(serde_json::to_string(&updated.agents)?),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                return Ok(TeamRunAckResponse {
+                    enqueue_status: TeamMessageEnqueueStatus::Accepted,
+                    message_id: generate_id(),
+                    run: TeamRunPayload {
+                        team_id: team_id.to_owned(),
+                        team_run_id: generate_id(),
+                        source: TeamRunSource::UserMessage,
+                        has_user_intervention: true,
+                        target_slot_id: slot_id.to_owned(),
+                        target_role: TeamRunTargetRole::Lead,
+                        status: TeamRunStatus::Completed,
+                        queued_intent_count: 0,
+                        starting_batch_count: 0,
+                        running_batch_count: 0,
+                        active_enqueue_lease_count: 0,
+                        slot_work: Vec::new(),
+                    },
+                });
+            }
+        }
+        self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = self.published_session(team_id)?;
         session.send_message_to_agent(slot_id, &content, files).await
     }
@@ -3174,6 +3333,91 @@ impl TeamSessionService {
         content: &str,
         files: Option<Vec<String>>,
     ) -> Result<AgentMessageQueueResult, TeamError> {
+        if let Some(user_id) = self.get_session_user_id(team_id).await {
+            let row = self.load_owned_team_row(&user_id, team_id).await?;
+            let team = Team::from_row(&row)?;
+            if let Some(agent) = team.agents.iter().find(|a| a.slot_id == to_slot_id)
+                && let Some(remote) = decode_remote_agent(agent)
+            {
+                let port = self
+                    .remote_port
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.clone())
+                    .ok_or_else(|| TeamError::InvalidRequest("LAN team service unavailable".into()))?;
+                let sent = port
+                    .send(
+                        &user_id,
+                        TeamRemoteMessage {
+                            peer_id: remote.peer_id,
+                            share_id: remote.share_id,
+                            share_label: remote.share_label,
+                            thread_id: remote.thread_id,
+                            content: content.to_owned(),
+                        },
+                    )
+                    .await?;
+                let mut updated = team.clone();
+                if let Some(target) = updated.agents.iter_mut().find(|a| a.slot_id == to_slot_id)
+                    && let Some(mut metadata) = decode_remote_agent(target)
+                {
+                    metadata.thread_id = Some(sent.thread_id);
+                    target.conversation_type = Some(encode_remote_agent(&metadata));
+                    self.repo
+                        .update_team(
+                            &user_id,
+                            team_id,
+                            &UpdateTeamParams {
+                                agents: Some(serde_json::to_string(&updated.agents)?),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                }
+                let mailbox = crate::mailbox::Mailbox::new_for_user(self.repo.clone(), &user_id).with_events(Arc::new(
+                    TeamEventEmitter::new(team_id.to_owned(), user_id.clone(), self.broadcaster.clone()),
+                ));
+                mailbox
+                    .write(
+                        team_id,
+                        to_slot_id,
+                        from_slot_id,
+                        crate::types::MailboxMessageType::Message,
+                        content,
+                        None,
+                    )
+                    .await?;
+                if let Some(reply) = sent.result_text.as_deref().filter(|s| !s.is_empty()) {
+                    mailbox
+                        .write(
+                            team_id,
+                            from_slot_id,
+                            to_slot_id,
+                            crate::types::MailboxMessageType::Message,
+                            reply,
+                            None,
+                        )
+                        .await?;
+                }
+                return Ok(AgentMessageQueueResult {
+                    team_run_id: None,
+                    target: TeamSlotWorkPayload {
+                        slot_id: to_slot_id.to_owned(),
+                        role: TeamRunTargetRole::Lead,
+                        state: TeamSlotWorkState::Idle,
+                        queued_foreground_count: 0,
+                        queued_background_count: 0,
+                        active_turn_id: None,
+                        active_turn_started_at_ms: None,
+                        active_turn_elapsed_ms: None,
+                        active_turn_slow: None,
+                        active_turn_slow_threshold_ms: None,
+                        blocked_reason: None,
+                        team_run_id: None,
+                    },
+                });
+            }
+        }
         let session = {
             let entry = self
                 .sessions

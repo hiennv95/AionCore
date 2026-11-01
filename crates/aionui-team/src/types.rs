@@ -115,12 +115,33 @@ pub struct TeamAgent {
     pub cli_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteTeamAgent {
+    pub peer_id: String,
+    pub share_id: String,
+    pub share_label: String,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+}
+
+const REMOTE_PREFIX: &str = "aionx-remote:";
+
+pub fn encode_remote_agent(remote: &RemoteTeamAgent) -> String {
+    format!("{}{}", REMOTE_PREFIX, serde_json::to_string(remote).unwrap_or_default())
+}
+
+pub fn decode_remote_agent(agent: &TeamAgent) -> Option<RemoteTeamAgent> {
+    let raw = agent.conversation_type.as_deref()?.strip_prefix(REMOTE_PREFIX)?;
+    serde_json::from_str(raw).ok()
+}
+
 impl TeamAgent {
     pub fn to_response(&self) -> TeamAgentResponse {
         self.to_response_with_icon(None)
     }
 
     pub fn to_response_with_icon(&self, icon: Option<String>) -> TeamAgentResponse {
+        let remote = decode_remote_agent(self);
         TeamAgentResponse {
             slot_id: self.slot_id.clone(),
             assistant_name: self.name.clone(),
@@ -145,6 +166,9 @@ impl TeamAgent {
                     availability: TeamContextResetAvailability::Unsupported,
                 }
             },
+            remote_peer_id: remote.as_ref().map(|r| r.peer_id.clone()),
+            remote_share_id: remote.as_ref().map(|r| r.share_id.clone()),
+            remote_share_label: remote.map(|r| r.share_label),
         }
     }
 }

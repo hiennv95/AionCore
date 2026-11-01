@@ -133,6 +133,17 @@ pub struct AddAgentRequest {
     pub assistant_id: Option<String>,
 }
 
+/// Adds a trusted LAN host's shared leader as a member of an existing team.
+#[derive(Debug, Deserialize)]
+pub struct AddRemoteAgentRequest {
+    pub name: String,
+    pub peer_id: String,
+    pub share_id: String,
+    pub share_label: String,
+    #[serde(default)]
+    pub backend: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AddAgentRequestCompat {
@@ -578,6 +589,12 @@ pub struct TeamAgentResponse {
     #[serde(default)]
     pub pending_confirmations: usize,
     pub context_reset: TeamContextResetCapability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_peer_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_share_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_share_label: Option<String>,
 }
 
 /// Full team response returned by create, get, and list endpoints.

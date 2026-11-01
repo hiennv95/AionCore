@@ -9,6 +9,26 @@ use async_trait::async_trait;
 
 use crate::error::TeamError;
 
+#[derive(Debug, Clone)]
+pub struct TeamRemoteMessage {
+    pub peer_id: String,
+    pub share_id: String,
+    pub share_label: String,
+    pub thread_id: Option<String>,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TeamRemoteResult {
+    pub thread_id: String,
+    pub result_text: Option<String>,
+}
+
+#[async_trait]
+pub trait TeamRemotePort: Send + Sync {
+    async fn send(&self, user_id: &str, message: TeamRemoteMessage) -> Result<TeamRemoteResult, TeamError>;
+}
+
 /// Resolves Team tool capability without exposing backend-specific descriptors
 /// or persisted handshake shapes to the Team domain.
 #[async_trait]

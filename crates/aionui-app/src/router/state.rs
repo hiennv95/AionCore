@@ -54,8 +54,8 @@ use aionui_system::{
 };
 use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, NativeSlashCommandPort, TeamAssistantCatalogEntry,
-    TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState,
-    TeamSessionService,
+    TeamAssistantCatalogPort, TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRemoteMessage,
+    TeamRemotePort, TeamRemoteResult, TeamRouterState, TeamSessionService,
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
@@ -308,6 +308,7 @@ pub async fn build_module_states(
         "startup: module states bundle started"
     );
     let network = super::network_state::build_network_state(services).await;
+    let team_network_service = network.as_ref().map(|n| n.service.clone());
     let device = super::device_state::build_device_state(services);
     let states = ModuleStates {
         network,
@@ -340,6 +341,7 @@ pub async fn build_module_states(
                 Some(cron.cron_service.clone()),
                 backend_binary_path.clone(),
                 assistant.service.clone(),
+                team_network_service.clone(),
             )
         }),
         session_message: build_module_state_phase(&boot, "session_message", || build_session_message_state(services)),
@@ -941,6 +943,7 @@ pub fn build_team_state(
     _cron_service: Option<Arc<aionui_cron::service::CronService>>,
     backend_binary_path: Arc<std::path::PathBuf>,
     assistant_service: Arc<AssistantService>,
+    network_service: Option<Arc<aionui_network::NetworkService>>,
 ) -> TeamRouterState {
     #[derive(Clone)]
     struct AssistantServiceTeamCatalog {
@@ -1019,6 +1022,50 @@ pub fn build_team_state(
         backend_binary_path,
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
+    if let Some(network) = network_service {
+        struct TeamNetworkAdapter(Arc<aionui_network::NetworkService>);
+        #[async_trait::async_trait]
+        impl TeamRemotePort for TeamNetworkAdapter {
+            async fn send(
+                &self,
+                user_id: &str,
+                message: TeamRemoteMessage,
+            ) -> Result<TeamRemoteResult, aionui_team::TeamError> {
+                let request = self
+                    .0
+                    .send(
+                        user_id,
+                        aionui_api_types::SendRemoteRequest {
+                            peer_id: message.peer_id,
+                            share_id: message.share_id,
+                            share_label: message.share_label,
+                            content: message.content,
+                            thread_id: message.thread_id,
+                            deadline_secs: None,
+                        },
+                    )
+                    .await
+                    .map_err(|e| aionui_team::TeamError::InvalidRequest(e.to_string()))?;
+                let id = request.id.clone();
+                let deadline = request.deadline_at;
+                loop {
+                    let current = self
+                        .0
+                        .get_outbound(user_id, &id)
+                        .await
+                        .map_err(|e| aionui_team::TeamError::InvalidRequest(e.to_string()))?;
+                    if current.state.is_terminal() || aionui_common::now_ms() >= deadline {
+                        return Ok(TeamRemoteResult {
+                            thread_id: current.thread_id,
+                            result_text: current.result_text,
+                        });
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+        service.with_remote_port(Arc::new(TeamNetworkAdapter(network)));
+    }
     spawn_assistant_mcp_binding_watcher(services.event_bus.subscribe(), Arc::clone(&service));
     service.with_project_service(Arc::new(services.project_service.clone()));
     // Path-2 cascade: removing a team drops its `user_order` row (sidebar §4.3).

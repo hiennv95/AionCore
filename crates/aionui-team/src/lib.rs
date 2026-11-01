@@ -44,8 +44,8 @@ pub use ports::{
     AgentTurnCancellationPort, AgentTurnExecutionError, AgentTurnExecutionPort, AgentTurnOutcome, AgentTurnRequest,
     AgentTurnSource, AgentTurnStarted, AgentTurnStartedCallback, AgentTurnStatus, NativeSlashCommandPort,
     NoopNativeSlashCommandPort, SlashCatalogSource, SlashCommandRecognition, TeamAssistantCatalogEntry,
-    TeamAssistantCatalogPort, TeamConversationBindingLookup, TeamConversationLookupPort, TeamToolCapabilityPort,
-    UnknownTeamToolCapabilityPort,
+    TeamAssistantCatalogPort, TeamConversationBindingLookup, TeamConversationLookupPort, TeamRemoteMessage,
+    TeamRemotePort, TeamRemoteResult, TeamToolCapabilityPort, UnknownTeamToolCapabilityPort,
 };
 
 pub use prompt_dump::TeamPromptDumpConfig;
@@ -63,6 +63,7 @@ pub use task_board::{TaskBoard, TaskUpdate};
 pub use team_run::{TeamRunManager, target_role_for};
 pub use tool_executor::{TeamToolContext, TeamToolExecutor, team_tool_call_from_name};
 pub use types::{
-    MailboxMessage, MailboxMessageType, TaskStatus, Team, TeamAgent, TeamTask, TeammateRole, TeammateStatus,
+    MailboxMessage, MailboxMessageType, RemoteTeamAgent, TaskStatus, Team, TeamAgent, TeamTask, TeammateRole,
+    TeammateStatus,
 };
 pub use visibility::TeamVisibilityPolicy;

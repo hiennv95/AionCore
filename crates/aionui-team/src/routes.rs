@@ -12,12 +12,12 @@ use axum::routing::{MethodRouter, delete, get, patch, post, put};
 
 use aionui_ai_agent::ActiveLeaseRegistry;
 use aionui_api_types::{
-    AddAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest, CreateTeamRequest,
-    GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest, RenameTeamRequest,
-    SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest, SetConfigOptionResponse, SetModeRequest,
-    SetModelRequest, TeamActivityPageResponse, TeamAgentResponse, TeamContextResetAvailability,
-    TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse, TeamMailboxMessageResponse, TeamResponse,
-    TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
+    AddAgentRequest, AddRemoteAgentRequest, ApiResponse, CancelTeamChildTurnRequest, CancelTeamRunRequest,
+    CreateTeamRequest, GetConfigOptionsResponse, InterruptTeamAgentRequest, PauseTeamSlotRequest, RenameAgentRequest,
+    RenameTeamRequest, SendAgentMessageRequest, SendTeamMessageRequest, SetConfigOptionRequest,
+    SetConfigOptionResponse, SetModeRequest, SetModelRequest, TeamActivityPageResponse, TeamAgentResponse,
+    TeamContextResetAvailability, TeamContextResetResponse, TeamInterruptAgentResponse, TeamListResponse,
+    TeamMailboxMessageResponse, TeamResponse, TeamRunAckResponse, TeamRunStateResponse, TeamTaskResponse,
 };
 use aionui_auth::{
     CurrentDevice, CurrentUser, DevicelessSession, RuntimeHelperCaller, ensure_no_local_files, from_paired_device,
@@ -213,6 +213,7 @@ pub fn team_routes(state: TeamRouterState) -> Router {
         .route("/api/teams/{id}/activity", get(list_activity))
         .route("/api/teams/{id}/name", desktop(patch(rename_team)))
         .route("/api/teams/{id}/agents", desktop(post(add_agent)))
+        .route("/api/teams/{id}/remote-agents", desktop(post(add_remote_agent)))
         .route("/api/teams/{id}/agents/{slot_id}", desktop(delete(remove_agent)))
         .route("/api/teams/{id}/agents/{slot_id}/name", desktop(patch(rename_agent)))
         .route(
@@ -453,6 +454,17 @@ async fn add_agent(
 ) -> Result<(StatusCode, Json<ApiResponse<TeamAgentResponse>>), ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
     let agent = state.service.add_agent(&user.id, &id, req).await?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(agent))))
+}
+
+async fn add_remote_agent(
+    State(state): State<TeamRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<AddRemoteAgentRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<TeamAgentResponse>>), ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let agent = state.service.add_remote_agent(&user.id, &id, req).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(agent))))
 }
 
