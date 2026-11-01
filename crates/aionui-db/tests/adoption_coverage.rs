@@ -25,6 +25,13 @@ const PARENT_SCOPED: &[(&str, &str, &str)] = &[
     // `cron_job_runs.owner_id` is the scheduler's run-lease holder, NOT a
     // user reference — ownership flows from `job_id`.
     ("cron_job_runs", "job_id", "cron_jobs"),
+    ("lan_shared_teams", "team_id", "teams"),
+    ("lan_team_members", "team_id", "teams"),
+    ("lan_team_invitations", "team_id", "teams"),
+    ("lan_team_invitation_votes", "invitation_id", "teams"),
+    ("lan_team_poll_consents", "team_id", "teams"),
+    ("lan_team_pair_attestations", "invitation_id", "teams"),
+    ("lan_team_message_receipts", "team_id", "teams"),
     ("mailbox", "team_id", "teams"),
     ("messages", "conversation_id", "conversations"),
     ("team_tasks", "team_id", "teams"),

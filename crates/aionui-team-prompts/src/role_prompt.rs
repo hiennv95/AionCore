@@ -30,6 +30,10 @@ that, call `team_members` before delegating work, adding or removing teammates,
 or referring to teammates. Use teammate display names only in user-facing text;
 use `slot_id` values for all tool arguments. Use `team_task_list` when you need
 current task state.
+Members with `kind: "lan_leader"` represent leaders of separate conversations
+on trusted LAN hosts. Communicate with them using `team_send_message` and their
+`slot_id`; do not assign them local task-board entries. Their conversation and
+task board are separate from yours. Share only the context needed for the request.
 Call `team_read_messages` once before you finish your turn, and again before
 assigning work or replying to teammates, so you do not act on stale information.
 If the result has `has_more: true`, call it again with `since_message_id` set to
@@ -368,6 +372,8 @@ mod tests {
         assert!(!prompt.contains("- Worker (claude, status: unknown)"));
         assert!(prompt.to_lowercase().contains("first team turn"));
         assert!(prompt.contains("team_members"));
+        assert!(prompt.contains("`kind: \"lan_leader\"`"));
+        assert!(prompt.contains("do not assign them local task-board entries"));
         assert!(prompt.contains("team_list_assistants"));
         assert!(prompt.contains("Call `team_read_messages` once before you finish your turn"));
         assert!(prompt.contains("`next_since_message_id`"));

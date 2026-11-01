@@ -17,6 +17,7 @@ use aionui_db::{
     UpdatePeerParams,
 };
 use aionui_peer::Fingerprint;
+use futures_util::{StreamExt, stream};
 use tracing::{info, warn};
 
 use crate::error::NetworkError;
@@ -39,9 +40,15 @@ pub struct NetworkService {
     listener: PeerListener,
     /// `--peer-listen` fixes the listener; the UI cannot toggle it.
     cli_listen: OnceLock<SocketAddr>,
+    poll_worker_started: OnceLock<()>,
+    poll_reconcile_lock: tokio::sync::Mutex<()>,
 }
 
 impl NetworkService {
+    pub fn set_team_sink(&self, sink: Arc<dyn crate::ports::LanTeamMessageSink>) -> Result<(), Arc<dyn crate::ports::LanTeamMessageSink>> {
+        self.inbound.set_team_sink(sink)
+    }
+
     pub fn new(
         repo: Arc<dyn INetworkRepository>,
         host: Arc<HostContext>,
@@ -58,13 +65,15 @@ impl NetworkService {
             transport,
             listener,
             cli_listen: OnceLock::new(),
+            poll_worker_started: OnceLock::new(),
+            poll_reconcile_lock: tokio::sync::Mutex::new(()),
         }
     }
 
     /// Boot: recover the inbox, resume the outbox, start the dispatcher and,
     /// when enabled, the listener. A listener failure (port in use) is
     /// reported in status but does not stop the host: local use keeps working.
-    pub async fn start(&self, cli_listen: Option<SocketAddr>) -> Result<(), NetworkError> {
+    pub async fn start(self: &Arc<Self>, cli_listen: Option<SocketAddr>) -> Result<(), NetworkError> {
         if let Some(addr) = cli_listen {
             let _ = self.cli_listen.set(addr);
         }
@@ -79,6 +88,123 @@ impl NetworkService {
                 return Err(error);
             }
             warn!(code = error.code(), %error, "network: peer listener not started");
+        }
+        if self.poll_worker_started.set(()).is_ok() {
+            let service = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    let Some(service) = service.upgrade() else { break };
+                    if let Err(error) = service.inbound.recover_team_messages().await {
+                        warn!(code = error.code(), "network: LAN team recovery scan failed");
+                    }
+                    if service.listener.running_addr().is_some() {
+                        if let Err(error) = service.inbound.sync_team_members().await {
+                            warn!(code = error.code(), "network: LAN team member sync failed");
+                        }
+                        if let Err(error) = service.dispatch_lan_team_outbound().await {
+                            warn!(code = error.code(), "network: LAN team outbox dispatch failed");
+                        }
+                    }
+                    drop(service);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            });
+            let service = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    let Some(service) = service.upgrade() else { break };
+                    if service.listener.running_addr().is_some() {
+                        let owner = service.host.owner_user_id();
+                        match service.repo.list_team_poll_consents(owner).await {
+                            Ok(consents) => {
+                                if !consents.is_empty() {
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_secs(3), service.list_peers(owner),
+                                    ).await;
+                                }
+                                for (peer, invitation) in consents {
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_secs(5),
+                                        service.reconcile_team_invitation(owner, &peer, &invitation),
+                                    ).await;
+                                }
+                            }
+                            Err(error) => warn!(%error, "network: unable to load LAN poll consents"),
+                        }
+                    }
+                    drop(service);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn send_lan_team_message(
+        &self, user_id: &str, team_id: &str, peer_id: &str, remote_team_id: &str, content: &str,
+    ) -> Result<String, NetworkError> {
+        self.ensure_owner(user_id)?;
+        if content.trim().is_empty() { return Err(NetworkError::InvalidRequest("message is empty".into())); }
+        if content.len() > policy::MAX_CONTENT_BYTES { return Err(NetworkError::PayloadTooLarge); }
+        let id = uuid::Uuid::now_v7().to_string();
+        if !self.repo.enqueue_lan_team_outbound(&id, user_id, team_id, peer_id, remote_team_id, content).await? {
+            return Err(NetworkError::TeamNotFound);
+        }
+        Ok(id)
+    }
+
+    pub async fn lan_team_delivery_statuses(&self, user_id: &str, team_id: &str)
+        -> Result<Vec<aionui_api_types::LanTeamDeliveryStatus>, NetworkError> {
+        self.ensure_owner(user_id)?;
+        Ok(self.repo.lan_team_delivery_statuses(user_id, team_id).await?.into_iter()
+            .map(|(message_id, state)| aionui_api_types::LanTeamDeliveryStatus { message_id, state }).collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_lan_team_message_with_mailbox(
+        &self, user_id: &str, team_id: &str, peer_id: &str, remote_team_id: &str,
+        from_slot_id: &str, to_slot_id: &str, content: &str,
+    ) -> Result<aionui_db::models::MailboxMessageRow, NetworkError> {
+        self.ensure_owner(user_id)?;
+        if content.trim().is_empty() { return Err(NetworkError::InvalidRequest("message is empty".into())); }
+        if content.len() > policy::MAX_CONTENT_BYTES { return Err(NetworkError::PayloadTooLarge); }
+        let message = aionui_db::models::MailboxMessageRow {
+            id: uuid::Uuid::now_v7().to_string(), team_id: team_id.to_owned(), to_agent_id: to_slot_id.to_owned(),
+            from_agent_id: from_slot_id.to_owned(), msg_type: "message".into(), content: content.to_owned(),
+            summary: None, files: None, read: false, created_at: now_ms(),
+        };
+        if !self.repo.enqueue_lan_team_outbound_with_mailbox(user_id, peer_id, remote_team_id, &message).await? {
+            return Err(NetworkError::TeamNotFound);
+        }
+        Ok(message)
+    }
+
+    async fn dispatch_lan_team_outbound(&self) -> Result<(), NetworkError> {
+        let rows = self.repo.pending_lan_team_outbound(now_ms(), 8).await?;
+        let results = stream::iter(rows).map(|row| async move {
+            let Some(peer) = self.repo.find_peer(&row.peer_id).await? else { return Ok(()) };
+            if self.repo.authorized_lan_team_member(&row.user_id, &row.team_id, &peer.fingerprint, &row.remote_team_id).await?.as_deref() != Some(row.peer_id.as_str()) {
+                self.repo.finish_lan_team_outbound(&row.id, "revoked").await?;
+                return Ok(());
+            }
+            let Ok((url, fingerprint)) = callable_peer(&peer) else {
+                self.repo.defer_lan_team_outbound(&row.id, now_ms() + 3_000).await?;
+                return Ok(());
+            };
+            let message = aionui_api_types::PeerTeamMessage {
+                request_id: row.id.clone(), team_id: row.remote_team_id, remote_team_id: row.team_id, content: row.content,
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(5), self.transport.send_team_message(&url, &fingerprint, &message)).await {
+                Ok(Ok(_)) => { self.repo.finish_lan_team_outbound(&row.id, "delivered").await?; }
+                Ok(Err(NetworkError::PeerRevoked | NetworkError::PeerUntrusted)) => {
+                    self.repo.finish_lan_team_outbound(&row.id, "revoked").await?;
+                }
+                _ => { self.repo.defer_lan_team_outbound(&row.id, now_ms() + 3_000).await?; }
+            }
+            Ok::<(), NetworkError>(())
+        }).buffer_unordered(8).collect::<Vec<_>>().await;
+        for result in results {
+            result?;
         }
         Ok(())
     }
@@ -166,6 +292,34 @@ impl NetworkService {
 
     // ── peers ───────────────────────────────────────────────────────────────
 
+    /// Refresh the address of a known peer after LAN discovery without pairing
+    /// with unknown hosts. The observed certificate remains the identity.
+    pub async fn observe_known_peer(&self, user_id: &str, req: AddPeerRequest) -> Result<Option<aionui_api_types::DiscoveredLanPeer>, NetworkError> {
+        self.ensure_owner(user_id)?;
+        let url = normalize_peer_url(&req.url)?;
+        let (fingerprint, hello) = self.transport.observe(&url).await?;
+        if &fingerprint == self.host.fingerprint() {
+            return Ok(None);
+        }
+        let peer = self.repo.find_peer_by_fingerprint(fingerprint.as_str()).await?;
+        let state = peer.as_ref().and_then(|p| PeerState::parse(&p.state));
+        if let Some(peer) = &peer
+            && state != Some(PeerState::Revoked)
+            && hello.caller_state != Some(PeerState::Revoked)
+        {
+            self.repo.update_peer(&peer.id, UpdatePeerParams {
+                peer_url: Some(&url),
+                ..Default::default()
+            }).await?;
+        }
+        Ok(Some(aionui_api_types::DiscoveredLanPeer {
+            url,
+            fingerprint: fingerprint.to_string(),
+            display_name: clean_display_name(&hello.display_name).unwrap_or_else(|_| fingerprint.short().to_owned()),
+            state: if hello.caller_state == Some(PeerState::Revoked) { Some(PeerState::Revoked) } else { state },
+        }))
+    }
+
     pub async fn list_peers(&self, user_id: &str) -> Result<Vec<PeerView>, NetworkError> {
         self.ensure_owner(user_id)?;
         policy::prune_expired_pairings(self.repo.as_ref()).await?;
@@ -173,24 +327,58 @@ impl NetworkService {
         // The responder is the only owner who approves a new connection. The
         // initiator learns that decision through the authenticated hello on the
         // next poll and becomes trusted locally without a second click.
-        for peer in &peers {
-            if peer.state != PeerState::PendingOutbound.as_str() {
-                continue;
+        let mut approvals = tokio::task::JoinSet::new();
+        for peer in peers.iter().filter(|p| p.state == PeerState::PendingOutbound.as_str()) {
+            let Some(url) = peer.peer_url.clone() else { continue };
+            let transport = self.transport.clone();
+            let id = peer.id.clone();
+            let expected = peer.fingerprint.clone();
+            approvals.spawn(async move {
+                let result = tokio::time::timeout(std::time::Duration::from_secs(1), transport.observe(&url)).await;
+                match result {
+                    Ok(Ok((fingerprint, hello)))
+                        if fingerprint.as_str() == expected && hello.caller_state == Some(PeerState::Trusted) => Some(id),
+                    _ => None,
+                }
+            });
+        }
+        while let Some(result) = approvals.join_next().await {
+            if let Ok(Some(id)) = result {
+                self.repo.compare_and_set_peer_state(
+                    &id, PeerState::PendingOutbound.as_str(), PeerState::Trusted.as_str(),
+                ).await?;
             }
-            let Some(url) = peer.peer_url.as_deref() else { continue };
-            let Ok((fingerprint, hello)) = self.transport.observe(url).await else { continue };
-            if fingerprint.as_str() != peer.fingerprint || hello.caller_state != Some(PeerState::Trusted) {
-                continue;
+        }
+        // A trusted peer can revoke us independently. An unreachable peer is
+        // not a revocation; require both its certificate and explicit state.
+        let mut checks = tokio::task::JoinSet::new();
+        for peer in peers.iter().filter(|p| p.state == PeerState::Trusted.as_str()) {
+            let Some(url) = peer.peer_url.clone() else { continue };
+            let transport = self.transport.clone();
+            let id = peer.id.clone();
+            let expected = peer.fingerprint.clone();
+            checks.spawn(async move {
+                let result = tokio::time::timeout(std::time::Duration::from_secs(1), transport.observe(&url)).await;
+                match result {
+                    Ok(Ok((fingerprint, hello)))
+                        if fingerprint.as_str() == expected && hello.caller_state == Some(PeerState::Revoked) =>
+                    {
+                        Some(id)
+                    }
+                    _ => None,
+                }
+            });
+        }
+        while let Some(result) = checks.join_next().await {
+            if let Ok(Some(id)) = result
+                && self
+                    .repo
+                    .revoke_peer_and_memberships(&id, Some(PeerState::Trusted.as_str()))
+                    .await?
+            {
+                self.inbound.cancel_live_for(&id, None).await?;
+                self.wake_outbound_for(&id).await?;
             }
-            self.repo
-                .update_peer(
-                    &peer.id,
-                    UpdatePeerParams {
-                        state: Some(PeerState::Trusted.as_str()),
-                        ..Default::default()
-                    },
-                )
-                .await?;
         }
         Ok(self.repo.list_peers().await?.into_iter().map(peer_view).collect())
     }
@@ -198,9 +386,24 @@ impl NetworkService {
     /// Contact another host by address and send it a pairing request. Nothing is
     /// trusted until this owner approves after comparing the verification code.
     pub async fn add_peer(&self, user_id: &str, req: AddPeerRequest) -> Result<PeerView, NetworkError> {
+        self.add_peer_checked(user_id, &req.url, None).await
+    }
+
+    pub async fn add_pinned_peer(
+        &self,
+        user_id: &str,
+        req: aionui_api_types::AddPinnedPeerRequest,
+    ) -> Result<PeerView, NetworkError> {
+        self.add_peer_checked(user_id, &req.url, Some(&req.fingerprint)).await
+    }
+
+    async fn add_peer_checked(&self, user_id: &str, address: &str, expected: Option<&str>) -> Result<PeerView, NetworkError> {
         self.ensure_owner(user_id)?;
-        let url = normalize_peer_url(&req.url)?;
+        let url = normalize_peer_url(address)?;
         let (fingerprint, hello) = self.transport.observe(&url).await?;
+        if expected.is_some_and(|expected| expected != fingerprint.as_str()) {
+            return Err(NetworkError::FingerprintMismatch);
+        }
         if &fingerprint == self.host.fingerprint() {
             return Err(NetworkError::InvalidRequest("that address is this host".into()));
         }
@@ -290,15 +493,18 @@ impl NetworkService {
             Some(PeerState::Trusted) => return Ok(peer_view(peer)),
             _ => return Err(NetworkError::PeerRevoked),
         }
-        self.repo
-            .update_peer(
-                id,
-                UpdatePeerParams {
-                    state: Some(PeerState::Trusted.as_str()),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        if !self
+            .repo
+            .compare_and_set_peer_state(id, PeerState::PendingInbound.as_str(), PeerState::Trusted.as_str())
+            .await?
+        {
+            let current = self.peer(id).await?;
+            return if current.state == PeerState::Trusted.as_str() {
+                Ok(peer_view(current))
+            } else {
+                Err(NetworkError::PeerRevoked)
+            };
+        }
         info!(peer = %&peer.fingerprint[..16], "network: peer trusted by owner");
         Ok(peer_view(self.peer(id).await?))
     }
@@ -306,15 +512,9 @@ impl NetworkService {
     pub async fn revoke_peer(&self, user_id: &str, id: &str) -> Result<PeerView, NetworkError> {
         self.ensure_owner(user_id)?;
         let peer = self.peer(id).await?;
-        self.repo
-            .update_peer(
-                id,
-                UpdatePeerParams {
-                    state: Some(PeerState::Revoked.as_str()),
-                    ..Default::default()
-                },
-            )
-            .await?;
+        if !self.repo.revoke_peer_and_memberships(id, None).await? {
+            return Err(NetworkError::PeerNotFound);
+        }
         info!(peer = %&peer.fingerprint[..16], "network: peer revoked by owner");
         self.inbound.cancel_live_for(id, None).await?;
         self.wake_outbound_for(id).await?;
@@ -326,6 +526,7 @@ impl NetworkService {
         self.ensure_owner(user_id)?;
         let peer = self.peer(id).await?;
         self.inbound.cancel_live_for(id, None).await?;
+        self.repo.revoke_peer_and_memberships(id, None).await?;
         self.repo.delete_peer(id).await?;
         info!(peer = %&peer.fingerprint[..16], "network: peer forgotten by owner");
         Ok(())
@@ -411,6 +612,256 @@ impl NetworkService {
     }
 
     // ── remote agents and requests (this host as requester) ────────────────
+
+    pub async fn set_team_shared(&self, user_id: &str, team_id: &str, enabled: bool) -> Result<(), NetworkError> {
+        self.ensure_owner(user_id)?;
+        self.repo
+            .set_team_shared(user_id, team_id, enabled)
+            .await
+            .map_err(|error| match error {
+                aionui_db::DbError::NotFound(_) => NetworkError::TeamNotFound,
+                other => NetworkError::Db(other),
+            })?;
+        Ok(())
+    }
+
+    pub async fn shared_teams(&self, user_id: &str) -> Result<Vec<aionui_api_types::LanTeam>, NetworkError> {
+        self.ensure_owner(user_id)?;
+        Ok(self
+            .repo
+            .list_shared_teams(user_id)
+            .await?
+            .into_iter()
+            .map(|(id, name)| aionui_api_types::LanTeam { id, name })
+            .collect())
+    }
+
+    pub async fn remote_teams(
+        &self,
+        user_id: &str,
+        peer_id: &str,
+    ) -> Result<Vec<aionui_api_types::LanTeam>, NetworkError> {
+        self.ensure_owner(user_id)?;
+        let peer = self.peer(peer_id).await?;
+        let (url, fingerprint) = callable_peer(&peer)?;
+        self.transport.list_teams(&url, &fingerprint).await
+    }
+
+    pub async fn remote_team_invitations(
+        &self,
+        user_id: &str,
+        peer_id: &str,
+    ) -> Result<Vec<aionui_api_types::PeerTeamInvitation>, NetworkError> {
+        self.ensure_owner(user_id)?;
+        let peer = self.peer(peer_id).await?;
+        let (url, fingerprint) = callable_peer(&peer)?;
+        Ok(self.transport.list_team_invitations(&url, &fingerprint).await?
+            .into_iter().filter(|poll| poll.state != "completed").collect())
+    }
+
+    pub async fn pending_local_team_invitation(&self, user_id: &str, team_id: &str)
+        -> Result<Option<aionui_api_types::PendingLocalLanInvitation>, NetworkError> {
+        self.ensure_owner(user_id)?;
+        let Some((id, candidate_fingerprint, state)) = self.repo.pending_local_team_invitation(user_id, team_id).await? else {
+            return Ok(None);
+        };
+        let mut participants = Vec::new();
+        for (fingerprint, decision) in self.repo.team_invitation_votes(user_id, &id).await? {
+            let display_name = if fingerprint == self.host.fingerprint().as_str() {
+                Some(self.host.display_name())
+            } else {
+                self.repo.find_peer_by_fingerprint(&fingerprint).await?.map(|peer| peer.display_name)
+            };
+            participants.push(aionui_api_types::PeerInvitationParticipant {
+                fingerprint, display_name, decision, peer_url: None, team_id: None,
+            });
+        }
+        Ok(Some(aionui_api_types::PendingLocalLanInvitation { id, candidate_fingerprint, state, participants }))
+    }
+
+    pub async fn cancel_team_invitation(&self, user_id: &str, team_id: &str, invitation_id: &str) -> Result<(), NetworkError> {
+        self.ensure_owner(user_id)?;
+        if !self.repo.cancel_team_invitation(user_id, team_id, invitation_id).await? {
+            return Err(NetworkError::RequestNotFound);
+        }
+        Ok(())
+    }
+
+    pub async fn create_team_invitation(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        peer_id: &str,
+    ) -> Result<aionui_api_types::CreateLanTeamInvitationResponse, NetworkError> {
+        self.ensure_owner(user_id)?;
+        let peer = self.peer(peer_id).await?;
+        if peer.state != PeerState::Trusted.as_str() {
+            return Err(NetworkError::PeerUntrusted);
+        }
+        let id = uuid::Uuid::now_v7().to_string();
+        self.repo
+            .create_team_invitation(user_id, team_id, &id, self.host.fingerprint().as_str(), peer_id)
+            .await
+            .map_err(|error| match error {
+                aionui_db::DbError::NotFound(_) => NetworkError::TeamNotFound,
+                aionui_db::DbError::Conflict(_) => NetworkError::RequestConflict,
+                other => NetworkError::Db(other),
+            })?;
+        if !self.repo
+            .decide_team_invitation(user_id, &id, self.host.fingerprint().as_str(), true, Some(team_id))
+            .await?
+        {
+            return Err(NetworkError::RequestConflict);
+        }
+        Ok(aionui_api_types::CreateLanTeamInvitationResponse { id })
+    }
+
+    pub async fn vote_remote_team_invitation(
+        &self,
+        user_id: &str,
+        peer_id: &str,
+        request: aionui_api_types::PeerInvitationVoteRequest,
+    ) -> Result<aionui_api_types::PeerInvitationVoteResponse, NetworkError> {
+        self.ensure_owner(user_id)?;
+        let _withdraw_guard = if request.approve { None } else { Some(self.poll_reconcile_lock.lock().await) };
+        if request.approve {
+            let team_id = request.team_id.as_deref().filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| NetworkError::InvalidRequest("a conversation is required to approve".into()))?;
+            if !self.repo.list_shared_teams(user_id).await?.iter().any(|(id, _)| id == team_id) {
+                return Err(NetworkError::TeamNotFound);
+            }
+        }
+        let peer = self.peer(peer_id).await?;
+        let (url, fingerprint) = callable_peer(&peer)?;
+        if request.approve {
+            let invitations = self.transport.list_team_invitations(&url, &fingerprint).await?;
+            let invitation = invitations.iter().find(|poll| poll.id == request.invitation_id)
+                .ok_or(NetworkError::RequestNotFound)?;
+            let mut expected: Vec<_> = invitation.participants.iter().map(|v| v.fingerprint.clone()).collect();
+            let mut displayed = request.participants.clone();
+            expected.sort_unstable();
+            displayed.sort_unstable();
+            if expected != displayed || expected.is_empty()
+                || !expected.iter().any(|p| p == self.host.fingerprint().as_str())
+                || invitation.decision != "pending"
+            {
+                return Err(NetworkError::InvalidRequest("invitation participants or decision changed".into()));
+            }
+            let participants = serde_json::to_string(&expected).map_err(|e| NetworkError::Internal(e.to_string()))?;
+            if !self.repo.record_team_poll_consent(user_id, request.team_id.as_deref().unwrap_or_default(), fingerprint.as_str(), &request.invitation_id, &participants).await? {
+                return Err(NetworkError::InvalidRequest("Choose a conversation whose LAN members are in this invitation, and resolve any other pending invitation first".into()));
+            }
+        }
+        let response = self.transport.vote_invitation(&url, &fingerprint, &request).await?;
+        if !request.approve && response.recorded {
+            self.repo.remove_team_poll_consent(user_id, fingerprint.as_str(), &request.invitation_id).await?;
+        }
+        Ok(response)
+    }
+
+    pub async fn vote_local_team_invitation(
+        &self,
+        user_id: &str,
+        request: aionui_api_types::PeerInvitationVoteRequest,
+    ) -> Result<aionui_api_types::PeerInvitationVoteResponse, NetworkError> {
+        self.ensure_owner(user_id)?;
+        if request.approve {
+            let team_id = self.repo.team_invitation_team_id(user_id, &request.invitation_id).await?
+                .ok_or(NetworkError::RequestNotFound)?;
+            if request.team_id.as_deref() != Some(team_id.as_str()) {
+                return Err(NetworkError::InvalidRequest("invitation belongs to a different conversation".into()));
+            }
+        }
+        let recorded = self.repo
+            .decide_team_invitation(user_id, &request.invitation_id, self.host.fingerprint().as_str(), request.approve, request.team_id.as_deref().filter(|_| request.approve))
+            .await?;
+        Ok(aionui_api_types::PeerInvitationVoteResponse { recorded })
+    }
+
+    pub async fn reconcile_team_invitation(
+        &self,
+        user_id: &str,
+        coordinator_id: &str,
+        invitation_id: &str,
+    ) -> Result<(), NetworkError> {
+        let _guard = self.poll_reconcile_lock.lock().await;
+        self.ensure_owner(user_id)?;
+        let coordinator = self.peer(coordinator_id).await?;
+        let (url, fingerprint) = callable_peer(&coordinator)?;
+        let (_, consent) = self.repo.team_poll_consent(user_id, fingerprint.as_str(), invitation_id).await?
+            .ok_or(NetworkError::RequestNotFound)?;
+        let expected: Vec<String> = serde_json::from_str(&consent)
+            .map_err(|error| NetworkError::Internal(error.to_string()))?;
+        let invitations = self.transport.list_team_invitations(&url, &fingerprint).await?;
+        let Some(invitation) = invitations.into_iter().find(|poll| poll.id == invitation_id) else {
+            self.repo.remove_team_poll_consent(user_id, fingerprint.as_str(), invitation_id).await?;
+            return Ok(());
+        };
+        let mut actual: Vec<String> = invitation.participants.iter().map(|participant| participant.fingerprint.clone()).collect();
+        actual.sort_unstable();
+        if !invitation.ready_for_pairing || invitation.decision != "approved" || actual != expected {
+            return Err(NetworkError::RequestConflict);
+        }
+        for participant in &invitation.participants {
+            let Some(url) = participant.peer_url.as_deref() else { continue };
+            let Some(peer) = self.repo.find_peer_by_fingerprint(&participant.fingerprint).await? else { continue };
+            if peer.peer_url.is_some() || peer.state == PeerState::Revoked.as_str() { continue; }
+            if let Ok((observed, hello)) = self.transport.observe(url).await
+                && observed.as_str() == participant.fingerprint
+                && hello.caller_state != Some(PeerState::Revoked)
+            {
+                self.repo.update_peer(&peer.id, UpdatePeerParams { peer_url: Some(url), ..Default::default() }).await?;
+            }
+        }
+        if invitation.state == "completed" {
+            let members = invitation.participants.iter().map(|participant| {
+                participant.team_id.clone().map(|team| (participant.fingerprint.clone(), team))
+            }).collect::<Option<Vec<_>>>().ok_or(NetworkError::RequestConflict)?;
+            if !self.repo.apply_team_poll_membership(user_id, fingerprint.as_str(), invitation_id, self.host.fingerprint().as_str(), &members).await? {
+                return Err(NetworkError::RequestConflict);
+            }
+            tracing::info!(invitation_id, "network: LAN team roster synchronized");
+            return Ok(());
+        }
+        for participant in invitation.participants {
+            if participant.fingerprint == self.host.fingerprint().as_str() || participant.fingerprint == fingerprint.as_str() {
+                continue;
+            }
+            // Recheck the local owner decision before each trust-changing action.
+            if self.repo.team_poll_consent(user_id, fingerprint.as_str(), invitation_id).await?.is_none() {
+                return Err(NetworkError::RequestConflict);
+            }
+            if let Some(peer) = self.repo.find_peer_by_fingerprint(&participant.fingerprint).await? {
+                match PeerState::parse(&peer.state) {
+                    Some(PeerState::PendingInbound) => { self.approve_peer(user_id, &peer.id).await?; }
+                    Some(PeerState::Revoked) => return Err(NetworkError::PeerRevoked),
+                    _ => {}
+                }
+            } else if self.host.fingerprint().as_str() < participant.fingerprint.as_str()
+                && let Some(url) = participant.peer_url
+            {
+                self.add_pinned_peer(user_id, aionui_api_types::AddPinnedPeerRequest {
+                    url,
+                    fingerprint: participant.fingerprint,
+                }).await?;
+            }
+        }
+        let peers = self.repo.list_peers().await?;
+        if expected.iter().all(|member| member == self.host.fingerprint().as_str()
+            || peers.iter().any(|peer| peer.fingerprint == *member && peer.state == PeerState::Trusted.as_str()))
+        {
+            if self.repo.team_poll_consent(user_id, fingerprint.as_str(), invitation_id).await?.is_none() {
+                return Err(NetworkError::RequestConflict);
+            }
+            let response = self.transport.attest_team_pairs(&url, &fingerprint, &aionui_api_types::PeerPairAttestationRequest {
+                invitation_id: invitation_id.to_owned(), participants: expected,
+            }).await?;
+            if !response.recorded {
+                return Err(NetworkError::RequestConflict);
+            }
+        }
+        Ok(())
+    }
 
     pub async fn remote_agents(&self, user_id: &str, peer_id: &str) -> Result<Vec<RemoteAgentView>, NetworkError> {
         self.ensure_owner(user_id)?;

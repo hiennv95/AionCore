@@ -102,6 +102,10 @@ pub trait TeamConversationProvisioningPort: Send + Sync {
 
     async fn conversation_assistant_id(&self, conversation_id: &str) -> Result<Option<String>, TeamError>;
 
+    async fn conversation_agent_id(&self, _user_id: &str, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+        Ok(None)
+    }
+
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError>;
 
     async fn patch_runtime_config(&self, conversation_id: &str, patch: serde_json::Value) -> Result<(), TeamError>;
@@ -491,6 +495,7 @@ impl TeamAgentProvisioner {
     ) -> Result<Option<String>, TeamError> {
         let team_id = mcp_stdio_cfg.team_id.clone();
         let (transport, capabilities) = self.resolve_team_tool_transport(user_id, agent).await?;
+        let mut final_transport = transport;
         info!(
             team_id = %team_id,
             slot_id = %agent.slot_id,
@@ -516,7 +521,7 @@ impl TeamAgentProvisioner {
             .await?;
         match transport {
             TeamToolTransport::Mcp => {
-                self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg, !kill_existing, &mcp_resolution)
+                self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg.clone(), !kill_existing, &mcp_resolution)
                     .await?
             }
             TeamToolTransport::CliAssumed => {
@@ -532,15 +537,29 @@ impl TeamAgentProvisioner {
         self.conversation_port
             .warmup_agent_process(user_id, &agent.conversation_id, task_manager)
             .await
-            .map_err(|e| {
-                TeamError::InvalidRequest(format!("failed to warm up rebuilt agent {}: {e}", agent.slot_id))
+            .map_err(|e| match e {
+                TeamError::SessionResumeUnsupported => e,
+                _ => TeamError::InvalidRequest(format!("failed to warm up rebuilt agent {}: {e}", agent.slot_id)),
             })?;
+        if transport == TeamToolTransport::CliAssumed
+            && capabilities.origin == aionui_common::CapabilityOrigin::Unknown
+            && self.resolve_team_tool_transport(user_id, agent).await?.0 == TeamToolTransport::Mcp
+        {
+            self.write_team_mcp_runtime_config(user_id, agent, mcp_stdio_cfg, true, &mcp_resolution).await?;
+            task_manager.kill_and_wait(&agent.conversation_id, Some(AgentKillReason::TeamMcpRebuild)).await;
+            self.conversation_port.warmup_agent_process(user_id, &agent.conversation_id, task_manager).await
+                .map_err(|e| match e {
+                    TeamError::SessionResumeUnsupported => e,
+                    _ => TeamError::InvalidRequest(format!("failed to warm up rebuilt agent {}: {e}", agent.slot_id)),
+                })?;
+            final_transport = TeamToolTransport::Mcp;
+        }
         info!(
             team_id = %team_id,
             slot_id = %agent.slot_id,
             conversation_id = %agent.conversation_id,
             backend = %agent.backend,
-            transport = ?transport,
+            transport = ?final_transport,
             outcome = "attached",
             "Team agent provisioner attached runtime process"
         );
@@ -606,7 +625,11 @@ impl TeamAgentProvisioner {
         user_id: &str,
         agent: &TeamAgent,
     ) -> Result<(TeamToolTransport, aionui_common::ResolvedBackendCapabilities), TeamError> {
-        let capabilities = self.capability_port.resolve(user_id, &agent.backend, None).await?;
+        let agent_id = self
+            .conversation_port
+            .conversation_agent_id(user_id, &agent.conversation_id)
+            .await?;
+        let capabilities = self.capability_port.resolve(user_id, &agent.backend, agent_id.as_deref()).await?;
         if capabilities.mcp.stdio {
             return Ok((TeamToolTransport::Mcp, capabilities));
         }
@@ -1057,6 +1080,10 @@ mod tests {
             Ok(None)
         }
 
+        async fn conversation_agent_id(&self, _user_id: &str, _conversation_id: &str) -> Result<Option<String>, TeamError> {
+            Ok(self.persisted_extra.lock().unwrap().get("agent_id").and_then(|id| id.as_str()).map(str::to_owned))
+        }
+
         async fn create_team_temp_workspace(&self, _user_id: &str, _team_id: &str) -> Result<String, TeamError> {
             Err(TeamError::InvalidRequest("unused".into()))
         }
@@ -1327,19 +1354,33 @@ mod tests {
 
     struct TestCapabilityPort;
 
+    struct HandshakeCapabilityPort(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl TeamToolCapabilityPort for HandshakeCapabilityPort {
+        async fn resolve(&self, _user_id: &str, _backend: &str, _agent_id: Option<&str>) -> Result<aionui_common::ResolvedBackendCapabilities, TeamError> {
+            let known = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
+            Ok(aionui_common::ResolvedBackendCapabilities {
+                mcp: aionui_common::McpTransportCapabilities { stdio: known, ..Default::default() },
+                cli_fallback: true,
+                origin: if known { aionui_common::CapabilityOrigin::AcpHandshake } else { aionui_common::CapabilityOrigin::Unknown },
+            })
+        }
+    }
+
     #[async_trait]
     impl TeamToolCapabilityPort for TestCapabilityPort {
         async fn resolve(
             &self,
             _user_id: &str,
             backend: &str,
-            _agent_id: Option<&str>,
+            agent_id: Option<&str>,
         ) -> Result<aionui_common::ResolvedBackendCapabilities, TeamError> {
             let direct = matches!(backend, "claude" | "codex" | "antigravity");
             let internal = backend == "aionrs";
             Ok(aionui_common::ResolvedBackendCapabilities {
                 mcp: aionui_common::McpTransportCapabilities {
-                    stdio: direct || internal,
+                    stdio: direct || internal || agent_id == Some("mcp-agent"),
                     ..Default::default()
                 },
                 cli_fallback: !internal,
@@ -1510,6 +1551,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn team_tool_transport_uses_conversation_agent_identity() {
+        let extra = Arc::new(Mutex::new(serde_json::json!({"agent_id": "mcp-agent"})));
+        let provisioner = test_provisioner_with_port_state(
+            Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(Vec::new())), None, None, Arc::clone(&extra),
+        );
+        let agent = test_agent();
+        assert_eq!(provisioner.team_tool_transport("user-test", &agent).await.unwrap(), TeamToolTransport::Mcp);
+        *extra.lock().unwrap() = serde_json::json!({"agent_id": "cli-agent"});
+        assert_eq!(provisioner.team_tool_transport("user-test", &agent).await.unwrap(), TeamToolTransport::CliAssumed);
+        *extra.lock().unwrap() = serde_json::json!({});
+        assert_eq!(provisioner.team_tool_transport("user-test", &agent).await.unwrap(), TeamToolTransport::CliAssumed);
+    }
+
+    #[tokio::test]
     async fn cli_runtime_config_clears_mcp_config() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let patches = Arc::new(Mutex::new(Vec::new()));
@@ -1636,6 +1691,20 @@ mod tests {
             patches[0]["session_mcp_servers"][0]["name"],
             serde_json::json!("chrome-devtools")
         );
+    }
+
+    #[tokio::test]
+    async fn attach_rebuilds_once_when_warmup_discovers_mcp() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let patches = Arc::new(Mutex::new(Vec::new()));
+        let mut provisioner = test_provisioner_with_patches(Arc::clone(&events), Arc::clone(&patches));
+        provisioner.capability_port = Arc::new(HandshakeCapabilityPort(std::sync::atomic::AtomicUsize::new(0)));
+        let task_manager: Arc<dyn IWorkerTaskManager> = Arc::new(NoopKillTaskManager);
+        provisioner.attach_agent_process("user-1", &test_agent(), test_mcp_config(), &task_manager, false).await.unwrap();
+        assert_eq!(events.lock().unwrap().as_slice(), ["patch", "warmup", "patch", "warmup"]);
+        let patches = patches.lock().unwrap();
+        assert!(patches[0]["team_mcp_stdio_config"].is_null());
+        assert!(patches[1]["team_mcp_stdio_config"].is_object());
     }
 
     #[tokio::test]

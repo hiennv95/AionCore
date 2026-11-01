@@ -45,6 +45,10 @@ use aionui_team::{
     TeamMcpSnapshotResolution, TeamProjectionMessageStore,
 };
 use aionui_team::{TeamError, TeamSessionService};
+
+#[allow(dead_code)]
+#[path = "../../aionui-network/tests/support/mod.rs"]
+mod lan_test_support;
 use common::MockTeamRepo;
 
 struct TestTeamToolCapabilityPort;
@@ -425,6 +429,13 @@ impl FakeConversationPorts {
 
 #[async_trait::async_trait]
 impl TeamConversationProvisioningPort for FakeConversationPorts {
+    async fn supports_context_reset(&self, _user_id: &str, conversation_id: &str) -> Result<bool, TeamError> {
+        if conversation_id.is_empty() {
+            return Err(TeamError::InvalidRequest("conversation not found: ".into()));
+        }
+        Ok(false)
+    }
+
     async fn create_team_conversation(
         &self,
         request: TeamConversationCreateRequest,
@@ -6369,6 +6380,488 @@ async fn es1_ensure_session_creates_session() {
         .unwrap();
 
     svc.ensure_session("user1", &created.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn lan_leader_is_a_remote_member_without_replacing_or_starting_a_local_leader() {
+    let (svc, tm) = setup_with_factory(success_factory());
+    let created = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "A".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    reset_runtime_state(&svc, &tm, &created.id).await;
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let local_leader = created.assistants.iter().find(|a| a.role == "lead").unwrap();
+    let before = tm.snapshot().build;
+    let remote = svc
+        .add_remote_agent(
+            "user1",
+            &created.id,
+            aionui_api_types::AddRemoteAgentRequest {
+                name: "Team B".into(),
+                peer_id: "peer-b".into(),
+                share_id: "team-b".into(),
+                share_label: "Team B".into(),
+                backend: "remote".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let scheduler = svc.get_session_scheduler(&created.id).unwrap();
+    assert_eq!(remote.role, "teammate");
+    assert_eq!(
+        scheduler.find_lead_slot_id().await.as_deref(),
+        Some(local_leader.slot_id.as_str())
+    );
+    assert_eq!(scheduler.get_agent(&remote.slot_id).await.unwrap().name, "Team B");
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    assert_eq!(
+        tm.snapshot().build,
+        before,
+        "remote member must never start a local agent"
+    );
+    svc.stop_session("user1", &created.id).await.unwrap();
+    svc.ensure_session("user1", &created.id).await.unwrap();
+    let scheduler = svc.get_session_scheduler(&created.id).unwrap();
+    assert_eq!(
+        scheduler.find_lead_slot_id().await.as_deref(),
+        Some(local_leader.slot_id.as_str())
+    );
+    assert_eq!(scheduler.get_agent(&remote.slot_id).await.unwrap().name, "Team B");
+}
+
+#[tokio::test]
+async fn lan_leader_message_reaches_existing_leader_only_for_matching_member() {
+    let (svc, _, turns, _) = setup_with_recording_turn_port();
+    let team = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "B".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    let leader = team.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+    svc.add_remote_agent(
+        "user1",
+        &team.id,
+        aionui_api_types::AddRemoteAgentRequest {
+            name: "Team A".into(),
+            peer_id: "peer-a".into(),
+            share_id: "team-a".into(),
+            share_label: "Team A".into(),
+            backend: "remote".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        svc.add_remote_agent(
+            "user1",
+            &team.id,
+            aionui_api_types::AddRemoteAgentRequest {
+                name: "Another name".into(),
+                peer_id: "peer-a".into(),
+                share_id: "team-a".into(),
+                share_label: "Team A".into(),
+                backend: "remote".into(),
+            },
+        )
+        .await,
+        Err(TeamError::InvalidRequest(message)) if message == "LAN conversation is already a team member"
+    ));
+
+    for (user, peer, remote_team) in [
+        ("user1", "peer-c", "team-a"),
+        ("user1", "peer-a", "team-c"),
+        ("other", "peer-a", "team-a"),
+    ] {
+        let error = svc
+            .receive_lan_leader_message(user, &team.id, peer, remote_team, "wrong sender")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TeamError::Forbidden(_) | TeamError::TeamNotFound(_)));
+    }
+    assert!(matches!(
+        svc.receive_lan_leader_message("user1", &team.id, "peer-a", "team-a", "   ")
+            .await,
+        Err(TeamError::InvalidRequest(_))
+    ));
+
+    svc.receive_lan_leader_message("user1", &team.id, "peer-a", "team-a", "Hello from Team A")
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if turns.requests.lock().unwrap().iter().any(|turn| {
+                turn.slot_id == leader.slot_id && turn.content.contains("Hello from Team A")
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("LAN message must wake the existing leader");
+}
+
+#[tokio::test]
+async fn two_teams_exchange_leader_messages_over_mtls_after_poll() {
+    use lan_test_support::{OWNER, eventually, pair, start_host};
+    async fn mcp_call(stream: &mut tokio::net::TcpStream, request: serde_json::Value) -> serde_json::Value {
+        use aionui_team::mcp::protocol::{read_frame, write_frame};
+        write_frame(stream, &serde_json::to_vec(&request).unwrap()).await.unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), read_frame(stream))
+            .await.expect("MCP response timed out").unwrap();
+        serde_json::from_slice(&frame).unwrap()
+    }
+    struct Sink { team: Arc<TeamSessionService>, repo: Arc<dyn aionui_db::INetworkRepository> }
+    #[async_trait::async_trait]
+    impl aionui_network::LanTeamMessageSink for Sink {
+        async fn recover_team(&self, owner: &str, team_id: &str) -> Result<(), aionui_network::NetworkError> {
+            self.team.ensure_session(owner, team_id).await.map_err(|e| aionui_network::NetworkError::Internal(e.to_string()))
+        }
+        async fn sync_member(&self, owner: &str, member: &aionui_db::ActiveLanTeamMember) -> Result<(), aionui_network::NetworkError> {
+            self.team.ensure_lan_member(owner, &member.team_id, &member.peer_id, &member.peer_name, &member.remote_team_id)
+                .await.map_err(|e| aionui_network::NetworkError::Internal(e.to_string()))
+        }
+        async fn deliver(&self, owner: &str, peer: &str, fingerprint: &str, message: &aionui_api_types::PeerTeamMessage)
+            -> Result<aionui_api_types::PeerTeamMessageResponse, aionui_network::NetworkError> {
+            let duplicate = self.team.receive_lan_leader_message_durable(self.repo.as_ref(), owner, &message.team_id,
+                peer, fingerprint, &message.remote_team_id, &message.request_id, &message.content).await
+                .map_err(|e| aionui_network::NetworkError::Internal(e.to_string()))?;
+            Ok(aionui_api_types::PeerTeamMessageResponse { duplicate })
+        }
+    }
+    struct Sender(Arc<aionui_network::NetworkService>);
+    #[async_trait::async_trait]
+    impl aionui_team::TeamRemotePort for Sender {
+        async fn send(&self, owner: &str, message: aionui_team::TeamRemoteMessage) -> Result<aionui_team::TeamRemoteResult, TeamError> {
+            let row = self.0.send_lan_team_message_with_mailbox(owner, &message.team_id, &message.peer_id, &message.share_id,
+                &message.from_slot_id, &message.to_slot_id, &message.content)
+                .await.map_err(|e| TeamError::InvalidRequest(e.to_string()))?;
+            Ok(aionui_team::TeamRemoteResult { thread_id: message.thread_id.unwrap_or_default(), result_text: None, persisted_message: Some(row) })
+        }
+    }
+    fn team_service(host: &lan_test_support::TestHost) -> (Arc<TeamSessionService>, Arc<RecordingTurnPort>) {
+        let repo = Arc::new(aionui_db::SqliteTeamRepository::new(host._db.pool().clone()));
+        let conversation_ports = Arc::new(FakeConversationPorts::new(Arc::new(MockConversationRepo::new())));
+        let turns = Arc::new(RecordingTurnPort::default());
+        let svc = TeamSessionService::new_with_capability_port(
+            repo, Arc::new(StubAgentMetadataRepo::empty()), Arc::new(EmptyTeamAssistantCatalog),
+            Arc::new(EmptyAssistantDefinitionRepo), Arc::new(EmptyAssistantOverlayRepo), Arc::new(EmptyProviderRepo),
+            conversation_ports.clone(), conversation_ports, Arc::new(NullBroadcaster),
+            Arc::new(CountingTaskManager::new(success_factory())), turns.clone(), noop_cancellation_port(),
+            Arc::new(TestTeamToolCapabilityPort), Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+        );
+        svc.with_remote_port(Arc::new(Sender(host.service.clone())));
+        assert!(host.inbound.set_team_sink(Arc::new(Sink { team: svc.clone(), repo: host.repo.clone() })).is_ok());
+        (svc, turns)
+    }
+    let (a, b) = (start_host("A").await, start_host("B").await);
+    pair(&a, &b).await;
+    b.service.observe_known_peer(OWNER, aionui_api_types::AddPeerRequest { url: a.url() }).await.unwrap();
+    let (team_a, turns_a) = team_service(&a);
+    let (team_b, turns_b) = team_service(&b);
+    let a_team = team_a.create_team(OWNER, CreateTeamRequest { name: "A".into(), agents: two_agent_input(), workspace: None }).await.unwrap();
+    let b_team = team_b.create_team(OWNER, CreateTeamRequest { name: "B".into(), agents: two_agent_input(), workspace: None }).await.unwrap();
+    a.service.set_team_shared(OWNER, &a_team.id, true).await.unwrap();
+    b.service.set_team_shared(OWNER, &b_team.id, true).await.unwrap();
+    let invitation = a.service.create_team_invitation(OWNER, &a_team.id, &a.peer_id_of(&b).await).await.unwrap();
+    b.service.vote_remote_team_invitation(OWNER, &b.peer_id_of(&a).await, aionui_api_types::PeerInvitationVoteRequest {
+        invitation_id: invitation.id, approve: true, team_id: Some(b_team.id.clone()),
+        participants: vec![a.host.fingerprint().to_string(), b.host.fingerprint().to_string()],
+    }).await.unwrap();
+    let a_remote = eventually("A sees B as a member", || async {
+        team_a.get_team(OWNER, &a_team.id).await.unwrap().assistants.into_iter()
+            .find(|agent| agent.remote_share_id.as_deref() == Some(b_team.id.as_str()))
+    }).await;
+    let b_remote = eventually("B sees A as a member", || async {
+        team_b.get_team(OWNER, &b_team.id).await.unwrap().assistants.into_iter()
+            .find(|agent| agent.remote_share_id.as_deref() == Some(a_team.id.as_str()))
+    }).await;
+    team_a.ensure_session(OWNER, &a_team.id).await.unwrap();
+    team_b.ensure_session(OWNER, &b_team.id).await.unwrap();
+    let lead_a = a_team.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+    let lead_b = b_team.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+    let worker_a = a_team.assistants.iter().find(|agent| agent.role != "lead").unwrap();
+    assert!(matches!(team_a.send_agent_message_from_agent(&a_team.id, &worker_a.slot_id, &a_remote.slot_id, "Not the leader", None).await, Err(TeamError::Forbidden(_))));
+    assert!(matches!(team_a.send_agent_message_from_agent(&a_team.id, &lead_a.slot_id, &a_remote.slot_id, "Attachment", Some(vec!["private.txt".into()])).await, Err(TeamError::InvalidRequest(_))));
+    let rejected: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lan_team_outbox WHERE content IN ('Not the leader', 'Attachment')")
+        .fetch_one(a._db.pool()).await.unwrap();
+    assert_eq!(rejected, 0);
+    let mcp = aionui_team::TeamMcpServer::start(
+        "lan-test-token".into(), team_a.get_session_scheduler(&a_team.id).unwrap(), a_team.id.clone(),
+        Arc::new(NullBroadcaster), Arc::downgrade(&team_a),
+    ).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", mcp.port())).await.unwrap();
+    let initialized = mcp_call(&mut stream, serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "auth_token": "lan-test-token", "slot_id": lead_a.slot_id,
+            "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "lan-test", "version": "1"}
+        }
+    })).await;
+    assert!(initialized["result"]["serverInfo"]["name"].is_string(), "{initialized}");
+    let members = mcp_call(&mut stream, serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "team_members", "arguments": {}}
+    })).await;
+    let members: serde_json::Value = serde_json::from_str(members["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(members.as_array().unwrap().iter().any(|member| member["slot_id"] == a_remote.slot_id), "{members}");
+    assert!(members.as_array().unwrap().iter().any(|member| member["slot_id"] == a_remote.slot_id && member["kind"] == "lan_leader"), "{members}");
+    let remote_task = mcp_call(&mut stream, serde_json::json!({
+        "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+        "params": {"name": "team_task_create", "arguments": {"subject": "Remote task", "owner": a_remote.slot_id}}
+    })).await;
+    assert_eq!(remote_task["result"]["isError"], true, "{remote_task}");
+    assert!(remote_task["result"]["content"][0]["text"].as_str().unwrap().contains("team_send_message"), "{remote_task}");
+    let local_task = mcp_call(&mut stream, serde_json::json!({
+        "jsonrpc": "2.0", "id": 21, "method": "tools/call",
+        "params": {"name": "team_task_create", "arguments": {"subject": "Local task", "owner": worker_a.slot_id}}
+    })).await;
+    let local_task: serde_json::Value = serde_json::from_str(local_task["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let reassignment = mcp_call(&mut stream, serde_json::json!({
+        "jsonrpc": "2.0", "id": 22, "method": "tools/call",
+        "params": {"name": "team_task_update", "arguments": {"task_id": local_task["task"]["task_id"], "owner": a_remote.slot_id}}
+    })).await;
+    assert_eq!(reassignment["result"]["isError"], true, "{reassignment}");
+    assert!(reassignment["result"]["content"][0]["text"].as_str().unwrap().contains("team_send_message"), "{reassignment}");
+    let attachment = mcp_call(&mut stream, serde_json::json!({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {"name": "team_send_message", "arguments": {"to": a_remote.slot_id, "message": "Attachment", "files": ["private.txt"]}}
+    })).await;
+    assert_eq!(attachment["result"]["isError"], true, "{attachment}");
+    assert!(attachment["result"]["content"][0]["text"].as_str().unwrap().contains("files are not supported"), "{attachment}");
+    let broadcast = mcp_call(&mut stream, serde_json::json!({
+        "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+        "params": {"name": "team_send_message", "arguments": {"to": "*", "message": "Broadcast attachment", "files": ["private.txt"]}}
+    })).await;
+    assert_eq!(broadcast["result"]["isError"], true, "{broadcast}");
+    let mut worker_stream = tokio::net::TcpStream::connect(("127.0.0.1", mcp.port())).await.unwrap();
+    mcp_call(&mut worker_stream, serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "auth_token": "lan-test-token", "slot_id": worker_a.slot_id,
+            "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "lan-test", "version": "1"}
+        }
+    })).await;
+    let worker_broadcast = mcp_call(&mut worker_stream, serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "team_send_message", "arguments": {"to": "*", "message": "Worker broadcast"}}
+    })).await;
+    assert_eq!(worker_broadcast["result"]["isError"], true, "{worker_broadcast}");
+    let partial: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE content IN ('Broadcast attachment', 'Worker broadcast')")
+        .fetch_one(a._db.pool()).await.unwrap();
+    assert_eq!(partial, 0);
+    let sent = mcp_call(&mut stream, serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "team_send_message", "arguments": {"to": a_remote.slot_id, "message": "From A to B"}}
+    })).await;
+    assert_ne!(sent["result"]["isError"], true, "{sent}");
+    assert!(sent["result"]["content"][0]["text"].is_string(), "{sent}");
+    eventually("B leader receives A message", || async {
+        turns_b.requests.lock().unwrap().iter().any(|turn| turn.slot_id == lead_b.slot_id && turn.content.contains("From A to B")).then_some(())
+    }).await;
+    team_b.send_agent_message_from_agent(&b_team.id, &lead_b.slot_id, &b_remote.slot_id, "From B to A", None).await.unwrap();
+    eventually("A leader receives B message", || async {
+        turns_a.requests.lock().unwrap().iter().any(|turn| turn.slot_id == lead_a.slot_id && turn.content.contains("From B to A")).then_some(())
+    }).await;
+    for (host, content) in [(&a, "From B to A"), (&b, "From A to B")] {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE content = ?").bind(content).fetch_one(host._db.pool()).await.unwrap();
+        assert_eq!(count, 1);
+    }
+    for (host, content) in [(&a, "From A to B"), (&b, "From B to A")] {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM lan_team_outbox outbox JOIN mailbox ON mailbox.id = outbox.id WHERE outbox.content = ? AND mailbox.content = ?")
+            .bind(content).bind(content).fetch_one(host._db.pool()).await.unwrap();
+        assert_eq!(count, 1);
+    }
+
+    let c = start_host("C").await;
+    pair(&a, &c).await;
+    c.service.observe_known_peer(OWNER, aionui_api_types::AddPeerRequest { url: a.url() }).await.unwrap();
+    let (team_c, turns_c) = team_service(&c);
+    let c_team = team_c.create_team(OWNER, CreateTeamRequest { name: "C".into(), agents: two_agent_input(), workspace: None }).await.unwrap();
+    c.service.set_team_shared(OWNER, &c_team.id, true).await.unwrap();
+    let invitation = a.service.create_team_invitation(OWNER, &a_team.id, &a.peer_id_of(&c).await).await.unwrap();
+    let participants = vec![a.host.fingerprint().to_string(), b.host.fingerprint().to_string(), c.host.fingerprint().to_string()];
+    for (host, team) in [(&b, &b_team), (&c, &c_team)] {
+        host.service.vote_remote_team_invitation(OWNER, &host.peer_id_of(&a).await, aionui_api_types::PeerInvitationVoteRequest {
+            invitation_id: invitation.id.clone(), approve: true, team_id: Some(team.id.clone()), participants: participants.clone(),
+        }).await.unwrap();
+    }
+    let b_to_c = eventually("B sees C as a member", || async {
+        team_b.get_team(OWNER, &b_team.id).await.unwrap().assistants.into_iter()
+            .find(|agent| agent.remote_share_id.as_deref() == Some(c_team.id.as_str()))
+    }).await;
+    let c_to_a = eventually("C sees A as a member", || async {
+        team_c.get_team(OWNER, &c_team.id).await.unwrap().assistants.into_iter()
+            .find(|agent| agent.remote_share_id.as_deref() == Some(a_team.id.as_str()))
+    }).await;
+    for (host, other) in [(&b, &c), (&c, &b)] {
+        let peer = host.repo.find_peer_by_fingerprint(other.host.fingerprint().as_str()).await.unwrap().unwrap();
+        assert_eq!(peer.state, "trusted");
+        assert_eq!(peer.peer_url.as_deref(), Some(other.url().as_str()));
+    }
+    let lead_c = c_team.assistants.iter().find(|agent| agent.role == "lead").unwrap();
+    let c_from_b = eventually("C sees B as a member", || async {
+        team_c.get_team(OWNER, &c_team.id).await.unwrap().assistants.into_iter()
+            .find(|agent| agent.remote_share_id.as_deref() == Some(b_team.id.as_str()))
+    }).await;
+    let unread = aionui_db::models::MailboxMessageRow {
+        id: "restart-receipt".into(), team_id: c_team.id.clone(), to_agent_id: lead_c.slot_id.clone(),
+        from_agent_id: c_from_b.slot_id, msg_type: "message".into(), content: "Recovered after restart".into(),
+        summary: None, files: None, read: false, created_at: aionui_common::now_ms(),
+    };
+    c.set_listening(false).await;
+    assert!(matches!(c.repo.enqueue_lan_team_message(OWNER, b.host.fingerprint().as_str(), &b_team.id, "restart-request", &unread).await.unwrap(), aionui_db::LanMessageEnqueue::Inserted));
+    assert!(c.repo.teams_with_unread_lan_messages("other").await.unwrap().is_empty());
+    eventually("C recovers its acknowledged unread LAN message", || async {
+        turns_c.requests.lock().unwrap().iter().any(|turn| turn.slot_id == lead_c.slot_id && turn.content.contains("Recovered after restart")).then_some(())
+    }).await;
+    c.set_listening(true).await;
+    team_b.send_agent_message_from_agent(&b_team.id, &lead_b.slot_id, &b_to_c.slot_id, "From B to C", None).await.unwrap();
+    eventually("C leader receives B message", || async {
+        turns_c.requests.lock().unwrap().iter().any(|turn| turn.slot_id == lead_c.slot_id && turn.content.contains("From B to C")).then_some(())
+    }).await;
+    team_c.send_agent_message_from_agent(&c_team.id, &lead_c.slot_id, &c_to_a.slot_id, "From C to A", None).await.unwrap();
+    eventually("A leader receives C message", || async {
+        turns_a.requests.lock().unwrap().iter().any(|turn| turn.slot_id == lead_a.slot_id && turn.content.contains("From C to A")).then_some(())
+    }).await;
+    b.service.revoke_peer(OWNER, &b.peer_id_of(&c).await).await.unwrap();
+    assert!(team_b.send_agent_message_from_agent(&b_team.id, &lead_b.slot_id, &b_to_c.slot_id, "After revoke", None).await.is_err());
+    let retained = team_b.get_team(OWNER, &b_team.id).await.unwrap();
+    assert!(retained.assistants.iter().any(|agent| agent.slot_id == b_to_c.slot_id));
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE content = 'After revoke'")
+        .fetch_one(c._db.pool()).await.unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn durable_lan_message_wakes_leader_once_and_rechecks_membership() {
+    use aionui_db::INetworkRepository;
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let repo = Arc::new(aionui_db::SqliteTeamRepository::new(db.pool().clone()));
+    let network = aionui_db::SqliteNetworkRepository::new(db.pool().clone());
+    let conv_repo = Arc::new(MockConversationRepo::new());
+    let conversation_ports = Arc::new(FakeConversationPorts::new(conv_repo));
+    let turns = Arc::new(RecordingTurnPort::default());
+    let svc = TeamSessionService::new_with_capability_port(
+        repo, Arc::new(StubAgentMetadataRepo::empty()), Arc::new(EmptyTeamAssistantCatalog),
+        Arc::new(EmptyAssistantDefinitionRepo), Arc::new(EmptyAssistantOverlayRepo), Arc::new(EmptyProviderRepo),
+        conversation_ports.clone(), conversation_ports, Arc::new(NullBroadcaster),
+        Arc::new(CountingTaskManager::new(success_factory())), turns.clone(), noop_cancellation_port(),
+        Arc::new(TestTeamToolCapabilityPort), Arc::new(std::path::PathBuf::from("/tmp/aioncore-test")),
+    );
+    let team = svc.create_team("user1", CreateTeamRequest { name: "B".into(), agents: two_agent_input(), workspace: None }).await.unwrap();
+    network.set_team_shared("user1", &team.id, true).await.unwrap();
+    let peer = network.insert_peer(aionui_db::InsertPeerParams {
+        fingerprint: "fingerprint-a", display_name: "A", peer_url: None, state: "trusted", verification_code: "123456",
+    }).await.unwrap();
+    sqlx::query("INSERT INTO lan_team_members (team_id, fingerprint, remote_team_id, state) VALUES (?, ?, 'team-a', 'active')")
+        .bind(&team.id).bind(&peer.fingerprint).execute(db.pool()).await.unwrap();
+    let duplicate_name = team.assistants[0].name.clone();
+    svc.ensure_lan_member("user1", &team.id, &peer.id, &duplicate_name, "team-a").await.unwrap();
+    svc.ensure_lan_member("user1", &team.id, &peer.id, &duplicate_name, "team-a").await.unwrap();
+    let refreshed = svc.get_team("user1", &team.id).await.unwrap();
+    assert_eq!(refreshed.assistants.iter().filter(|agent| agent.remote_peer_id.as_deref() == Some(peer.id.as_str())).count(), 1);
+    svc.ensure_session("user1", &team.id).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    turns.requests.lock().unwrap().clear();
+    assert!(!svc.receive_lan_leader_message_durable(&network, "user1", &team.id, &peer.id, &peer.fingerprint, "team-a", "request-1", "Hello from A").await.unwrap());
+    assert!(svc.receive_lan_leader_message_durable(&network, "user1", &team.id, &peer.id, &peer.fingerprint, "team-a", "request-1", "Hello from A").await.unwrap());
+    let leader = team.assistants.iter().find(|a| a.role == "lead").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if turns.requests.lock().unwrap().iter().any(|turn| turn.slot_id == leader.slot_id && turn.content.contains("Hello from A")) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("LAN message must wake the leader");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE team_id = ? AND content = 'Hello from A'")
+        .bind(&team.id).fetch_one(db.pool()).await.unwrap();
+    assert_eq!(count, 1);
+    assert!(network.revoke_peer_and_memberships(&peer.id, None).await.unwrap());
+    assert!(matches!(svc.receive_lan_leader_message_durable(&network, "user1", &team.id, &peer.id, &peer.fingerprint, "team-a", "request-2", "rejected").await, Err(TeamError::Forbidden(_))));
+}
+
+#[tokio::test]
+async fn remote_leader_reply_is_delivered_to_the_local_leaders_session() {
+    struct RemoteReply(String);
+    #[async_trait::async_trait]
+    impl aionui_team::TeamRemotePort for RemoteReply {
+        async fn send(
+            &self,
+            _: &str,
+            message: aionui_team::TeamRemoteMessage,
+        ) -> Result<aionui_team::TeamRemoteResult, TeamError> {
+            assert_eq!(message.content, "Question from A");
+            assert_eq!(message.team_id, self.0);
+            assert_eq!(message.share_id, "team-b");
+            Ok(aionui_team::TeamRemoteResult {
+                thread_id: "thread-b".into(),
+                result_text: Some("Answer from B".into()),
+                persisted_message: None,
+            })
+        }
+    }
+    let (svc, _, turns, _) = setup_with_recording_turn_port();
+    let team = svc
+        .create_team(
+            "user1",
+            CreateTeamRequest {
+                name: "A".into(),
+                agents: two_agent_input(),
+                workspace: None,
+            },
+        )
+        .await
+        .unwrap();
+    svc.ensure_session("user1", &team.id).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    turns.requests.lock().unwrap().clear();
+    let leader = team.assistants.iter().find(|a| a.role == "lead").unwrap();
+    let remote = svc
+        .add_remote_agent(
+            "user1",
+            &team.id,
+            aionui_api_types::AddRemoteAgentRequest {
+                name: "Team B".into(),
+                peer_id: "peer-b".into(),
+                share_id: "team-b".into(),
+                share_label: "Team B".into(),
+                backend: "remote".into(),
+            },
+        )
+        .await
+        .unwrap();
+    svc.with_remote_port(Arc::new(RemoteReply(team.id.clone())));
+    svc.send_agent_message_from_agent(&team.id, &leader.slot_id, &remote.slot_id, "Question from A", None)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if turns
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|turn| turn.slot_id == leader.slot_id && turn.content.contains("Answer from B"))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("remote answer must wake the local leader");
 }
 
 #[tokio::test]

@@ -4,8 +4,8 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use crate::error::{DbError, message_indicates_unique_violation};
 use crate::models::{NetworkInboundRequestRow, NetworkOutboundRequestRow, NetworkPeerRow, NetworkShareRow};
 use crate::repository::network::{
-    INetworkRepository, InsertInboundParams, InsertOutboundParams, InsertPeerParams, InsertShareParams, OutboundUpdate,
-    RequestUpdate, UpdatePeerParams,
+    ActiveLanTeamMember, INetworkRepository, InsertInboundParams, InsertOutboundParams, InsertPeerParams, InsertShareParams, LanMessageEnqueue, LanTeamOutboxRow, OutboundUpdate,
+    PendingLanInvitation, RequestUpdate, UpdatePeerParams,
 };
 
 /// Terminal request states; rows in these states never change again.
@@ -68,6 +68,391 @@ fn push_state_list(builder: &mut QueryBuilder<'_, Sqlite>, states: &[&str]) {
 
 #[async_trait::async_trait]
 impl INetworkRepository for SqliteNetworkRepository {
+    async fn enqueue_lan_team_outbound_with_mailbox(
+        &self, user_id: &str, peer_id: &str, remote_team_id: &str, message: &crate::models::MailboxMessageRow,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query("INSERT INTO lan_team_outbox (id, user_id, team_id, peer_id, remote_team_id, content, state, created_at) SELECT ?, teams.user_id, teams.id, peer.id, member.remote_team_id, ?, 'pending', ? FROM teams JOIN lan_shared_teams shared ON shared.team_id = teams.id JOIN lan_team_members member ON member.team_id = teams.id AND member.state = 'active' JOIN network_peers peer ON peer.fingerprint = member.fingerprint AND peer.state = 'trusted' WHERE teams.user_id = ? AND teams.id = ? AND peer.id = ? AND member.remote_team_id = ?")
+            .bind(&message.id).bind(&message.content).bind(message.created_at).bind(user_id).bind(&message.team_id).bind(peer_id).bind(remote_team_id)
+            .execute(&mut *tx).await?;
+        if inserted.rows_affected() != 1 { return Ok(false); }
+        sqlx::query("INSERT INTO mailbox (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&message.id).bind(&message.team_id).bind(&message.to_agent_id).bind(&message.from_agent_id).bind(&message.msg_type)
+            .bind(&message.content).bind(&message.summary).bind(&message.files).bind(message.read).bind(message.created_at)
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+    async fn enqueue_lan_team_outbound(
+        &self, id: &str, user_id: &str, team_id: &str, peer_id: &str, remote_team_id: &str, content: &str,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query("INSERT INTO lan_team_outbox (id, user_id, team_id, peer_id, remote_team_id, content, state, created_at) SELECT ?, teams.user_id, teams.id, peer.id, member.remote_team_id, ?, 'pending', ? FROM teams JOIN lan_shared_teams shared ON shared.team_id = teams.id JOIN lan_team_members member ON member.team_id = teams.id AND member.state = 'active' JOIN network_peers peer ON peer.fingerprint = member.fingerprint AND peer.state = 'trusted' WHERE teams.user_id = ? AND teams.id = ? AND peer.id = ? AND member.remote_team_id = ?")
+            .bind(id).bind(content).bind(now_ms()).bind(user_id).bind(team_id).bind(peer_id).bind(remote_team_id)
+            .execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+    async fn pending_lan_team_outbound(&self, now: i64, limit: i64) -> Result<Vec<LanTeamOutboxRow>, DbError> {
+        Ok(sqlx::query_as("SELECT item.id, item.user_id, item.team_id, item.peer_id, item.remote_team_id, item.content FROM lan_team_outbox item WHERE item.state = 'pending' AND item.next_attempt_at <= ? AND NOT EXISTS (SELECT 1 FROM lan_team_outbox earlier WHERE earlier.state = 'pending' AND earlier.team_id = item.team_id AND earlier.peer_id = item.peer_id AND earlier.remote_team_id = item.remote_team_id AND earlier.rowid < item.rowid) ORDER BY item.next_attempt_at, item.rowid LIMIT ?")
+            .bind(now).bind(limit).fetch_all(&self.pool).await?)
+    }
+    async fn defer_lan_team_outbound(&self, id: &str, until: i64) -> Result<bool, DbError> {
+        Ok(sqlx::query("UPDATE lan_team_outbox SET next_attempt_at = ? WHERE id = ? AND state = 'pending'")
+            .bind(until).bind(id).execute(&self.pool).await?.rows_affected() == 1)
+    }
+    async fn finish_lan_team_outbound(&self, id: &str, state: &str) -> Result<bool, DbError> {
+        if state != "delivered" && state != "revoked" { return Ok(false); }
+        Ok(sqlx::query("UPDATE lan_team_outbox SET state = ? WHERE id = ? AND state = 'pending'")
+            .bind(state).bind(id).execute(&self.pool).await?.rows_affected() == 1)
+    }
+    async fn lan_team_delivery_statuses(&self, user_id: &str, team_id: &str) -> Result<Vec<(String, String)>, DbError> {
+        Ok(sqlx::query_as("SELECT outbox.id, outbox.state FROM lan_team_outbox outbox JOIN teams ON teams.id = outbox.team_id WHERE teams.user_id = ? AND outbox.user_id = ? AND outbox.team_id = ? ORDER BY outbox.rowid")
+            .bind(user_id).bind(user_id).bind(team_id).fetch_all(&self.pool).await?)
+    }
+    async fn teams_with_unread_lan_messages(&self, user_id: &str) -> Result<Vec<String>, DbError> {
+        Ok(sqlx::query_scalar("SELECT DISTINCT teams.id FROM lan_team_message_receipts receipt JOIN mailbox ON mailbox.id = receipt.mailbox_id AND mailbox.team_id = receipt.team_id JOIN teams ON teams.id = receipt.team_id WHERE teams.user_id = ? AND mailbox.read = 0")
+            .bind(user_id).fetch_all(&self.pool).await?)
+    }
+    async fn enqueue_lan_team_message(
+        &self, user_id: &str, fingerprint: &str, remote_team_id: &str, request_id: &str,
+        message: &crate::models::MailboxMessageRow,
+    ) -> Result<LanMessageEnqueue, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let locked = sqlx::query("UPDATE network_peers SET state = state WHERE fingerprint = ? AND state = 'trusted' AND EXISTS (SELECT 1 FROM lan_team_members member JOIN teams ON teams.id = member.team_id JOIN lan_shared_teams shared ON shared.team_id = teams.id WHERE member.team_id = ? AND teams.user_id = ? AND member.fingerprint = network_peers.fingerprint AND member.remote_team_id = ? AND member.state = 'active')")
+            .bind(fingerprint).bind(&message.team_id).bind(user_id).bind(remote_team_id).execute(&mut *tx).await?;
+        if locked.rows_affected() != 1 { return Ok(LanMessageEnqueue::Unauthorized); }
+        let peer_id: String = sqlx::query_scalar("SELECT id FROM network_peers WHERE fingerprint = ?")
+            .bind(fingerprint).fetch_one(&mut *tx).await?;
+        let existing: Option<(String, String, String)> = sqlx::query_as("SELECT team_id, remote_team_id, mailbox_id FROM lan_team_message_receipts WHERE peer_id = ? AND request_id = ?")
+            .bind(&peer_id).bind(request_id).fetch_optional(&mut *tx).await?;
+        if let Some((team, remote, mailbox_id)) = existing {
+            let same: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM mailbox WHERE id = ? AND team_id = ? AND to_agent_id = ? AND from_agent_id = ? AND type = ? AND content = ? AND summary IS ? AND files IS ?)")
+                .bind(mailbox_id).bind(&message.team_id).bind(&message.to_agent_id).bind(&message.from_agent_id)
+                .bind(&message.msg_type).bind(&message.content).bind(&message.summary).bind(&message.files)
+                .fetch_one(&mut *tx).await?;
+            return Ok(if same && team == message.team_id && remote == remote_team_id { LanMessageEnqueue::Duplicate } else { LanMessageEnqueue::Conflict });
+        }
+        sqlx::query("INSERT INTO mailbox (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(&message.id).bind(&message.team_id).bind(&message.to_agent_id).bind(&message.from_agent_id)
+            .bind(&message.msg_type).bind(&message.content).bind(&message.summary).bind(&message.files).bind(message.read).bind(message.created_at)
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO lan_team_message_receipts (peer_id, request_id, team_id, remote_team_id, mailbox_id) VALUES (?, ?, ?, ?, ?)")
+            .bind(peer_id).bind(request_id).bind(&message.team_id).bind(remote_team_id).bind(&message.id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(LanMessageEnqueue::Inserted)
+    }
+    async fn record_team_pair_attestation(
+        &self, user_id: &str, invitation_id: &str, fingerprint: &str, participants: &str, local: bool, now: i64,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query("INSERT INTO lan_team_pair_attestations (invitation_id, fingerprint, attested_at) SELECT invitation.id, ?, ? FROM lan_team_invitations invitation JOIN teams ON teams.id = invitation.team_id JOIN lan_team_invitation_votes voter ON voter.invitation_id = invitation.id AND voter.fingerprint = ? WHERE invitation.id = ? AND teams.user_id = ? AND invitation.state = 'pending' AND voter.decision = 'approved' AND (? = 1 OR EXISTS (SELECT 1 FROM network_peers WHERE fingerprint = ? AND state = 'trusted')) AND NOT EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND (vote.decision <> 'approved' OR NOT EXISTS (SELECT 1 FROM json_each(?) item WHERE item.value = vote.fingerprint))) AND (SELECT COUNT(*) FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id) = (SELECT COUNT(DISTINCT value) FROM json_each(?)) ON CONFLICT (invitation_id, fingerprint) DO UPDATE SET attested_at = excluded.attested_at")
+            .bind(fingerprint).bind(now).bind(fingerprint).bind(invitation_id).bind(user_id).bind(local).bind(fingerprint).bind(participants).bind(participants)
+            .execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn team_pair_attestations_complete(&self, user_id: &str, invitation_id: &str, since: i64) -> Result<bool, DbError> {
+        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM lan_team_invitations invitation JOIN teams ON teams.id = invitation.team_id WHERE invitation.id = ? AND teams.user_id = ? AND invitation.state = 'pending' AND EXISTS (SELECT 1 FROM lan_team_invitation_votes WHERE invitation_id = invitation.id) AND NOT EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND (vote.decision <> 'approved' OR NOT EXISTS (SELECT 1 FROM lan_team_pair_attestations attestation WHERE attestation.invitation_id = vote.invitation_id AND attestation.fingerprint = vote.fingerprint AND attestation.attested_at >= ?))))")
+            .bind(invitation_id).bind(user_id).bind(since).fetch_one(&self.pool).await?)
+    }
+    async fn complete_team_invitation(
+        &self, user_id: &str, invitation_id: &str, local_fingerprint: &str, since: i64,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query("UPDATE lan_team_invitations AS invitation SET state = 'completed' WHERE invitation.id = ? AND invitation.state = 'pending' AND EXISTS (SELECT 1 FROM teams JOIN lan_shared_teams shared ON shared.team_id = teams.id WHERE teams.id = invitation.team_id AND teams.user_id = ?) AND EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND vote.fingerprint = ? AND vote.remote_team_id = invitation.team_id) AND EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND vote.fingerprint = invitation.candidate_fingerprint) AND NOT EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND (vote.decision <> 'approved' OR vote.remote_team_id IS NULL OR length(trim(vote.remote_team_id)) = 0 OR (vote.fingerprint <> ? AND NOT EXISTS (SELECT 1 FROM network_peers peer WHERE peer.fingerprint = vote.fingerprint AND peer.state = 'trusted')) OR NOT EXISTS (SELECT 1 FROM lan_team_pair_attestations attestation WHERE attestation.invitation_id = vote.invitation_id AND attestation.fingerprint = vote.fingerprint AND attestation.attested_at >= ?))) AND NOT EXISTS (SELECT 1 FROM lan_team_members member WHERE member.team_id = invitation.team_id AND member.state = 'active' AND NOT EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND vote.fingerprint = member.fingerprint AND vote.remote_team_id = member.remote_team_id))")
+            .bind(invitation_id).bind(user_id).bind(local_fingerprint).bind(local_fingerprint).bind(since)
+            .execute(&mut *tx).await?;
+        if updated.rows_affected() != 1 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query("INSERT INTO lan_team_members (team_id, fingerprint, remote_team_id, state) SELECT invitation.team_id, vote.fingerprint, vote.remote_team_id, 'active' FROM lan_team_invitations invitation JOIN lan_team_invitation_votes vote ON vote.invitation_id = invitation.id WHERE invitation.id = ? AND vote.fingerprint <> ? ON CONFLICT (team_id, fingerprint) DO UPDATE SET remote_team_id = excluded.remote_team_id, state = excluded.state")
+            .bind(invitation_id).bind(local_fingerprint).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+    async fn record_team_poll_consent(
+        &self, user_id: &str, team_id: &str, coordinator: &str, invitation_id: &str, participants: &str,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query("INSERT INTO lan_team_poll_consents (coordinator_fingerprint, invitation_id, team_id, participants) SELECT ?, ?, teams.id, ? FROM teams JOIN lan_shared_teams ON lan_shared_teams.team_id = teams.id JOIN network_peers ON network_peers.fingerprint = ? AND network_peers.state = 'trusted' WHERE teams.user_id = ? AND teams.id = ? AND NOT EXISTS (SELECT 1 FROM lan_team_members member WHERE member.team_id = teams.id AND member.state = 'active' AND NOT EXISTS (SELECT 1 FROM json_each(?) participant WHERE participant.value = member.fingerprint)) AND NOT EXISTS (SELECT 1 FROM lan_team_invitations invitation WHERE invitation.team_id = teams.id AND invitation.state = 'pending') AND NOT EXISTS (SELECT 1 FROM lan_team_poll_consents consent WHERE consent.team_id = teams.id AND (consent.coordinator_fingerprint <> ? OR consent.invitation_id <> ?)) ON CONFLICT (coordinator_fingerprint, invitation_id) DO UPDATE SET participants = excluded.participants WHERE lan_team_poll_consents.team_id = excluded.team_id AND lan_team_poll_consents.participants = excluded.participants")
+            .bind(coordinator).bind(invitation_id).bind(participants).bind(coordinator).bind(user_id).bind(team_id).bind(participants).bind(coordinator).bind(invitation_id)
+            .execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn remove_team_poll_consent(&self, user_id: &str, coordinator: &str, invitation_id: &str) -> Result<bool, DbError> {
+        Ok(sqlx::query("DELETE FROM lan_team_poll_consents WHERE coordinator_fingerprint = ? AND invitation_id = ? AND EXISTS (SELECT 1 FROM teams WHERE teams.id = lan_team_poll_consents.team_id AND teams.user_id = ?)")
+            .bind(coordinator).bind(invitation_id).bind(user_id).execute(&self.pool).await?.rows_affected() == 1)
+    }
+    async fn team_poll_consent(
+        &self, user_id: &str, coordinator: &str, invitation_id: &str,
+    ) -> Result<Option<(String, String)>, DbError> {
+        Ok(sqlx::query_as("SELECT consent.team_id, consent.participants FROM lan_team_poll_consents consent JOIN teams ON teams.id = consent.team_id JOIN lan_shared_teams ON lan_shared_teams.team_id = teams.id JOIN network_peers peer ON peer.fingerprint = consent.coordinator_fingerprint AND peer.state = 'trusted' WHERE teams.user_id = ? AND consent.coordinator_fingerprint = ? AND consent.invitation_id = ?")
+            .bind(user_id).bind(coordinator).bind(invitation_id).fetch_optional(&self.pool).await?)
+    }
+    async fn apply_team_poll_membership(
+        &self, user_id: &str, coordinator: &str, invitation_id: &str, local_fingerprint: &str,
+        members: &[(String, String)],
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        // Acquire the write lock before reading consent and trust so revoke cannot race the roster update.
+        let locked = sqlx::query("UPDATE lan_team_poll_consents SET participants = participants WHERE coordinator_fingerprint = ? AND invitation_id = ? AND EXISTS (SELECT 1 FROM teams JOIN lan_shared_teams shared ON shared.team_id = teams.id WHERE teams.id = lan_team_poll_consents.team_id AND teams.user_id = ?) AND EXISTS (SELECT 1 FROM network_peers WHERE fingerprint = ? AND state = 'trusted')")
+            .bind(coordinator).bind(invitation_id).bind(user_id).bind(coordinator).execute(&mut *tx).await?;
+        if locked.rows_affected() != 1 {
+            return Ok(false);
+        }
+        let (team_id, participants): (String, String) = sqlx::query_as("SELECT team_id, participants FROM lan_team_poll_consents WHERE coordinator_fingerprint = ? AND invitation_id = ?")
+            .bind(coordinator).bind(invitation_id).fetch_one(&mut *tx).await?;
+        let Ok(expected) = serde_json::from_str::<Vec<String>>(&participants) else { return Ok(false) };
+        let mut actual = members.iter().map(|(fingerprint, _)| fingerprint.clone()).collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort_unstable();
+        if actual != expected_sorted || actual.windows(2).any(|pair| pair[0] == pair[1])
+            || !actual.iter().any(|fingerprint| fingerprint == coordinator)
+            || members.iter().any(|(fingerprint, team)| fingerprint.is_empty() || team.trim().is_empty())
+            || !members.iter().any(|(fingerprint, team)| fingerprint == local_fingerprint && team == &team_id)
+        {
+            return Ok(false);
+        }
+        for (fingerprint, _) in members.iter().filter(|(fingerprint, _)| fingerprint != local_fingerprint) {
+            let trusted: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM network_peers WHERE fingerprint = ? AND state = 'trusted')")
+                .bind(fingerprint).fetch_one(&mut *tx).await?;
+            if !trusted { return Ok(false); }
+        }
+        let active: Vec<(String, String)> = sqlx::query_as("SELECT fingerprint, remote_team_id FROM lan_team_members WHERE team_id = ? AND state = 'active'")
+            .bind(&team_id).fetch_all(&mut *tx).await?;
+        if active.iter().any(|member| !members.contains(member)) {
+            return Ok(false);
+        }
+        for (fingerprint, remote_team) in members.iter().filter(|(fingerprint, _)| fingerprint != local_fingerprint) {
+            sqlx::query("INSERT INTO lan_team_members (team_id, fingerprint, remote_team_id, state) VALUES (?, ?, ?, 'active') ON CONFLICT (team_id, fingerprint) DO UPDATE SET remote_team_id = excluded.remote_team_id, state = excluded.state")
+                .bind(&team_id).bind(fingerprint).bind(remote_team).execute(&mut *tx).await?;
+        }
+        sqlx::query("DELETE FROM lan_team_poll_consents WHERE coordinator_fingerprint = ? AND invitation_id = ?")
+            .bind(coordinator).bind(invitation_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+    async fn list_team_poll_consents(&self, user_id: &str) -> Result<Vec<(String, String)>, DbError> {
+        Ok(sqlx::query_as("SELECT peer.id, consent.invitation_id FROM lan_team_poll_consents consent JOIN teams ON teams.id = consent.team_id JOIN lan_shared_teams ON lan_shared_teams.team_id = teams.id JOIN network_peers peer ON peer.fingerprint = consent.coordinator_fingerprint AND peer.state = 'trusted' WHERE teams.user_id = ? ORDER BY consent.invitation_id")
+            .bind(user_id).fetch_all(&self.pool).await?)
+    }
+    async fn authorized_lan_team_member(
+        &self, user_id: &str, team_id: &str, fingerprint: &str, remote_team_id: &str,
+    ) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar("SELECT peer.id FROM lan_team_members member JOIN teams ON teams.id = member.team_id JOIN lan_shared_teams shared ON shared.team_id = teams.id JOIN network_peers peer ON peer.fingerprint = member.fingerprint WHERE teams.user_id = ? AND teams.id = ? AND member.fingerprint = ? AND member.remote_team_id = ? AND member.state = 'active' AND peer.state = 'trusted'")
+            .bind(user_id).bind(team_id).bind(fingerprint).bind(remote_team_id).fetch_optional(&self.pool).await?)
+    }
+    async fn active_lan_team_members(&self, user_id: &str) -> Result<Vec<ActiveLanTeamMember>, DbError> {
+        Ok(sqlx::query_as("SELECT member.team_id, peer.id AS peer_id, peer.display_name AS peer_name, peer.fingerprint, member.remote_team_id FROM lan_team_members member JOIN teams ON teams.id = member.team_id JOIN lan_shared_teams shared ON shared.team_id = teams.id JOIN network_peers peer ON peer.fingerprint = member.fingerprint WHERE teams.user_id = ? AND member.state = 'active' AND peer.state = 'trusted' ORDER BY member.team_id, peer.id")
+            .bind(user_id).fetch_all(&self.pool).await?)
+    }
+    async fn create_team_invitation(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        invitation_id: &str,
+        local_fingerprint: &str,
+        candidate_peer_id: &str,
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("INSERT INTO lan_team_invitations (id, team_id, candidate_fingerprint, state, created_at) SELECT ?, teams.id, peer.fingerprint, 'pending', ? FROM teams JOIN lan_shared_teams ON lan_shared_teams.team_id = teams.id JOIN network_peers peer ON peer.id = ? AND peer.state = 'trusted' WHERE teams.id = ? AND teams.user_id = ? AND peer.fingerprint <> ? AND NOT EXISTS (SELECT 1 FROM lan_team_members WHERE team_id = teams.id AND fingerprint = peer.fingerprint AND state = 'active') AND NOT EXISTS (SELECT 1 FROM lan_team_poll_consents WHERE team_id = teams.id)")
+            .bind(invitation_id)
+            .bind(now_ms())
+            .bind(candidate_peer_id)
+            .bind(team_id)
+            .bind(user_id)
+            .bind(local_fingerprint)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| map_unique(error, "pending invitation already exists"))?;
+        if result.rows_affected() != 1 {
+            let blocked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM lan_team_poll_consents consent JOIN teams ON teams.id = consent.team_id WHERE teams.id = ? AND teams.user_id = ?)")
+                .bind(team_id).bind(user_id).fetch_one(&mut *tx).await?;
+            if blocked { return Err(DbError::Conflict("conversation has an active invitation".into())); }
+            return Err(DbError::NotFound("shared team or eligible trusted peer not found".into()));
+        }
+        sqlx::query("INSERT INTO lan_team_invitation_votes (invitation_id, fingerprint, decision) SELECT ?, fingerprint, 'pending' FROM (SELECT ? AS fingerprint UNION SELECT candidate_fingerprint FROM lan_team_invitations WHERE id = ? UNION SELECT fingerprint FROM lan_team_members WHERE team_id = ? AND state = 'active')")
+            .bind(invitation_id)
+            .bind(local_fingerprint)
+            .bind(invitation_id)
+            .bind(team_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn team_invitation_votes(
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+    ) -> Result<Vec<(String, String)>, DbError> {
+        Ok(sqlx::query_as("SELECT votes.fingerprint, votes.decision FROM lan_team_invitation_votes votes JOIN lan_team_invitations invitations ON invitations.id = votes.invitation_id JOIN teams ON teams.id = invitations.team_id WHERE invitations.id = ? AND teams.user_id = ? ORDER BY votes.fingerprint")
+            .bind(invitation_id)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    async fn team_invitation_conversations(
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+    ) -> Result<Vec<(String, String)>, DbError> {
+        Ok(sqlx::query_as("SELECT votes.fingerprint, votes.remote_team_id FROM lan_team_invitation_votes votes JOIN lan_team_invitations invitations ON invitations.id = votes.invitation_id JOIN teams ON teams.id = invitations.team_id WHERE invitations.id = ? AND teams.user_id = ? AND votes.decision = 'approved' AND votes.remote_team_id IS NOT NULL ORDER BY votes.fingerprint")
+            .bind(invitation_id)
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    async fn decide_team_invitation(
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+        fingerprint: &str,
+        approve: bool,
+        remote_team_id: Option<&str>,
+    ) -> Result<bool, DbError> {
+        if approve && remote_team_id.is_none_or(|id| id.trim().is_empty()) {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("UPDATE lan_team_invitation_votes SET decision = ?, remote_team_id = ? WHERE invitation_id = ? AND fingerprint = ? AND (decision = 'pending' OR (? = 0 AND decision = 'approved')) AND EXISTS (SELECT 1 FROM lan_team_invitations JOIN teams ON teams.id = lan_team_invitations.team_id WHERE lan_team_invitations.id = ? AND lan_team_invitations.state = 'pending' AND teams.user_id = ? AND (? = 0 OR NOT EXISTS (SELECT 1 FROM lan_team_members member WHERE member.team_id = teams.id AND member.fingerprint = lan_team_invitation_votes.fingerprint AND member.state = 'active' AND member.remote_team_id <> ?)))")
+            .bind(if approve { "approved" } else { "rejected" })
+            .bind(remote_team_id)
+            .bind(invitation_id)
+            .bind(fingerprint)
+            .bind(approve)
+            .bind(invitation_id)
+            .bind(user_id)
+            .bind(approve)
+            .bind(remote_team_id)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 1 && !approve {
+            sqlx::query("UPDATE lan_team_invitations SET state = 'rejected' WHERE id = ? AND state = 'pending'")
+                .bind(invitation_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let recorded = if result.rows_affected() == 1 {
+            true
+        } else if !approve {
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM lan_team_invitation_votes vote JOIN lan_team_invitations invitation ON invitation.id = vote.invitation_id JOIN teams ON teams.id = invitation.team_id WHERE vote.invitation_id = ? AND vote.fingerprint = ? AND vote.decision = 'rejected' AND invitation.state = 'rejected' AND teams.user_id = ?)")
+                .bind(invitation_id).bind(fingerprint).bind(user_id).fetch_one(&mut *tx).await?
+        } else {
+            false
+        };
+        tx.commit().await?;
+        Ok(recorded)
+    }
+
+    async fn pending_local_team_invitation(&self, user_id: &str, team_id: &str) -> Result<Option<(String, String, String)>, DbError> {
+        Ok(sqlx::query_as("SELECT invitation.id, invitation.candidate_fingerprint, invitation.state FROM lan_team_invitations invitation JOIN teams ON teams.id = invitation.team_id WHERE teams.user_id = ? AND teams.id = ? AND invitation.id = (SELECT id FROM lan_team_invitations WHERE team_id = teams.id ORDER BY rowid DESC LIMIT 1) AND invitation.state IN ('pending', 'rejected', 'cancelled')")
+            .bind(user_id).bind(team_id).fetch_optional(&self.pool).await?)
+    }
+    async fn cancel_team_invitation(&self, user_id: &str, team_id: &str, invitation_id: &str) -> Result<bool, DbError> {
+        Ok(sqlx::query("UPDATE lan_team_invitations SET state = 'cancelled' WHERE id = ? AND team_id = ? AND state = 'pending' AND EXISTS (SELECT 1 FROM teams WHERE teams.id = lan_team_invitations.team_id AND teams.user_id = ?)")
+            .bind(invitation_id).bind(team_id).bind(user_id).execute(&self.pool).await?.rows_affected() == 1)
+    }
+    async fn team_invitation_team_id(&self, user_id: &str, invitation_id: &str) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar("SELECT invitations.team_id FROM lan_team_invitations invitations JOIN teams ON teams.id = invitations.team_id WHERE invitations.id = ? AND teams.user_id = ? AND invitations.state = 'pending'")
+            .bind(invitation_id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    async fn pending_team_invitations(
+        &self,
+        user_id: &str,
+        fingerprint: &str,
+    ) -> Result<Vec<PendingLanInvitation>, DbError> {
+        Ok(sqlx::query_as::<_, PendingLanInvitation>(
+            "SELECT invitations.id, invitations.state, teams.name AS team_name, invitations.candidate_fingerprint, candidate.display_name AS candidate_name, votes.decision FROM lan_team_invitations invitations JOIN teams ON teams.id = invitations.team_id JOIN lan_shared_teams shared ON shared.team_id = teams.id JOIN lan_team_invitation_votes votes ON votes.invitation_id = invitations.id LEFT JOIN network_peers candidate ON candidate.fingerprint = invitations.candidate_fingerprint WHERE teams.user_id = ? AND votes.fingerprint = ? AND (invitations.state = 'pending' OR (invitations.state = 'completed' AND EXISTS (SELECT 1 FROM lan_team_members member WHERE member.team_id = invitations.team_id AND member.fingerprint = votes.fingerprint AND member.state = 'active'))) ORDER BY invitations.created_at, invitations.id",
+        )
+        .bind(user_id)
+        .bind(fingerprint)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn compare_and_set_peer_state(&self, id: &str, expected: &str, next: &str) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE network_peers SET state = ?, updated_at = ? WHERE id = ? AND state = ?")
+            .bind(next)
+            .bind(now_ms())
+            .bind(id)
+            .bind(expected)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    async fn revoke_peer_and_memberships(&self, id: &str, expected: Option<&str>) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("UPDATE network_peers SET state = 'revoked', updated_at = ? WHERE id = ? AND (? IS NULL OR state = ?)")
+            .bind(now_ms())
+            .bind(id)
+            .bind(expected)
+            .bind(expected)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query("UPDATE lan_team_invitations SET state = 'cancelled' WHERE state = 'pending' AND id IN (SELECT votes.invitation_id FROM lan_team_invitation_votes votes JOIN network_peers peer ON peer.fingerprint = votes.fingerprint WHERE peer.id = ?)")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE lan_team_members SET state = 'revoked' WHERE fingerprint = (SELECT fingerprint FROM network_peers WHERE id = ?) AND state = 'active'")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM lan_team_poll_consents WHERE coordinator_fingerprint = (SELECT fingerprint FROM network_peers WHERE id = ?) OR EXISTS (SELECT 1 FROM json_each(lan_team_poll_consents.participants) WHERE value = (SELECT fingerprint FROM network_peers WHERE id = ?))")
+            .bind(id).bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+    async fn set_team_shared(&self, user_id: &str, team_id: &str, enabled: bool) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM teams WHERE id = ? AND user_id = ?)")
+            .bind(team_id)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !exists {
+            return Err(DbError::NotFound("team not found".into()));
+        }
+        if enabled {
+            sqlx::query("INSERT OR IGNORE INTO lan_shared_teams (team_id) VALUES (?)")
+                .bind(team_id)
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            sqlx::query("DELETE FROM lan_team_poll_consents WHERE team_id = ?")
+                .bind(team_id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE lan_team_invitations SET state = 'cancelled' WHERE team_id = ? AND state = 'pending'")
+                .bind(team_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM lan_shared_teams WHERE team_id = ?")
+                .bind(team_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_shared_teams(&self, user_id: &str) -> Result<Vec<(String, String)>, DbError> {
+        Ok(sqlx::query_as("SELECT teams.id, teams.name FROM teams JOIN lan_shared_teams ON teams.id = lan_shared_teams.team_id WHERE teams.user_id = ? ORDER BY teams.name, teams.id")
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     async fn list_peers(&self) -> Result<Vec<NetworkPeerRow>, DbError> {
         Ok(
             sqlx::query_as::<_, NetworkPeerRow>("SELECT * FROM network_peers ORDER BY created_at ASC")

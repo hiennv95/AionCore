@@ -37,6 +37,9 @@ pub enum TeamError {
     #[error("Team agent runtime is not ready for conversation: {conversation_id}")]
     RuntimeNotReady { conversation_id: String },
 
+    #[error("Team session resume is unsupported")]
+    SessionResumeUnsupported,
+
     #[error("Team member runtime failed: {slot_id}")]
     MemberRuntimeFailed {
         team_id: String,

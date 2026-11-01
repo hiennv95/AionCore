@@ -1,7 +1,44 @@
 use aionui_common::TimestampMs;
 
 use crate::error::DbError;
-use crate::models::{NetworkInboundRequestRow, NetworkOutboundRequestRow, NetworkPeerRow, NetworkShareRow};
+use crate::models::{MailboxMessageRow, NetworkInboundRequestRow, NetworkOutboundRequestRow, NetworkPeerRow, NetworkShareRow};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LanMessageEnqueue {
+    Inserted,
+    Duplicate,
+    Conflict,
+    Unauthorized,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct LanTeamOutboxRow {
+    pub id: String,
+    pub user_id: String,
+    pub team_id: String,
+    pub peer_id: String,
+    pub remote_team_id: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ActiveLanTeamMember {
+    pub team_id: String,
+    pub peer_id: String,
+    pub peer_name: String,
+    pub fingerprint: String,
+    pub remote_team_id: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PendingLanInvitation {
+    pub id: String,
+    pub state: String,
+    pub team_name: String,
+    pub candidate_fingerprint: String,
+    pub candidate_name: Option<String>,
+    pub decision: String,
+}
 
 /// Data access for private-LAN peers, shares and remote requests (ADR-009).
 ///
@@ -10,6 +47,90 @@ use crate::models::{NetworkInboundRequestRow, NetworkOutboundRequestRow, Network
 /// given `claim_token`.
 #[async_trait::async_trait]
 pub trait INetworkRepository: Send + Sync {
+    /// Snapshot the active LAN roster and candidate while creating an invitation.
+    async fn create_team_invitation(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        invitation_id: &str,
+        local_fingerprint: &str,
+        candidate_peer_id: &str,
+    ) -> Result<(), DbError>;
+    async fn team_invitation_votes(
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+    ) -> Result<Vec<(String, String)>, DbError>;
+    async fn team_invitation_conversations(
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+    ) -> Result<Vec<(String, String)>, DbError>;
+    async fn team_invitation_team_id(&self, user_id: &str, invitation_id: &str) -> Result<Option<String>, DbError>;
+    async fn pending_local_team_invitation(&self, user_id: &str, team_id: &str) -> Result<Option<(String, String, String)>, DbError>;
+    async fn cancel_team_invitation(&self, user_id: &str, team_id: &str, invitation_id: &str) -> Result<bool, DbError>;
+    async fn record_team_poll_consent(
+        &self, user_id: &str, team_id: &str, coordinator: &str, invitation_id: &str, participants: &str,
+    ) -> Result<bool, DbError>;
+    async fn team_poll_consent(
+        &self, user_id: &str, coordinator: &str, invitation_id: &str,
+    ) -> Result<Option<(String, String)>, DbError>;
+    async fn remove_team_poll_consent(&self, user_id: &str, coordinator: &str, invitation_id: &str) -> Result<bool, DbError>;
+    /// Apply an authenticated completed poll against the owner's persisted consent.
+    async fn apply_team_poll_membership(
+        &self, user_id: &str, coordinator: &str, invitation_id: &str, local_fingerprint: &str,
+        members: &[(String, String)],
+    ) -> Result<bool, DbError>;
+    /// Resolve a currently trusted remote conversation member for message delivery.
+    async fn authorized_lan_team_member(
+        &self, user_id: &str, team_id: &str, fingerprint: &str, remote_team_id: &str,
+    ) -> Result<Option<String>, DbError>;
+    async fn active_lan_team_members(&self, user_id: &str) -> Result<Vec<ActiveLanTeamMember>, DbError>;
+    /// Teams with an acknowledged LAN message that has not yet been read.
+    async fn teams_with_unread_lan_messages(&self, user_id: &str) -> Result<Vec<String>, DbError>;
+    /// Atomically authorize and persist a peer message and its idempotency receipt.
+    async fn enqueue_lan_team_message(
+        &self, user_id: &str, fingerprint: &str, remote_team_id: &str, request_id: &str,
+        message: &MailboxMessageRow,
+    ) -> Result<LanMessageEnqueue, DbError>;
+    async fn enqueue_lan_team_outbound(
+        &self, id: &str, user_id: &str, team_id: &str, peer_id: &str, remote_team_id: &str, content: &str,
+    ) -> Result<bool, DbError>;
+    async fn enqueue_lan_team_outbound_with_mailbox(
+        &self, user_id: &str, peer_id: &str, remote_team_id: &str, message: &MailboxMessageRow,
+    ) -> Result<bool, DbError>;
+    async fn pending_lan_team_outbound(&self, now: i64, limit: i64) -> Result<Vec<LanTeamOutboxRow>, DbError>;
+    async fn defer_lan_team_outbound(&self, id: &str, until: i64) -> Result<bool, DbError>;
+    async fn finish_lan_team_outbound(&self, id: &str, state: &str) -> Result<bool, DbError>;
+    async fn lan_team_delivery_statuses(&self, user_id: &str, team_id: &str) -> Result<Vec<(String, String)>, DbError>;
+    async fn list_team_poll_consents(&self, user_id: &str) -> Result<Vec<(String, String)>, DbError>;
+    async fn record_team_pair_attestation(
+        &self, user_id: &str, invitation_id: &str, fingerprint: &str, participants: &str, local: bool, now: i64,
+    ) -> Result<bool, DbError>;
+    async fn team_pair_attestations_complete(&self, user_id: &str, invitation_id: &str, since: i64) -> Result<bool, DbError>;
+    /// Complete a poll and update the coordinator roster in one transaction.
+    async fn complete_team_invitation(
+        &self, user_id: &str, invitation_id: &str, local_fingerprint: &str, since: i64,
+    ) -> Result<bool, DbError>;
+    async fn pending_team_invitations(
+        &self,
+        user_id: &str,
+        fingerprint: &str,
+    ) -> Result<Vec<PendingLanInvitation>, DbError>;
+    /// Returns false if the invitation or vote is no longer pending.
+    async fn decide_team_invitation(
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+        fingerprint: &str,
+        approve: bool,
+        remote_team_id: Option<&str>,
+    ) -> Result<bool, DbError>;
+    /// Only teams owned by `user_id` can have their LAN visibility changed.
+    async fn set_team_shared(&self, user_id: &str, team_id: &str, enabled: bool) -> Result<(), DbError>;
+    /// IDs and names only; conversation history and members are never exposed.
+    async fn list_shared_teams(&self, user_id: &str) -> Result<Vec<(String, String)>, DbError>;
+
     // ── peers ─────────────────────────────────────────────────────────────
     async fn list_peers(&self) -> Result<Vec<NetworkPeerRow>, DbError>;
     async fn find_peer(&self, id: &str) -> Result<Option<NetworkPeerRow>, DbError>;
@@ -17,6 +138,11 @@ pub trait INetworkRepository: Send + Sync {
     async fn insert_peer(&self, params: InsertPeerParams<'_>) -> Result<NetworkPeerRow, DbError>;
     /// Update state and, when given, the display name / URL. `NotFound` if missing.
     async fn update_peer(&self, id: &str, params: UpdatePeerParams<'_>) -> Result<(), DbError>;
+    /// Change state only if it has not changed since it was observed.
+    async fn compare_and_set_peer_state(&self, id: &str, expected: &str, next: &str) -> Result<bool, DbError>;
+    /// Revoke the peer, its team memberships and affected pending invitations atomically.
+    /// An expected state fences observations made before a newer local decision.
+    async fn revoke_peer_and_memberships(&self, id: &str, expected: Option<&str>) -> Result<bool, DbError>;
     async fn delete_peer(&self, id: &str) -> Result<(), DbError>;
     async fn count_peers_in_state(&self, state: &str) -> Result<i64, DbError>;
 

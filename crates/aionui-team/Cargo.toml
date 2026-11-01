@@ -25,6 +25,7 @@ agent-client-protocol = "2.0.0"
 futures-util.workspace = true
 
 [dev-dependencies]
+aionui-network.workspace = true
 sqlx.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 futures-util.workspace = true

@@ -309,7 +309,14 @@ use aionui_db::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
 
 impl Team {
     pub fn from_row(row: &TeamRow) -> Result<Self, serde_json::Error> {
-        let agents: Vec<TeamAgent> = serde_json::from_str(&row.agents)?;
+        let mut agents: Vec<TeamAgent> = serde_json::from_str(&row.agents)?;
+        // Older LAN members were persisted as a second local leader. The remote
+        // host's leader is a teammate in this team, not its scheduler's leader.
+        for agent in &mut agents {
+            if decode_remote_agent(agent).is_some() {
+                agent.role = TeammateRole::Teammate;
+            }
+        }
         Ok(Self {
             id: row.id.clone(),
             name: row.name.clone(),
@@ -686,6 +693,45 @@ mod tests {
         assert_eq!(team.agents.len(), 1);
         assert_eq!(team.agents[0].slot_id, "s1");
         assert_eq!(team.lead_agent_id.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn legacy_remote_leader_is_loaded_as_a_teammate() {
+        let remote = TeamAgent {
+            slot_id: "remote".into(),
+            name: "Team B".into(),
+            role: TeammateRole::Lead,
+            conversation_id: String::new(),
+            backend: "remote".into(),
+            model: String::new(),
+            assistant_id: None,
+            status: None,
+            cli_path: None,
+            conversation_type: Some(encode_remote_agent(&RemoteTeamAgent {
+                peer_id: "peer-b".into(),
+                share_id: "team-b".into(),
+                share_label: "Team B".into(),
+                thread_id: None,
+            })),
+        };
+        let row = TeamRow {
+            id: "t1".into(),
+            user_id: "owner".into(),
+            name: "A".into(),
+            workspace: String::new(),
+            workspace_mode: "shared".into(),
+            agents: serde_json::to_string(&vec![remote]).unwrap(),
+            lead_agent_id: None,
+            session_mode: None,
+            agents_version: "1".into(),
+            created_at: 1,
+            updated_at: 1,
+            project_id: None,
+            folder_id: None,
+        };
+        let team = Team::from_row(&row).unwrap();
+        assert_eq!(team.agents[0].role, TeammateRole::Teammate);
+        assert_eq!(decode_remote_agent(&team.agents[0]).unwrap().peer_id, "peer-b");
     }
 
     #[test]

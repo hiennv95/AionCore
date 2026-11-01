@@ -1023,6 +1023,46 @@ pub fn build_team_state(
         aionui_team::TeamPromptDumpConfig::from_data_dir(&services.data_dir, services.dump_prompts),
     );
     if let Some(network) = network_service {
+        struct TeamLanSink {
+            team: Arc<TeamSessionService>,
+            repo: Arc<dyn aionui_db::INetworkRepository>,
+        }
+        #[async_trait::async_trait]
+        impl aionui_network::LanTeamMessageSink for TeamLanSink {
+            async fn recover_team(&self, owner: &str, team_id: &str) -> Result<(), aionui_network::NetworkError> {
+                self.team.ensure_session(owner, team_id).await
+                    .map_err(|error| aionui_network::NetworkError::Internal(error.to_string()))
+            }
+            async fn sync_member(&self, owner: &str, member: &aionui_db::ActiveLanTeamMember)
+                -> Result<(), aionui_network::NetworkError> {
+                if self.repo.authorized_lan_team_member(owner, &member.team_id, &member.fingerprint, &member.remote_team_id)
+                    .await?.as_deref() != Some(member.peer_id.as_str()) {
+                    return Ok(());
+                }
+                self.team.ensure_lan_member(owner, &member.team_id, &member.peer_id, &member.peer_name, &member.remote_team_id)
+                    .await.map_err(|error| aionui_network::NetworkError::Internal(error.to_string()))
+            }
+            async fn deliver(&self, owner: &str, peer: &str, fingerprint: &str, message: &aionui_api_types::PeerTeamMessage)
+                -> Result<aionui_api_types::PeerTeamMessageResponse, aionui_network::NetworkError> {
+                let duplicate = self.team.receive_lan_leader_message_durable(
+                    self.repo.as_ref(), owner, &message.team_id, peer, fingerprint, &message.remote_team_id,
+                    &message.request_id, &message.content,
+                ).await.map_err(|error| match error {
+                    aionui_team::TeamError::Forbidden(_) | aionui_team::TeamError::TeamNotFound(_) => aionui_network::NetworkError::TeamNotFound,
+                    aionui_team::TeamError::InvalidRequest(_) => aionui_network::NetworkError::RequestConflict,
+                    aionui_team::TeamError::Database(error) => aionui_network::NetworkError::Db(error),
+                    other => aionui_network::NetworkError::Internal(other.to_string()),
+                })?;
+                Ok(aionui_api_types::PeerTeamMessageResponse { duplicate })
+            }
+        }
+        let sink = TeamLanSink {
+            team: service.clone(),
+            repo: Arc::new(aionui_db::SqliteNetworkRepository::new(services.database.pool().clone())),
+        };
+        if network.set_team_sink(Arc::new(sink)).is_err() {
+            tracing::warn!("network: LAN team message sink already configured");
+        }
         struct TeamNetworkAdapter(Arc<aionui_network::NetworkService>);
         #[async_trait::async_trait]
         impl TeamRemotePort for TeamNetworkAdapter {
@@ -1031,37 +1071,10 @@ pub fn build_team_state(
                 user_id: &str,
                 message: TeamRemoteMessage,
             ) -> Result<TeamRemoteResult, aionui_team::TeamError> {
-                let request = self
-                    .0
-                    .send(
-                        user_id,
-                        aionui_api_types::SendRemoteRequest {
-                            peer_id: message.peer_id,
-                            share_id: message.share_id,
-                            share_label: message.share_label,
-                            content: message.content,
-                            thread_id: message.thread_id,
-                            deadline_secs: None,
-                        },
-                    )
-                    .await
-                    .map_err(|e| aionui_team::TeamError::InvalidRequest(e.to_string()))?;
-                let id = request.id.clone();
-                let deadline = request.deadline_at;
-                loop {
-                    let current = self
-                        .0
-                        .get_outbound(user_id, &id)
-                        .await
-                        .map_err(|e| aionui_team::TeamError::InvalidRequest(e.to_string()))?;
-                    if current.state.is_terminal() || aionui_common::now_ms() >= deadline {
-                        return Ok(TeamRemoteResult {
-                            thread_id: current.thread_id,
-                            result_text: current.result_text,
-                        });
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                }
+                let persisted_message = self.0.send_lan_team_message_with_mailbox(user_id, &message.team_id, &message.peer_id, &message.share_id,
+                    &message.from_slot_id, &message.to_slot_id, &message.content)
+                    .await.map_err(|e| aionui_team::TeamError::InvalidRequest(e.to_string()))?;
+                Ok(TeamRemoteResult { thread_id: message.thread_id.unwrap_or_default(), result_text: None, persisted_message: Some(persisted_message) })
             }
         }
         service.with_remote_port(Arc::new(TeamNetworkAdapter(network)));

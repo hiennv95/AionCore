@@ -518,6 +518,21 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
             .map(str::to_owned))
     }
 
+    async fn conversation_agent_id(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>, TeamError> {
+        let Some(row) = self.conversation_repo.get(user_id, conversation_id).await? else {
+            return Ok(None);
+        };
+        if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(user_id, conversation_id).await? {
+            let id = snapshot.agent_id.trim();
+            if !id.is_empty() {
+                return Ok(Some(id.to_owned()));
+            }
+        }
+        let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
+        Ok(extra.get("agent_id").and_then(serde_json::Value::as_str).map(str::trim)
+            .filter(|id| !id.is_empty()).map(str::to_owned))
+    }
+
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError> {
         self.conversation_service
             .create_team_temp_workspace(user_id, team_id)
@@ -745,6 +760,8 @@ fn map_conversation_update_error(error: ConversationError) -> TeamError {
         ConversationError::WorkspacePathUnavailable { path } => TeamError::WorkspacePathUnavailable(path),
         ConversationError::WorkspacePathRuntimeUnavailable { path } => TeamError::WorkspacePathRuntimeUnavailable(path),
         ConversationError::Forbidden { reason } => TeamError::Forbidden(reason),
+        ConversationError::BadRequest { reason } if reason == aionui_api_types::TEAM_SESSION_RESUME_UNSUPPORTED =>
+            TeamError::SessionResumeUnsupported,
         ConversationError::ActiveAgentNotFound { conversation_id } => TeamError::RuntimeNotReady { conversation_id },
         ConversationError::NotFound { id } => TeamError::InvalidRequest(format!("conversation not found: {id}")),
         ConversationError::NotFoundReason { reason } => TeamError::InvalidRequest(reason),
@@ -764,6 +781,14 @@ fn map_conversation_turn_error(error: ConversationError) -> AgentTurnExecutionEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_team_resume_maps_to_explicit_runtime_error() {
+        let error = map_conversation_update_error(ConversationError::BadRequest {
+            reason: aionui_api_types::TEAM_SESSION_RESUME_UNSUPPORTED.to_owned(),
+        });
+        assert!(matches!(error, TeamError::SessionResumeUnsupported));
+    }
 
     #[test]
     fn parse_available_command_names_extracts_names() {

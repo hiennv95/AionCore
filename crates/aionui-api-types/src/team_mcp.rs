@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 /// has always been done via per-team TCP port + auth token, so the team_id was
 /// redundant in the server name.
 pub const TEAM_MCP_SERVER_NAME: &str = "aionui-team";
+pub const TEAM_SESSION_RESUME_UNSUPPORTED: &str =
+    "This agent cannot restore a Team session after restart. The conversation history is preserved.";
 
 /// Stdio connection config for the team session MCP server.
 ///

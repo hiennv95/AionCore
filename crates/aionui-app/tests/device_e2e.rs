@@ -192,6 +192,18 @@ async fn a_paired_phone_can_read_but_not_change_lan_trust() {
         (status, body["code"].clone()),
         (StatusCode::FORBIDDEN, json!("NETWORK_OWNER_ONLY"))
     );
+    let (status, body) = send(json_with_token(
+        "PUT",
+        "/api/network/teams/team-x",
+        json!({"enabled": true}),
+        &phone,
+        "c",
+    ))
+    .await;
+    assert_eq!(
+        (status, body["code"].clone()),
+        (StatusCode::FORBIDDEN, json!("NETWORK_OWNER_ONLY"))
+    );
     let (status, _) = send(json_with_token("PUT", "/api/network/status", rename, &desktop, "c")).await;
     assert_eq!(status, StatusCode::OK);
 }
@@ -321,6 +333,9 @@ async fn an_agent_helper_token_cannot_manage_devices_or_lan_trust() {
         ("POST", "/api/network/peers/peer-x/revoke", json!({})),
         ("DELETE", "/api/network/peers/peer-x", json!(null)),
         ("DELETE", "/api/network/shares/share-x", json!(null)),
+        ("PUT", "/api/network/teams/team-x", json!({"enabled": true})),
+        ("GET", "/api/network/teams/team-x/invitations", json!(null)),
+        ("DELETE", "/api/network/teams/team-x/invitations/poll-x", json!(null)),
     ] {
         let (status, resp) = send(helper_request(method, uri, body, &helper)).await;
         assert_eq!((status, resp["code"].clone()), network_owner_only, "{method} {uri}");
@@ -345,6 +360,11 @@ async fn an_agent_helper_token_cannot_manage_devices_or_lan_trust() {
     ))
     .await;
     assert_eq!(status, StatusCode::OK);
+    let (status, body) = send(json_with_token(
+        "GET", "/api/network/teams/team-x/invitations", json!(null), &desktop, "c",
+    )).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["data"].is_null());
 }
 
 #[tokio::test]

@@ -3,13 +3,27 @@
 //! conversation or agent crates directly.
 
 use aionui_api_types::{
-    PeerHelloResponse, PeerPairingRequest, PeerPairingResponse, PeerPairingReveal, PeerPairingRevealResponse,
-    PeerRequestStatus, PeerSharesResponse, PeerSubmitRequest, WaitingKind,
+    LanTeam, PeerHelloResponse, PeerInvitationVoteRequest, PeerInvitationVoteResponse, PeerPairingRequest,
+    PeerPairAttestationRequest, PeerPairingResponse, PeerPairingReveal, PeerPairingRevealResponse, PeerRequestStatus, PeerSharesResponse,
+    PeerSubmitRequest, PeerTeamInvitation, WaitingKind,
 };
 use aionui_peer::Fingerprint;
 use tokio::sync::mpsc;
 
 use crate::error::NetworkError;
+
+/// Delivers to a local team, atomically rechecking membership and recording the request receipt.
+#[async_trait::async_trait]
+pub trait LanTeamMessageSink: Send + Sync {
+    async fn recover_team(&self, _owner: &str, _team_id: &str) -> Result<(), NetworkError> {
+        Ok(())
+    }
+    async fn sync_member(&self, _owner: &str, _member: &aionui_db::ActiveLanTeamMember) -> Result<(), NetworkError> {
+        Ok(())
+    }
+    async fn deliver(&self, owner: &str, peer_id: &str, fingerprint: &str, message: &aionui_api_types::PeerTeamMessage)
+        -> Result<aionui_api_types::PeerTeamMessageResponse, NetworkError>;
+}
 
 /// The owner-host conversation that runs a shared agent for one peer thread.
 #[derive(Debug, Clone)]
@@ -63,6 +77,8 @@ pub trait RemoteTurnRunner: Send + Sync {
 /// Outgoing peer-protocol calls (requester side), over mutual TLS.
 #[async_trait::async_trait]
 pub trait PeerTransport: Send + Sync {
+    async fn send_team_message(&self, url: &str, expected: &Fingerprint, body: &aionui_api_types::PeerTeamMessage)
+        -> Result<aionui_api_types::PeerTeamMessageResponse, NetworkError>;
     /// First contact: accept any server certificate and report its fingerprint.
     async fn observe(&self, url: &str) -> Result<(Fingerprint, PeerHelloResponse), NetworkError>;
     async fn pair(
@@ -79,6 +95,17 @@ pub trait PeerTransport: Send + Sync {
         body: &PeerPairingReveal,
     ) -> Result<PeerPairingRevealResponse, NetworkError>;
     async fn list_shares(&self, url: &str, expected: &Fingerprint) -> Result<PeerSharesResponse, NetworkError>;
+    async fn list_teams(&self, url: &str, expected: &Fingerprint) -> Result<Vec<LanTeam>, NetworkError>;
+    async fn list_team_invitations(&self, url: &str, expected: &Fingerprint) -> Result<Vec<PeerTeamInvitation>, NetworkError>;
+    async fn vote_invitation(
+        &self,
+        url: &str,
+        expected: &Fingerprint,
+        body: &PeerInvitationVoteRequest,
+    ) -> Result<PeerInvitationVoteResponse, NetworkError>;
+    async fn attest_team_pairs(
+        &self, url: &str, expected: &Fingerprint, body: &PeerPairAttestationRequest,
+    ) -> Result<PeerInvitationVoteResponse, NetworkError>;
     async fn submit(
         &self,
         url: &str,

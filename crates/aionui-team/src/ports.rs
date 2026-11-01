@@ -11,6 +11,9 @@ use crate::error::TeamError;
 
 #[derive(Debug, Clone)]
 pub struct TeamRemoteMessage {
+    pub team_id: String,
+    pub from_slot_id: String,
+    pub to_slot_id: String,
     pub peer_id: String,
     pub share_id: String,
     pub share_label: String,
@@ -22,6 +25,7 @@ pub struct TeamRemoteMessage {
 pub struct TeamRemoteResult {
     pub thread_id: String,
     pub result_text: Option<String>,
+    pub persisted_message: Option<aionui_db::models::MailboxMessageRow>,
 }
 
 #[async_trait]

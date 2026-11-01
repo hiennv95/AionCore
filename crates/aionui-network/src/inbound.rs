@@ -12,7 +12,7 @@
 //!   re-checked by the sweep while a turn runs; revoke/unshare cancel at once.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aionui_api_types::{
@@ -30,7 +30,7 @@ use tracing::{debug, info, warn};
 use crate::error::NetworkError;
 use crate::host::HostContext;
 use crate::policy::{self, codes};
-use crate::ports::{RemoteConversationSpec, RemoteTurnRunner, TurnEvent};
+use crate::ports::{LanTeamMessageSink, RemoteConversationSpec, RemoteTurnRunner, TurnEvent};
 
 /// Why a running turn is being stopped.
 type CancelReason = Option<&'static str>;
@@ -47,6 +47,7 @@ pub struct InboundService {
     running: Mutex<HashMap<String, watch::Sender<CancelReason>>>,
     /// Pairing exchanges waiting for the initiator's reveal, by caller fingerprint (ADR-016).
     pairings: Mutex<HashMap<String, PairingExchange>>,
+    team_sink: OnceLock<Arc<dyn LanTeamMessageSink>>,
 }
 
 /// The responder's half of a commit-then-reveal pairing exchange (ADR-016).
@@ -67,7 +68,51 @@ impl InboundService {
             changes: watch::channel(0).0,
             running: Mutex::new(HashMap::new()),
             pairings: Mutex::new(HashMap::new()),
+            team_sink: OnceLock::new(),
         }
+    }
+
+    pub fn set_team_sink(&self, sink: Arc<dyn LanTeamMessageSink>) -> Result<(), Arc<dyn LanTeamMessageSink>> {
+        self.team_sink.set(sink)
+    }
+
+    pub async fn sync_team_members(&self) -> Result<(), NetworkError> {
+        let Some(sink) = self.team_sink.get() else { return Ok(()) };
+        let owner = self.host.owner_user_id();
+        for member in self.repo.active_lan_team_members(owner).await? {
+            if let Err(error) = sink.sync_member(owner, &member).await {
+                debug!(team_id = %member.team_id, code = error.code(), "network: LAN team member sync deferred");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn recover_team_messages(&self) -> Result<(), NetworkError> {
+        let Some(sink) = self.team_sink.get() else { return Ok(()) };
+        let owner = self.host.owner_user_id();
+        for team_id in self.repo.teams_with_unread_lan_messages(owner).await? {
+            if let Err(error) = sink.recover_team(owner, &team_id).await {
+                warn!(%team_id, code = error.code(), "network: LAN team recovery deferred");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn receive_team_message(
+        &self, caller: &Fingerprint, body: aionui_api_types::PeerTeamMessage,
+    ) -> Result<aionui_api_types::PeerTeamMessageResponse, NetworkError> {
+        self.authorize(caller).await?;
+        if !policy::valid_request_id(&body.request_id) || body.team_id.trim().is_empty() || body.team_id.len() > 128
+            || body.remote_team_id.trim().is_empty() || body.remote_team_id.len() > 128 || body.content.trim().is_empty()
+        {
+            return Err(NetworkError::InvalidRequest("invalid team message".into()));
+        }
+        if body.content.len() > policy::MAX_CONTENT_BYTES { return Err(NetworkError::PayloadTooLarge); }
+        let owner = self.host.owner_user_id();
+        let peer_id = self.repo.authorized_lan_team_member(owner, &body.team_id, caller.as_str(), &body.remote_team_id)
+            .await?.ok_or(NetworkError::TeamNotFound)?;
+        let sink = self.team_sink.get().ok_or(NetworkError::Disabled)?;
+        sink.deliver(owner, &peer_id, caller.as_str(), &body).await
     }
 
     fn changed(&self) {
@@ -279,6 +324,111 @@ impl InboundService {
             })
             .collect();
         Ok(PeerSharesResponse { shares })
+    }
+
+    pub async fn list_teams(&self, caller: &Fingerprint) -> Result<Vec<aionui_api_types::LanTeam>, NetworkError> {
+        self.authorize(caller).await?;
+        Ok(self
+            .repo
+            .list_shared_teams(self.host.owner_user_id())
+            .await?
+            .into_iter()
+            .map(|(id, name)| aionui_api_types::LanTeam { id, name })
+            .collect())
+    }
+
+    pub async fn list_team_invitations(
+        &self,
+        caller: &Fingerprint,
+    ) -> Result<Vec<aionui_api_types::PeerTeamInvitation>, NetworkError> {
+        self.authorize(caller).await?;
+        let rows = self.repo.pending_team_invitations(self.host.owner_user_id(), caller.as_str()).await?;
+        let peers = self.repo.list_peers().await?;
+        let mut invitations = Vec::with_capacity(rows.len());
+        for row in rows {
+            let votes = self.repo.team_invitation_votes(self.host.owner_user_id(), &row.id).await?;
+            let ready_for_pairing = !votes.is_empty() && votes.iter().all(|(fingerprint, decision)| {
+                decision == "approved" && (fingerprint == self.host.fingerprint().as_str()
+                    || peers.iter().any(|peer| peer.fingerprint == *fingerprint && peer.state == PeerState::Trusted.as_str()))
+            });
+            let conversations = if ready_for_pairing {
+                self.repo.team_invitation_conversations(self.host.owner_user_id(), &row.id).await?
+            } else {
+                Vec::new()
+            };
+            let participants = votes.into_iter().map(|(fingerprint, decision)| {
+                let display_name = if fingerprint == self.host.fingerprint().as_str() {
+                    Some(self.host.display_name())
+                } else {
+                    peers.iter().find(|peer| peer.fingerprint == fingerprint).map(|peer| peer.display_name.clone())
+                };
+                let peer_url = ready_for_pairing.then(|| peers.iter()
+                    .find(|peer| peer.fingerprint == fingerprint && peer.state == PeerState::Trusted.as_str())
+                    .and_then(|peer| peer.peer_url.clone())).flatten();
+                let team_id = conversations.iter().find(|(member, _)| member == &fingerprint).map(|(_, id)| id.clone());
+                aionui_api_types::PeerInvitationParticipant { fingerprint, display_name, decision, peer_url, team_id }
+            }).collect();
+            let pairing_verified = self.repo.team_pair_attestations_complete(self.host.owner_user_id(), &row.id, now_ms() - 15_000).await?;
+            invitations.push(aionui_api_types::PeerTeamInvitation {
+                id: row.id,
+                state: row.state,
+                team_name: row.team_name,
+                candidate_fingerprint: row.candidate_fingerprint,
+                candidate_name: row.candidate_name,
+                decision: row.decision,
+                participants,
+                ready_for_pairing,
+                pairing_verified,
+            });
+        }
+        Ok(invitations)
+    }
+
+    pub async fn attest_team_pairs(
+        &self,
+        caller: &Fingerprint,
+        body: aionui_api_types::PeerPairAttestationRequest,
+    ) -> Result<aionui_api_types::PeerInvitationVoteResponse, NetworkError> {
+        self.authorize(caller).await?;
+        if !policy::valid_request_id(&body.invitation_id) || body.participants.is_empty() || body.participants.len() > 256
+            || body.participants.iter().any(|value| Fingerprint::parse(value).is_err())
+        {
+            return Err(NetworkError::InvalidRequest("invalid pair attestation".into()));
+        }
+        let participants = serde_json::to_string(&body.participants).map_err(|e| NetworkError::Internal(e.to_string()))?;
+        let owner = self.host.owner_user_id();
+        let recorded = self.repo.record_team_pair_attestation(owner, &body.invitation_id, caller.as_str(), &participants, false, now_ms()).await?;
+        if recorded {
+            let peers = self.repo.list_peers().await?;
+            if body.participants.iter().all(|fingerprint| fingerprint == self.host.fingerprint().as_str()
+                || peers.iter().any(|peer| peer.fingerprint == *fingerprint && peer.state == PeerState::Trusted.as_str()))
+            {
+                self.repo.record_team_pair_attestation(owner, &body.invitation_id, self.host.fingerprint().as_str(), &participants, true, now_ms()).await?;
+                if self.repo.complete_team_invitation(owner, &body.invitation_id, self.host.fingerprint().as_str(), now_ms() - 15_000).await? {
+                    info!(invitation_id = %body.invitation_id, "network: LAN team poll completed");
+                }
+            }
+        }
+        Ok(aionui_api_types::PeerInvitationVoteResponse { recorded })
+    }
+
+    pub async fn vote_invitation(
+        &self,
+        caller: &Fingerprint,
+        body: aionui_api_types::PeerInvitationVoteRequest,
+    ) -> Result<aionui_api_types::PeerInvitationVoteResponse, NetworkError> {
+        self.authorize(caller).await?;
+        if !policy::valid_request_id(&body.invitation_id) {
+            return Err(NetworkError::InvalidRequest("invalid invitation id".into()));
+        }
+        if body.approve && body.team_id.as_deref().is_none_or(|id| id.trim().is_empty() || id.len() > 128) {
+            return Err(NetworkError::InvalidRequest("a conversation is required to approve".into()));
+        }
+        let recorded = self
+            .repo
+            .decide_team_invitation(self.host.owner_user_id(), &body.invitation_id, caller.as_str(), body.approve, body.team_id.as_deref().filter(|_| body.approve))
+            .await?;
+        Ok(aionui_api_types::PeerInvitationVoteResponse { recorded })
     }
 
     pub async fn submit(

@@ -48,7 +48,7 @@ pub use repository::cron::{
 };
 pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::network::{
-    InsertInboundParams, InsertOutboundParams, InsertPeerParams, InsertShareParams, OutboundUpdate, RequestUpdate,
+    ActiveLanTeamMember, InsertInboundParams, InsertOutboundParams, InsertPeerParams, InsertShareParams, LanMessageEnqueue, LanTeamOutboxRow, OutboundUpdate, RequestUpdate,
     UpdatePeerParams,
 };
 pub use repository::oauth_token::UpsertOAuthTokenParams;

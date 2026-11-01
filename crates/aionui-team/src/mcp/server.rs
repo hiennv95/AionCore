@@ -14,7 +14,7 @@ use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
 use crate::tool_executor::{TeamToolContext, TeamToolExecutor, team_tool_call_from_name};
-use crate::types::{MailboxMessage, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus};
+use crate::types::{MailboxMessage, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus, decode_remote_agent};
 use crate::work_source::WorkSource;
 
 use super::protocol::{
@@ -845,10 +845,16 @@ async fn exec_send_message(
         .ok_or_else(|| ToolCallError::from_message("Team service not available; cannot wake target"))?;
 
     let targets = if resolved_to == "*" {
-        scheduler
-            .list_agents()
-            .await
-            .iter()
+        let agents = scheduler.list_agents().await;
+        if agents.iter().any(|agent| agent.slot_id != caller_slot_id && decode_remote_agent(agent).is_some()) {
+            if !agents.iter().any(|agent| agent.slot_id == caller_slot_id && agent.role == TeammateRole::Lead && decode_remote_agent(agent).is_none()) {
+                return Err(ToolCallError::from_message("only the local leader can message a LAN leader"));
+            }
+            if !input.files.is_empty() {
+                return Err(ToolCallError::from_message("files are not supported for LAN team messages"));
+            }
+        }
+        agents.iter()
             .filter(|a| a.slot_id != caller_slot_id)
             .map(|a| a.slot_id.clone())
             .collect::<Vec<_>>()
@@ -935,6 +941,7 @@ fn agent_json(agent: &TeamAgent) -> Value {
         "slot_id": agent.slot_id,
         "name": agent.name,
         "role": agent.role,
+        "kind": if decode_remote_agent(agent).is_some() { "lan_leader" } else { "local" },
         "status": status,
         "assistant_id": agent.assistant_id,
         "model": agent.model,

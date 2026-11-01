@@ -69,6 +69,12 @@ impl From<TeamError> for ApiError {
                 format!("Team agent runtime is not ready for conversation: {conversation_id}"),
                 Some(serde_json::json!({ "conversation_id": conversation_id })),
             ),
+            TeamError::SessionResumeUnsupported => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TEAM_SESSION_RESUME_UNSUPPORTED",
+                aionui_api_types::TEAM_SESSION_RESUME_UNSUPPORTED,
+                None,
+            ),
             TeamError::MemberRuntimeFailed {
                 team_id,
                 slot_id,

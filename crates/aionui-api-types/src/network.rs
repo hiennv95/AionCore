@@ -3,6 +3,88 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerTeamMessage {
+    pub request_id: String,
+    pub team_id: String,
+    pub remote_team_id: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerTeamMessageResponse {
+    pub duplicate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanTeamDeliveryStatus {
+    pub message_id: String,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateLanTeamInvitationRequest {
+    pub peer_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateLanTeamInvitationResponse {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingLocalLanInvitation {
+    pub id: String,
+    pub candidate_fingerprint: String,
+    pub state: String,
+    pub participants: Vec<PeerInvitationParticipant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInvitationParticipant {
+    pub fingerprint: String,
+    pub display_name: Option<String>,
+    pub decision: String,
+    pub peer_url: Option<String>,
+    #[serde(default)]
+    pub team_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerTeamInvitation {
+    pub id: String,
+    #[serde(default)]
+    pub state: String,
+    pub team_name: String,
+    pub candidate_fingerprint: String,
+    pub candidate_name: Option<String>,
+    pub decision: String,
+    pub participants: Vec<PeerInvitationParticipant>,
+    pub ready_for_pairing: bool,
+    pub pairing_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerPairAttestationRequest {
+    pub invitation_id: String,
+    pub participants: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInvitationVoteRequest {
+    pub invitation_id: String,
+    pub approve: bool,
+    #[serde(default)]
+    pub team_id: Option<String>,
+    #[serde(default)]
+    pub participants: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInvitationVoteResponse {
+    pub recorded: bool,
+}
+
 /// Version of the host-to-host request contract carried in every peer body.
 pub const PEER_CONTRACT_VERSION: u32 = 2;
 
@@ -160,6 +242,20 @@ pub struct AddPeerRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddPinnedPeerRequest {
+    pub url: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredLanPeer {
+    pub url: String,
+    pub fingerprint: String,
+    pub display_name: String,
+    pub state: Option<PeerState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareView {
     pub id: String,
     pub peer_id: String,
@@ -311,6 +407,18 @@ pub struct PeerShareEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerSharesResponse {
     pub shares: Vec<PeerShareEntry>,
+}
+
+/// A conversation whose owner has enabled LAN collaboration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanTeam {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetLanTeamSharingRequest {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

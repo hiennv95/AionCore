@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aionui_api_types::{
-    PeerErrorBody, PeerHelloResponse, PeerPairingRequest, PeerPairingResponse, PeerPairingReveal,
-    PeerPairingRevealResponse, PeerRequestStatus, PeerSharesResponse, PeerSubmitRequest,
+    LanTeam, PeerErrorBody, PeerHelloResponse, PeerInvitationVoteRequest, PeerInvitationVoteResponse,
+    PeerPairAttestationRequest, PeerPairingRequest, PeerPairingResponse, PeerPairingReveal, PeerPairingRevealResponse, PeerRequestStatus,
+    PeerSharesResponse, PeerSubmitRequest, PeerTeamInvitation,
 };
 use aionui_peer::{Fingerprint, PeerIdentity, ServerPin, client_config};
 use serde::Serialize;
@@ -138,6 +139,10 @@ fn describe(error: &reqwest::Error) -> String {
 
 #[async_trait::async_trait]
 impl PeerTransport for HttpsPeerTransport {
+    async fn send_team_message(&self, url: &str, expected: &Fingerprint, body: &aionui_api_types::PeerTeamMessage)
+        -> Result<aionui_api_types::PeerTeamMessageResponse, NetworkError> {
+        self.post(expected, url, "/peer/v1/team-messages", body).await
+    }
     async fn observe(&self, url: &str) -> Result<(Fingerprint, PeerHelloResponse), NetworkError> {
         let slot = Arc::new(Mutex::new(None));
         let client = self.build(ServerPin::Observe(slot.clone()))?;
@@ -175,6 +180,31 @@ impl PeerTransport for HttpsPeerTransport {
     async fn list_shares(&self, url: &str, expected: &Fingerprint) -> Result<PeerSharesResponse, NetworkError> {
         let client = self.pinned(expected)?;
         self.call(client.get(join(url, "/peer/v1/shares")), CALL_TIMEOUT).await
+    }
+
+    async fn list_teams(&self, url: &str, expected: &Fingerprint) -> Result<Vec<LanTeam>, NetworkError> {
+        let client = self.pinned(expected)?;
+        self.call(client.get(join(url, "/peer/v1/teams")), CALL_TIMEOUT).await
+    }
+
+    async fn list_team_invitations(&self, url: &str, expected: &Fingerprint) -> Result<Vec<PeerTeamInvitation>, NetworkError> {
+        let client = self.pinned(expected)?;
+        self.call(client.get(join(url, "/peer/v1/team-invitations")), CALL_TIMEOUT).await
+    }
+
+    async fn vote_invitation(
+        &self,
+        url: &str,
+        expected: &Fingerprint,
+        body: &PeerInvitationVoteRequest,
+    ) -> Result<PeerInvitationVoteResponse, NetworkError> {
+        self.post(expected, url, "/peer/v1/team-invitation-votes", body).await
+    }
+
+    async fn attest_team_pairs(
+        &self, url: &str, expected: &Fingerprint, body: &PeerPairAttestationRequest,
+    ) -> Result<PeerInvitationVoteResponse, NetworkError> {
+        self.post(expected, url, "/peer/v1/team-pair-attestations", body).await
     }
 
     async fn submit(

@@ -20,7 +20,7 @@ pub use host::{HostContext, NetworkSettings};
 pub use inbound::InboundService;
 pub use outbound::OutboundService;
 pub use peer_routes::peer_routes;
-pub use ports::{PeerTransport, RemoteConversationSpec, RemoteTurnRunner, TurnEvent};
+pub use ports::{LanTeamMessageSink, PeerTransport, RemoteConversationSpec, RemoteTurnRunner, TurnEvent};
 pub use routes::{NetworkRouterState, network_routes};
 pub use service::NetworkService;
 pub use transport::HttpsPeerTransport;

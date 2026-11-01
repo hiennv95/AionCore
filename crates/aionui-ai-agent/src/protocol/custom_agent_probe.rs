@@ -58,10 +58,9 @@ pub async fn try_connect_custom_agent(
 /// As [`try_connect_custom_agent`], plus the catalog the probe's `session/new`
 /// advertised. The probe already pays for a full spawn + `initialize` +
 /// `session/new`; callers that persist agent metadata use this variant so that
-/// data is stored instead of thrown away. The partial is `Some` only on a
-/// successful session whose agent advertised at least one of modes / models /
-/// config options — an auth-gated or failing probe yields `None`, never an
-/// empty write that would blank an existing catalog.
+/// data is stored instead of thrown away. A successful session includes the
+/// initialize capabilities even when it advertises no catalog options; an
+/// auth-gated or failing probe yields `None`.
 pub async fn try_connect_custom_agent_with_catalog(
     command: &str,
     args: &[String],
@@ -252,14 +251,16 @@ async fn run_handshake(proc: &CliAgentProcess) -> ProbeOutcome {
             let models = legacy_models
                 .as_ref()
                 .and_then(crate::manager::acp::legacy_session_model::LegacySessionModelState::from_state_value);
-            ProbeOutcome::Ok(
-                crate::manager::acp::catalog_forwarder::catalog_partial_from_session_new(
-                    response.modes.as_ref(),
-                    models.as_ref(),
-                    response.config_options.as_deref(),
-                )
-                .map(Box::new),
+            let mut handshake = crate::manager::acp::catalog_forwarder::catalog_partial_from_session_new(
+                response.modes.as_ref(),
+                models.as_ref(),
+                response.config_options.as_deref(),
             )
+            .unwrap_or_default();
+            handshake.agent_capabilities = protocol
+                .agent_capabilities()
+                .and_then(|caps| serde_json::to_value(caps).ok());
+            ProbeOutcome::Ok(Some(Box::new(handshake)))
         }
         Err(AcpError::AuthRequired) => {
             ProbeOutcome::Auth("Agent reachable but requires login/authorization".to_string())

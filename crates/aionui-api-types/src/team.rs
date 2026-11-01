@@ -1239,6 +1239,9 @@ mod tests {
             model: "claude".into(),
             assistant_id: Some("assistant-x".into()),
             status: Some("idle".into()),
+            remote_peer_id: None,
+            remote_share_id: None,
+            remote_share_label: None,
             pending_confirmations: 2,
             context_reset: TeamContextResetCapability {
                 supported: true,
@@ -1275,6 +1278,9 @@ mod tests {
             model: "claude".into(),
             assistant_id: None,
             status: None,
+            remote_peer_id: None,
+            remote_share_id: None,
+            remote_share_label: None,
             pending_confirmations: 0,
             context_reset: TeamContextResetCapability {
                 supported: true,
@@ -1305,6 +1311,9 @@ mod tests {
                 model: "claude".into(),
                 assistant_id: Some("assistant-x".into()),
                 status: None,
+                remote_peer_id: None,
+                remote_share_id: None,
+                remote_share_label: None,
                 pending_confirmations: 0,
                 context_reset: TeamContextResetCapability {
                     supported: false,
@@ -1373,6 +1382,9 @@ mod tests {
                 model: "opus".into(),
                 assistant_id: None,
                 status: Some("idle".into()),
+                remote_peer_id: None,
+                remote_share_id: None,
+                remote_share_label: None,
                 pending_confirmations: 0,
                 context_reset: TeamContextResetCapability {
                     supported: true,
@@ -1428,6 +1440,9 @@ mod tests {
             model: "claude".into(),
             assistant_id: Some("custom-1".into()),
             status: Some("working".into()),
+            remote_peer_id: None,
+            remote_share_id: None,
+            remote_share_label: None,
             pending_confirmations: 1,
             context_reset: TeamContextResetCapability {
                 supported: false,
@@ -1458,6 +1473,9 @@ mod tests {
                     model: "claude".into(),
                     assistant_id: None,
                     status: None,
+                    remote_peer_id: None,
+                    remote_share_id: None,
+                    remote_share_label: None,
                     pending_confirmations: 0,
                     context_reset: TeamContextResetCapability {
                         supported: false,
@@ -1476,6 +1494,9 @@ mod tests {
                     model: "claude".into(),
                     assistant_id: Some("x".into()),
                     status: Some("idle".into()),
+                    remote_peer_id: None,
+                    remote_share_id: None,
+                    remote_share_label: None,
                     pending_confirmations: 3,
                     context_reset: TeamContextResetCapability {
                         supported: true,
@@ -1520,6 +1541,9 @@ mod tests {
                 model: "sonnet".into(),
                 assistant_id: None,
                 status: None,
+                remote_peer_id: None,
+                remote_share_id: None,
+                remote_share_label: None,
                 pending_confirmations: 0,
                 context_reset: TeamContextResetCapability {
                     supported: true,

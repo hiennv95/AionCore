@@ -155,11 +155,11 @@ pub use mcp::{
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
 pub use network::{
-    AddPeerRequest, CreateShareRequest, InboundRequestView, NetworkStatusResponse, OutboundRequestView,
-    PEER_CONTRACT_VERSION, PeerErrorBody, PeerHelloResponse, PeerPairingRequest, PeerPairingResponse,
-    PeerPairingReveal, PeerPairingRevealResponse, PeerRequestStatus, PeerShareEntry, PeerSharesResponse, PeerState,
-    PeerSubmitRequest, PeerView, RemoteAgentView, RemoteRequestState, SendRemoteRequest, ShareView,
-    UpdateNetworkSettingsRequest, WaitingKind,
+    AddPeerRequest, AddPinnedPeerRequest, CreateLanTeamInvitationRequest, CreateLanTeamInvitationResponse, CreateShareRequest, DiscoveredLanPeer, InboundRequestView, LanTeam, NetworkStatusResponse, OutboundRequestView,
+    PEER_CONTRACT_VERSION, PeerErrorBody, PeerHelloResponse, PeerInvitationParticipant, PeerInvitationVoteRequest, PeerInvitationVoteResponse,
+    PeerPairAttestationRequest, PeerPairingRequest, PeerPairingResponse, PeerPairingReveal, PeerPairingRevealResponse, PeerRequestStatus, PeerShareEntry, PeerSharesResponse, PeerState,
+    LanTeamDeliveryStatus, PendingLocalLanInvitation, PeerSubmitRequest, PeerTeamInvitation, PeerTeamMessage, PeerTeamMessageResponse, PeerView, RemoteAgentView, RemoteRequestState, SendRemoteRequest, SetLanTeamSharingRequest,
+    ShareView, UpdateNetworkSettingsRequest, WaitingKind,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
@@ -240,7 +240,7 @@ pub use team::{
     TeamSlotBlockedReason, TeamSlotWorkChangedPayload, TeamSlotWorkPayload, TeamSlotWorkState, TeamTaskChange,
     TeamTaskChangedPayload, TeamTaskResponse, TeammateMessagePayload, assistant_mcp_binding_fingerprint,
 };
-pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
+pub use team_mcp::{TEAM_MCP_SERVER_NAME, TEAM_SESSION_RESUME_UNSUPPORTED, TeamMcpStdioConfig};
 pub use team_tools::{
     TEAM_DESCRIBE_ASSISTANT_DESCRIPTION, TEAM_LIST_ASSISTANTS_DESCRIPTION, TEAM_SPAWN_AGENT_DESCRIPTION,
     TEAM_TOOLS_SCHEMA_VERSION, TeamToolCall, TeamToolCliEnvelope, TeamToolCliMeta, TeamToolContextResponse,

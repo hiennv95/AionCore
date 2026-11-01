@@ -964,6 +964,64 @@ impl TeamSession {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn receive_lan_message(
+        &self, network: &dyn aionui_db::INetworkRepository, fingerprint: &str, remote_team_id: &str,
+        request_id: &str, from_slot_id: &str, to_slot_id: &str, content: &str,
+    ) -> Result<bool, TeamError> {
+        let to_agent = self.scheduler.get_agent(to_slot_id).await?;
+        let from_agent = self.scheduler.get_agent(from_slot_id).await?;
+        self.ensure_member_runtime_lazy(to_slot_id, true).await?;
+        self.publish_runtime_constraint(to_slot_id).await?;
+        let lease = self.work_coordinator.acquire_enqueue(EnqueueRequest {
+            slot_id: to_slot_id.to_owned(), role: target_role_for(to_agent.role), source: WorkSource::McpSendMessage,
+            binding: CausalBinding::InheritRunningBatch { caller_slot_id: from_slot_id.to_owned() },
+        })?;
+        let row = aionui_db::models::MailboxMessageRow {
+            id: generate_id(), team_id: self.team.id.clone(), to_agent_id: to_slot_id.to_owned(),
+            from_agent_id: from_slot_id.to_owned(), msg_type: MailboxMessageType::Message.to_string(),
+            content: content.to_owned(), summary: None, files: None, read: false, created_at: aionui_common::now_ms(),
+        };
+        let result = network.enqueue_lan_team_message(&self.user_id, fingerprint, remote_team_id, request_id, &row).await;
+        match result {
+            Ok(aionui_db::LanMessageEnqueue::Inserted) => {}
+            Ok(aionui_db::LanMessageEnqueue::Duplicate) => {
+                self.work_coordinator.abort_enqueue(&lease, "duplicate_lan_message");
+                self.event_loops.notify(to_slot_id);
+                return Ok(true);
+            }
+            Ok(aionui_db::LanMessageEnqueue::Conflict) => {
+                self.work_coordinator.abort_enqueue(&lease, "conflicting_lan_message");
+                return Err(TeamError::InvalidRequest("LAN message request id conflicts".into()));
+            }
+            Ok(aionui_db::LanMessageEnqueue::Unauthorized) => {
+                self.work_coordinator.abort_enqueue(&lease, "unauthorized_lan_message");
+                return Err(TeamError::Forbidden("LAN membership is no longer active".into()));
+            }
+            Err(error) => {
+                self.work_coordinator.abort_enqueue(&lease, "lan_mailbox_write_failed");
+                return Err(error.into());
+            }
+        }
+        TeamEventEmitter::new(self.team.id.clone(), self.user_id.clone(), self.broadcaster.clone())
+            .broadcast_mailbox_changed(crate::activity_mapping::mailbox_row_to_response(&row), aionui_api_types::TeamMailboxChange::Created);
+        let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
+        let request = TeamProjectionRequest {
+            user_id: self.user_id.clone(), team_id: self.team.id.clone(), slot_id: to_slot_id.to_owned(),
+            conversation_id: to_agent.conversation_id.clone(),
+            source: TeamProjectionSource::Teammate { from_slot_id: from_slot_id.to_owned(), from_name: from_agent.name,
+                sender_backend: Some(from_agent.backend), sender_conversation_id: Some(from_agent.conversation_id) },
+            content: content.to_owned(), files: Vec::new(), visibility: crate::visibility::TeamVisibilityPolicy::teammate_message(),
+            dedupe_key: Some(teammate_dedupe_key(&self.team.id, &row.id, &to_agent.conversation_id)),
+        };
+        if let Err(error) = projection.project(request).await {
+            warn!(team_id = %self.team.id, mailbox_message_id = %row.id, error = %error, "LAN team message projection failed");
+        }
+        self.commit_persisted_enqueue(&lease, row.id).await?;
+        self.event_loops.notify(to_slot_id);
+        Ok(false)
+    }
+
     pub(crate) async fn shutdown_agent(
         &self,
         caller_slot_id: &str,
@@ -2429,6 +2487,12 @@ async fn attach_member_runtime_inner(
 }
 
 fn sanitize_member_runtime_failure(error: &TeamError) -> MemberRuntimeFailure {
+    if let TeamError::SessionResumeUnsupported = error {
+        return MemberRuntimeFailure {
+            classification: "session_resume_unsupported",
+            public_reason: aionui_api_types::TEAM_SESSION_RESUME_UNSUPPORTED.to_owned(),
+        };
+    }
     let classification = match error {
         TeamError::Database(_) => "runtime_configuration_failed",
         TeamError::SessionNotFound(_) => "session_stopped",
@@ -2486,6 +2550,15 @@ mod tests {
     use aionui_api_types::WebSocketMessage;
     use aionui_common::{AgentKillReason, TimestampMs};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn unsupported_team_resume_has_safe_actionable_reason() {
+        let failure = sanitize_member_runtime_failure(&TeamError::SessionResumeUnsupported);
+        assert_eq!(failure.classification, "session_resume_unsupported");
+        assert_eq!(failure.public_reason, aionui_api_types::TEAM_SESSION_RESUME_UNSUPPORTED);
+        let other = sanitize_member_runtime_failure(&TeamError::InvalidRequest("private detail".into()));
+        assert_eq!(other.public_reason, "Agent runtime failed to start");
+    }
 
     struct NullBroadcaster;
     impl EventBroadcaster for NullBroadcaster {

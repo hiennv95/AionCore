@@ -1,6 +1,6 @@
 use super::TeammateManager;
 use crate::error::TeamError;
-use crate::types::{MailboxMessage, MailboxMessageType, TeammateRole};
+use crate::types::{MailboxMessage, MailboxMessageType, TeammateRole, decode_remote_agent};
 
 impl TeammateManager {
     pub async fn create_task(
@@ -10,6 +10,7 @@ impl TeammateManager {
         owner: Option<&str>,
         blocked_by: &[String],
     ) -> Result<crate::types::TeamTask, TeamError> {
+        self.ensure_local_task_owner(owner).await?;
         self.task_board
             .create_task(&self.team_id, subject, description, owner, blocked_by)
             .await
@@ -26,6 +27,7 @@ impl TeammateManager {
         use crate::task_board::TaskUpdate;
         use crate::types::TaskStatus;
 
+        self.ensure_local_task_owner(owner.as_deref()).await?;
         let update = TaskUpdate {
             status: status.and_then(TaskStatus::parse),
             description,
@@ -34,6 +36,18 @@ impl TeammateManager {
             ..Default::default()
         };
         self.task_board.update_task(&self.team_id, task_id, &update).await
+    }
+
+    async fn ensure_local_task_owner(&self, owner: Option<&str>) -> Result<(), TeamError> {
+        if let Some(owner) = owner
+            && let Some(slot) = self.slots.lock().await.get(owner)
+            && decode_remote_agent(&slot.agent).is_some()
+        {
+            return Err(TeamError::InvalidRequest(
+                "remote leaders have separate task boards; use team_send_message instead".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Finalizes an agent turn by marking the slot idle. The leader re-wake and

@@ -27,6 +27,11 @@ pub fn peer_routes(inbound: Arc<InboundService>) -> Router {
         .route("/peer/v1/pairing", post(pair))
         .route("/peer/v1/pairing/reveal", post(reveal))
         .route("/peer/v1/shares", get(shares))
+        .route("/peer/v1/teams", get(teams))
+        .route("/peer/v1/team-invitation-votes", post(vote_invitation))
+        .route("/peer/v1/team-pair-attestations", post(attest_team_pairs))
+        .route("/peer/v1/team-invitations", get(team_invitations))
+        .route("/peer/v1/team-messages", post(team_message))
         .route("/peer/v1/requests", post(submit))
         .route("/peer/v1/requests/{request_id}", get(status))
         .route("/peer/v1/requests/{request_id}/cancel", post(cancel))
@@ -87,6 +92,44 @@ async fn shares(
     Extension(caller): Extension<PeerCaller>,
 ) -> PeerResult<aionui_api_types::PeerSharesResponse> {
     Ok(Json(inbound.list_shares(&caller.fingerprint).await?))
+}
+
+async fn teams(
+    State(inbound): State<Arc<InboundService>>,
+    Extension(caller): Extension<PeerCaller>,
+) -> PeerResult<Vec<aionui_api_types::LanTeam>> {
+    Ok(Json(inbound.list_teams(&caller.fingerprint).await?))
+}
+
+async fn team_invitations(
+    State(inbound): State<Arc<InboundService>>,
+    Extension(caller): Extension<PeerCaller>,
+) -> PeerResult<Vec<aionui_api_types::PeerTeamInvitation>> {
+    Ok(Json(inbound.list_team_invitations(&caller.fingerprint).await?))
+}
+
+async fn team_message(
+    State(inbound): State<Arc<InboundService>>,
+    Extension(caller): Extension<PeerCaller>,
+    Json(body): Json<aionui_api_types::PeerTeamMessage>,
+) -> PeerResult<aionui_api_types::PeerTeamMessageResponse> {
+    Ok(Json(inbound.receive_team_message(&caller.fingerprint, body).await?))
+}
+
+async fn vote_invitation(
+    State(inbound): State<Arc<InboundService>>,
+    Extension(caller): Extension<PeerCaller>,
+    Json(body): Json<aionui_api_types::PeerInvitationVoteRequest>,
+) -> PeerResult<aionui_api_types::PeerInvitationVoteResponse> {
+    Ok(Json(inbound.vote_invitation(&caller.fingerprint, body).await?))
+}
+
+async fn attest_team_pairs(
+    State(inbound): State<Arc<InboundService>>,
+    Extension(caller): Extension<PeerCaller>,
+    Json(body): Json<aionui_api_types::PeerPairAttestationRequest>,
+) -> PeerResult<aionui_api_types::PeerInvitationVoteResponse> {
+    Ok(Json(inbound.attest_team_pairs(&caller.fingerprint, body).await?))
 }
 
 async fn submit(

@@ -16,6 +16,8 @@ pub enum NetworkError {
     PeerRevoked,
     #[error("peer not found")]
     PeerNotFound,
+    #[error("team not found")]
+    TeamNotFound,
     #[error("too many pending pairing requests")]
     PairingLimit,
     #[error("the fingerprint presented by the peer changed")]
@@ -56,6 +58,7 @@ impl NetworkError {
             Self::PeerUntrusted => "PEER_UNTRUSTED",
             Self::PeerRevoked => "PEER_REVOKED",
             Self::PeerNotFound => "PEER_NOT_FOUND",
+            Self::TeamNotFound => "TEAM_NOT_FOUND",
             Self::PairingLimit => "PAIRING_LIMIT",
             Self::FingerprintMismatch => "FINGERPRINT_MISMATCH",
             Self::ShareNotFound => "SHARE_NOT_FOUND",
@@ -77,7 +80,7 @@ impl NetworkError {
         match self {
             Self::InvalidRequest(_) | Self::VersionUnsupported => 400,
             Self::OwnerOnly | Self::PeerUntrusted | Self::PeerRevoked | Self::FingerprintMismatch => 403,
-            Self::PeerNotFound | Self::ShareNotFound | Self::RequestNotFound => 404,
+            Self::PeerNotFound | Self::TeamNotFound | Self::ShareNotFound | Self::RequestNotFound => 404,
             Self::Disabled | Self::RequestConflict | Self::AlreadyFinished => 409,
             Self::PayloadTooLarge => 413,
             Self::PairingLimit | Self::QueueFull => 429,
