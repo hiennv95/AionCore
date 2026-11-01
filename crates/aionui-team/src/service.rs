@@ -1111,7 +1111,7 @@ impl TeamSessionService {
                 .find(|agent| agent.slot_id == slot_id)
                 .cloned()
                 .ok_or_else(|| TeamError::AgentNotFound(slot_id.into()))?;
-            if removed.role == crate::types::TeammateRole::Lead {
+            if removed.role == crate::types::TeammateRole::Lead && decode_remote_agent(&removed).is_none() {
                 return Err(TeamError::InvalidRequest("cannot remove the team lead".into()));
             }
             let session = self.sessions.get(team_id).map(|entry| Arc::clone(&entry.session));
