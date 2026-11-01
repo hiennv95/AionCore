@@ -1,7 +1,9 @@
 use aionui_common::TimestampMs;
 
 use crate::error::DbError;
-use crate::models::{MailboxMessageRow, NetworkInboundRequestRow, NetworkOutboundRequestRow, NetworkPeerRow, NetworkShareRow};
+use crate::models::{
+    MailboxMessageRow, NetworkInboundRequestRow, NetworkOutboundRequestRow, NetworkPeerRow, NetworkShareRow,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanMessageEnqueue {
@@ -56,48 +58,84 @@ pub trait INetworkRepository: Send + Sync {
         local_fingerprint: &str,
         candidate_peer_id: &str,
     ) -> Result<(), DbError>;
-    async fn team_invitation_votes(
-        &self,
-        user_id: &str,
-        invitation_id: &str,
-    ) -> Result<Vec<(String, String)>, DbError>;
+    async fn team_invitation_votes(&self, user_id: &str, invitation_id: &str)
+    -> Result<Vec<(String, String)>, DbError>;
     async fn team_invitation_conversations(
         &self,
         user_id: &str,
         invitation_id: &str,
     ) -> Result<Vec<(String, String)>, DbError>;
     async fn team_invitation_team_id(&self, user_id: &str, invitation_id: &str) -> Result<Option<String>, DbError>;
-    async fn pending_local_team_invitation(&self, user_id: &str, team_id: &str) -> Result<Option<(String, String, String)>, DbError>;
+    async fn pending_local_team_invitation(
+        &self,
+        user_id: &str,
+        team_id: &str,
+    ) -> Result<Option<(String, String, String)>, DbError>;
     async fn cancel_team_invitation(&self, user_id: &str, team_id: &str, invitation_id: &str) -> Result<bool, DbError>;
     async fn record_team_poll_consent(
-        &self, user_id: &str, team_id: &str, coordinator: &str, invitation_id: &str, participants: &str,
+        &self,
+        user_id: &str,
+        team_id: &str,
+        coordinator: &str,
+        invitation_id: &str,
+        participants: &str,
     ) -> Result<bool, DbError>;
     async fn team_poll_consent(
-        &self, user_id: &str, coordinator: &str, invitation_id: &str,
+        &self,
+        user_id: &str,
+        coordinator: &str,
+        invitation_id: &str,
     ) -> Result<Option<(String, String)>, DbError>;
-    async fn remove_team_poll_consent(&self, user_id: &str, coordinator: &str, invitation_id: &str) -> Result<bool, DbError>;
+    async fn remove_team_poll_consent(
+        &self,
+        user_id: &str,
+        coordinator: &str,
+        invitation_id: &str,
+    ) -> Result<bool, DbError>;
     /// Apply an authenticated completed poll against the owner's persisted consent.
     async fn apply_team_poll_membership(
-        &self, user_id: &str, coordinator: &str, invitation_id: &str, local_fingerprint: &str,
+        &self,
+        user_id: &str,
+        coordinator: &str,
+        invitation_id: &str,
+        local_fingerprint: &str,
         members: &[(String, String)],
     ) -> Result<bool, DbError>;
     /// Resolve a currently trusted remote conversation member for message delivery.
     async fn authorized_lan_team_member(
-        &self, user_id: &str, team_id: &str, fingerprint: &str, remote_team_id: &str,
+        &self,
+        user_id: &str,
+        team_id: &str,
+        fingerprint: &str,
+        remote_team_id: &str,
     ) -> Result<Option<String>, DbError>;
     async fn active_lan_team_members(&self, user_id: &str) -> Result<Vec<ActiveLanTeamMember>, DbError>;
     /// Teams with an acknowledged LAN message that has not yet been read.
     async fn teams_with_unread_lan_messages(&self, user_id: &str) -> Result<Vec<String>, DbError>;
     /// Atomically authorize and persist a peer message and its idempotency receipt.
     async fn enqueue_lan_team_message(
-        &self, user_id: &str, fingerprint: &str, remote_team_id: &str, request_id: &str,
+        &self,
+        user_id: &str,
+        fingerprint: &str,
+        remote_team_id: &str,
+        request_id: &str,
         message: &MailboxMessageRow,
     ) -> Result<LanMessageEnqueue, DbError>;
     async fn enqueue_lan_team_outbound(
-        &self, id: &str, user_id: &str, team_id: &str, peer_id: &str, remote_team_id: &str, content: &str,
+        &self,
+        id: &str,
+        user_id: &str,
+        team_id: &str,
+        peer_id: &str,
+        remote_team_id: &str,
+        content: &str,
     ) -> Result<bool, DbError>;
     async fn enqueue_lan_team_outbound_with_mailbox(
-        &self, user_id: &str, peer_id: &str, remote_team_id: &str, message: &MailboxMessageRow,
+        &self,
+        user_id: &str,
+        peer_id: &str,
+        remote_team_id: &str,
+        message: &MailboxMessageRow,
     ) -> Result<bool, DbError>;
     async fn pending_lan_team_outbound(&self, now: i64, limit: i64) -> Result<Vec<LanTeamOutboxRow>, DbError>;
     async fn defer_lan_team_outbound(&self, id: &str, until: i64) -> Result<bool, DbError>;
@@ -105,12 +143,27 @@ pub trait INetworkRepository: Send + Sync {
     async fn lan_team_delivery_statuses(&self, user_id: &str, team_id: &str) -> Result<Vec<(String, String)>, DbError>;
     async fn list_team_poll_consents(&self, user_id: &str) -> Result<Vec<(String, String)>, DbError>;
     async fn record_team_pair_attestation(
-        &self, user_id: &str, invitation_id: &str, fingerprint: &str, participants: &str, local: bool, now: i64,
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+        fingerprint: &str,
+        participants: &str,
+        local: bool,
+        now: i64,
     ) -> Result<bool, DbError>;
-    async fn team_pair_attestations_complete(&self, user_id: &str, invitation_id: &str, since: i64) -> Result<bool, DbError>;
+    async fn team_pair_attestations_complete(
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+        since: i64,
+    ) -> Result<bool, DbError>;
     /// Complete a poll and update the coordinator roster in one transaction.
     async fn complete_team_invitation(
-        &self, user_id: &str, invitation_id: &str, local_fingerprint: &str, since: i64,
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+        local_fingerprint: &str,
+        since: i64,
     ) -> Result<bool, DbError>;
     async fn pending_team_invitations(
         &self,

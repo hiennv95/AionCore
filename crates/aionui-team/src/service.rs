@@ -463,18 +463,38 @@ impl TeamSessionService {
     }
 
     pub async fn ensure_lan_member(
-        &self, user_id: &str, team_id: &str, peer_id: &str, peer_name: &str, remote_team_id: &str,
+        &self,
+        user_id: &str,
+        team_id: &str,
+        peer_id: &str,
+        peer_name: &str,
+        remote_team_id: &str,
     ) -> Result<(), TeamError> {
-        let base = if peer_name.trim().is_empty() { "LAN" } else { peer_name.trim() };
+        let base = if peer_name.trim().is_empty() {
+            "LAN"
+        } else {
+            peer_name.trim()
+        };
         for index in 1..=100 {
             let team = self.load_owned_team(user_id, team_id).await?;
-            if team.agents.iter().any(|agent| decode_remote_agent(agent)
-                .is_some_and(|remote| remote.peer_id == peer_id && remote.share_id == remote_team_id)) {
+            if team.agents.iter().any(|agent| {
+                decode_remote_agent(agent)
+                    .is_some_and(|remote| remote.peer_id == peer_id && remote.share_id == remote_team_id)
+            }) {
                 return Ok(());
             }
-            let name = if index == 1 { base.to_owned() } else { format!("{base} {index}") };
-            let request = AddRemoteAgentRequest { name, peer_id: peer_id.to_owned(), share_id: remote_team_id.to_owned(),
-                share_label: base.to_owned(), backend: "remote".into() };
+            let name = if index == 1 {
+                base.to_owned()
+            } else {
+                format!("{base} {index}")
+            };
+            let request = AddRemoteAgentRequest {
+                name,
+                peer_id: peer_id.to_owned(),
+                share_id: remote_team_id.to_owned(),
+                share_label: base.to_owned(),
+                backend: "remote".into(),
+            };
             match self.add_remote_agent(user_id, team_id, request).await {
                 Ok(_) => return Ok(()),
                 Err(TeamError::DuplicateAgentName(_)) | Err(TeamError::InvalidRequest(_)) => continue,
@@ -509,7 +529,9 @@ impl TeamSessionService {
             decode_remote_agent(agent)
                 .is_some_and(|remote| remote.peer_id == req.peer_id && remote.share_id == req.share_id)
         }) {
-            return Err(TeamError::InvalidRequest("LAN conversation is already a team member".into()));
+            return Err(TeamError::InvalidRequest(
+                "LAN conversation is already a team member".into(),
+            ));
         }
         let slot_id = format!("lan-{}", generate_id());
         let agent = TeamAgent {
@@ -2637,86 +2659,109 @@ impl TeamSessionService {
         let (content, files) = self.resolve_message_attachments(user_id, content, files).await?;
         let row = self.load_owned_team_row(user_id, team_id).await?;
         let team = Team::from_row(&row)?;
-        if let Some(agent) = team.agents.iter().find(|agent| agent.slot_id == slot_id) {
-            if let Some(remote) = decode_remote_agent(agent) {
-                if files.as_ref().is_some_and(|f| !f.is_empty()) {
-                    return Err(TeamError::InvalidRequest(
-                        "files are not supported for LAN team messages".into(),
-                    ));
+        if let Some(agent) = team.agents.iter().find(|agent| agent.slot_id == slot_id)
+            && let Some(remote) = decode_remote_agent(agent)
+        {
+            if files.as_ref().is_some_and(|f| !f.is_empty()) {
+                return Err(TeamError::InvalidRequest(
+                    "files are not supported for LAN team messages".into(),
+                ));
+            }
+            let port = self
+                .remote_port
+                .read()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .ok_or_else(|| TeamError::InvalidRequest("LAN team service unavailable".into()))?;
+            let sent = port
+                .send(
+                    user_id,
+                    TeamRemoteMessage {
+                        team_id: team_id.to_owned(),
+                        from_slot_id: "user".into(),
+                        to_slot_id: slot_id.to_owned(),
+                        peer_id: remote.peer_id,
+                        share_id: remote.share_id,
+                        share_label: remote.share_label,
+                        thread_id: remote.thread_id,
+                        content: content.clone(),
+                    },
+                )
+                .await?;
+            let mailbox = crate::mailbox::Mailbox::new_for_user(self.repo.clone(), user_id).with_events(Arc::new(
+                TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone()),
+            ));
+            if let Some(row) = &sent.persisted_message {
+                TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone())
+                    .broadcast_mailbox_changed(
+                        crate::activity_mapping::mailbox_row_to_response(row),
+                        aionui_api_types::TeamMailboxChange::Created,
+                    );
+            } else {
+                mailbox
+                    .write(
+                        team_id,
+                        slot_id,
+                        "user",
+                        crate::types::MailboxMessageType::Message,
+                        &content,
+                        None,
+                    )
+                    .await?;
+            }
+            if let Some(reply) = sent.result_text.as_deref().filter(|s| !s.is_empty()) {
+                mailbox
+                    .write(
+                        team_id,
+                        "user",
+                        slot_id,
+                        crate::types::MailboxMessageType::Message,
+                        reply,
+                        None,
+                    )
+                    .await?;
+            }
+            if sent.persisted_message.is_none() {
+                let mut updated = team;
+                if let Some(target) = updated.agents.iter_mut().find(|a| a.slot_id == slot_id)
+                    && let Some(mut metadata) = decode_remote_agent(target)
+                {
+                    metadata.thread_id = Some(sent.thread_id);
+                    target.conversation_type = Some(encode_remote_agent(&metadata));
                 }
-                let port = self
-                    .remote_port
-                    .read()
-                    .ok()
-                    .and_then(|guard| guard.clone())
-                    .ok_or_else(|| TeamError::InvalidRequest("LAN team service unavailable".into()))?;
-                let sent = port
-                    .send(
+                self.repo
+                    .update_team(
                         user_id,
-                        TeamRemoteMessage {
-                            team_id: team_id.to_owned(),
-                            from_slot_id: "user".into(),
-                            to_slot_id: slot_id.to_owned(),
-                            peer_id: remote.peer_id,
-                            share_id: remote.share_id,
-                            share_label: remote.share_label,
-                            thread_id: remote.thread_id,
-                            content: content.clone(),
+                        team_id,
+                        &UpdateTeamParams {
+                            agents: Some(serde_json::to_string(&updated.agents)?),
+                            ..Default::default()
                         },
                     )
                     .await?;
-                let mailbox = crate::mailbox::Mailbox::new_for_user(self.repo.clone(), user_id).with_events(Arc::new(
-                    TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone()),
-                ));
-                if let Some(row) = &sent.persisted_message {
-                    TeamEventEmitter::new(team_id.to_owned(), user_id.to_owned(), self.broadcaster.clone())
-                        .broadcast_mailbox_changed(crate::activity_mapping::mailbox_row_to_response(row), aionui_api_types::TeamMailboxChange::Created);
-                } else {
-                    mailbox.write(team_id, slot_id, "user", crate::types::MailboxMessageType::Message, &content, None).await?;
-                }
-                if let Some(reply) = sent.result_text.as_deref().filter(|s| !s.is_empty()) {
-                    mailbox
-                        .write(
-                            team_id,
-                            "user",
-                            slot_id,
-                            crate::types::MailboxMessageType::Message,
-                            reply,
-                            None,
-                        )
-                        .await?;
-                }
-                if sent.persisted_message.is_none() {
-                    let mut updated = team;
-                    if let Some(target) = updated.agents.iter_mut().find(|a| a.slot_id == slot_id) {
-                        if let Some(mut metadata) = decode_remote_agent(target) {
-                            metadata.thread_id = Some(sent.thread_id);
-                            target.conversation_type = Some(encode_remote_agent(&metadata));
-                        }
-                    }
-                    self.repo.update_team(user_id, team_id, &UpdateTeamParams {
-                        agents: Some(serde_json::to_string(&updated.agents)?), ..Default::default()
-                    }).await?;
-                }
-                return Ok(TeamRunAckResponse {
-                    enqueue_status: TeamMessageEnqueueStatus::Accepted,
-                    message_id: sent.persisted_message.as_ref().map(|row| row.id.clone()).unwrap_or_else(generate_id),
-                    run: TeamRunPayload {
-                        team_id: team_id.to_owned(),
-                        team_run_id: generate_id(),
-                        source: TeamRunSource::UserMessage,
-                        has_user_intervention: true,
-                        target_slot_id: slot_id.to_owned(),
-                        target_role: TeamRunTargetRole::Teammate,
-                        status: TeamRunStatus::Completed,
-                        queued_intent_count: 0,
-                        starting_batch_count: 0,
-                        running_batch_count: 0,
-                        active_enqueue_lease_count: 0,
-                        slot_work: Vec::new(),
-                    },
-                });
             }
+            return Ok(TeamRunAckResponse {
+                enqueue_status: TeamMessageEnqueueStatus::Accepted,
+                message_id: sent
+                    .persisted_message
+                    .as_ref()
+                    .map(|row| row.id.clone())
+                    .unwrap_or_else(generate_id),
+                run: TeamRunPayload {
+                    team_id: team_id.to_owned(),
+                    team_run_id: generate_id(),
+                    source: TeamRunSource::UserMessage,
+                    has_user_intervention: true,
+                    target_slot_id: slot_id.to_owned(),
+                    target_role: TeamRunTargetRole::Teammate,
+                    status: TeamRunStatus::Completed,
+                    queued_intent_count: 0,
+                    starting_batch_count: 0,
+                    running_batch_count: 0,
+                    active_enqueue_lease_count: 0,
+                    slot_work: Vec::new(),
+                },
+            });
         }
         self.ensure_session_inner(team_id, Some(user_id)).await?;
         let session = self.published_session(team_id)?;
@@ -3392,18 +3437,43 @@ impl TeamSessionService {
 
     #[allow(clippy::too_many_arguments)]
     pub async fn receive_lan_leader_message_durable(
-        &self, network: &dyn aionui_db::INetworkRepository, user_id: &str, team_id: &str, peer_id: &str,
-        fingerprint: &str, remote_team_id: &str, request_id: &str, content: &str,
+        &self,
+        network: &dyn aionui_db::INetworkRepository,
+        user_id: &str,
+        team_id: &str,
+        peer_id: &str,
+        fingerprint: &str,
+        remote_team_id: &str,
+        request_id: &str,
+        content: &str,
     ) -> Result<bool, TeamError> {
         let team = self.load_owned_team(user_id, team_id).await?;
         ensure_message_not_empty(content, None)?;
-        let sender = team.agents.iter().find(|agent| decode_remote_agent(agent)
-            .is_some_and(|remote| remote.peer_id == peer_id && remote.share_id == remote_team_id))
+        let sender = team
+            .agents
+            .iter()
+            .find(|agent| {
+                decode_remote_agent(agent)
+                    .is_some_and(|remote| remote.peer_id == peer_id && remote.share_id == remote_team_id)
+            })
             .ok_or_else(|| TeamError::Forbidden("LAN member is not part of this team".into()))?;
-        let leader = team.agents.iter().find(|agent| agent.role == TeammateRole::Lead && decode_remote_agent(agent).is_none())
+        let leader = team
+            .agents
+            .iter()
+            .find(|agent| agent.role == TeammateRole::Lead && decode_remote_agent(agent).is_none())
             .ok_or_else(|| TeamError::InvalidRequest("team has no local leader".into()))?;
         self.ensure_session_inner(team_id, Some(user_id)).await?;
-        self.published_session(team_id)?.receive_lan_message(network, fingerprint, remote_team_id, request_id, &sender.slot_id, &leader.slot_id, content).await
+        self.published_session(team_id)?
+            .receive_lan_message(
+                network,
+                fingerprint,
+                remote_team_id,
+                request_id,
+                &sender.slot_id,
+                &leader.slot_id,
+                content,
+            )
+            .await
     }
 
     pub async fn send_agent_message_from_agent(
@@ -3420,12 +3490,19 @@ impl TeamSessionService {
             if let Some(agent) = team.agents.iter().find(|a| a.slot_id == to_slot_id)
                 && let Some(remote) = decode_remote_agent(agent)
             {
-                if !team.agents.iter().any(|sender| sender.slot_id == from_slot_id
-                    && sender.role == TeammateRole::Lead && decode_remote_agent(sender).is_none()) {
-                    return Err(TeamError::Forbidden("only the local leader can message a LAN leader".into()));
+                if !team.agents.iter().any(|sender| {
+                    sender.slot_id == from_slot_id
+                        && sender.role == TeammateRole::Lead
+                        && decode_remote_agent(sender).is_none()
+                }) {
+                    return Err(TeamError::Forbidden(
+                        "only the local leader can message a LAN leader".into(),
+                    ));
                 }
                 if files.as_ref().is_some_and(|files| !files.is_empty()) {
-                    return Err(TeamError::InvalidRequest("files are not supported for LAN team messages".into()));
+                    return Err(TeamError::InvalidRequest(
+                        "files are not supported for LAN team messages".into(),
+                    ));
                 }
                 let port = self
                     .remote_port
@@ -3455,9 +3532,16 @@ impl TeamSessionService {
                     {
                         metadata.thread_id = Some(sent.thread_id);
                         target.conversation_type = Some(encode_remote_agent(&metadata));
-                        self.repo.update_team(&user_id, team_id, &UpdateTeamParams {
-                            agents: Some(serde_json::to_string(&updated.agents)?), ..Default::default()
-                        }).await?;
+                        self.repo
+                            .update_team(
+                                &user_id,
+                                team_id,
+                                &UpdateTeamParams {
+                                    agents: Some(serde_json::to_string(&updated.agents)?),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
                     }
                 }
                 let mailbox = crate::mailbox::Mailbox::new_for_user(self.repo.clone(), &user_id).with_events(Arc::new(
@@ -3465,9 +3549,21 @@ impl TeamSessionService {
                 ));
                 if let Some(row) = &sent.persisted_message {
                     TeamEventEmitter::new(team_id.to_owned(), user_id.clone(), self.broadcaster.clone())
-                        .broadcast_mailbox_changed(crate::activity_mapping::mailbox_row_to_response(row), aionui_api_types::TeamMailboxChange::Created);
+                        .broadcast_mailbox_changed(
+                            crate::activity_mapping::mailbox_row_to_response(row),
+                            aionui_api_types::TeamMailboxChange::Created,
+                        );
                 } else {
-                    mailbox.write(team_id, to_slot_id, from_slot_id, crate::types::MailboxMessageType::Message, content, None).await?;
+                    mailbox
+                        .write(
+                            team_id,
+                            to_slot_id,
+                            from_slot_id,
+                            crate::types::MailboxMessageType::Message,
+                            content,
+                            None,
+                        )
+                        .await?;
                 }
                 if let Some(reply) = sent.result_text.as_deref().filter(|s| !s.is_empty()) {
                     self.published_session(team_id)?

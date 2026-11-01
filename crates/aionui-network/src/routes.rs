@@ -42,12 +42,24 @@ pub fn network_routes(state: NetworkRouterState) -> Router {
         .route("/api/network/peers/{id}/revoke", post(revoke_peer))
         .route("/api/network/peers/{id}/remote-agents", get(remote_agents))
         .route("/api/network/peers/{id}/teams", get(remote_teams))
-        .route("/api/network/peers/{id}/team-invitations", get(remote_team_invitations).post(vote_team_invitation))
-        .route("/api/network/peers/{id}/team-invitations/{invitation_id}/connect", post(reconcile_team_invitation))
+        .route(
+            "/api/network/peers/{id}/team-invitations",
+            get(remote_team_invitations).post(vote_team_invitation),
+        )
+        .route(
+            "/api/network/peers/{id}/team-invitations/{invitation_id}/connect",
+            post(reconcile_team_invitation),
+        )
         .route("/api/network/teams", get(shared_teams))
         .route("/api/network/teams/{id}", axum::routing::put(set_team_shared))
-        .route("/api/network/teams/{id}/invitations", get(pending_local_team_invitation).post(create_team_invitation))
-        .route("/api/network/teams/{id}/invitations/{invitation_id}", delete(cancel_team_invitation))
+        .route(
+            "/api/network/teams/{id}/invitations",
+            get(pending_local_team_invitation).post(create_team_invitation),
+        )
+        .route(
+            "/api/network/teams/{id}/invitations/{invitation_id}",
+            delete(cancel_team_invitation),
+        )
         .route("/api/network/teams/{id}/deliveries", get(team_deliveries))
         .route("/api/network/team-invitation-votes", post(vote_local_team_invitation))
         .route("/api/network/shares", get(list_shares).post(create_share))
@@ -97,7 +109,11 @@ async fn observe_known_peer(
     Json(request): Json<AddPeerRequest>,
 ) -> ApiResult<Option<aionui_api_types::DiscoveredLanPeer>> {
     ensure_manager(device, deviceless, helper)?;
-    ok(state.service.observe_known_peer(&user.id, request).await.map_err(to_api_error)?)
+    ok(state
+        .service
+        .observe_known_peer(&user.id, request)
+        .await
+        .map_err(to_api_error)?)
 }
 
 async fn add_pinned_peer(
@@ -109,7 +125,11 @@ async fn add_pinned_peer(
     Json(request): Json<aionui_api_types::AddPinnedPeerRequest>,
 ) -> ApiResult<PeerView> {
     ensure_manager(device, deviceless, helper)?;
-    ok(state.service.add_pinned_peer(&user.id, request).await.map_err(to_api_error)?)
+    ok(state
+        .service
+        .add_pinned_peer(&user.id, request)
+        .await
+        .map_err(to_api_error)?)
 }
 
 fn ok<T>(value: T) -> ApiResult<T> {
@@ -226,7 +246,11 @@ async fn pending_local_team_invitation(
     Path(id): Path<String>,
 ) -> ApiResult<Option<aionui_api_types::PendingLocalLanInvitation>> {
     ensure_manager(device, deviceless, helper)?;
-    ok(state.service.pending_local_team_invitation(&user.id, &id).await.map_err(to_api_error)?)
+    ok(state
+        .service
+        .pending_local_team_invitation(&user.id, &id)
+        .await
+        .map_err(to_api_error)?)
 }
 
 async fn create_team_invitation(
@@ -239,7 +263,11 @@ async fn create_team_invitation(
     Json(request): Json<aionui_api_types::CreateLanTeamInvitationRequest>,
 ) -> ApiResult<aionui_api_types::CreateLanTeamInvitationResponse> {
     ensure_manager(device, deviceless, helper)?;
-    ok(state.service.create_team_invitation(&user.id, &id, &request.peer_id).await.map_err(to_api_error)?)
+    ok(state
+        .service
+        .create_team_invitation(&user.id, &id, &request.peer_id)
+        .await
+        .map_err(to_api_error)?)
 }
 
 async fn cancel_team_invitation(
@@ -251,7 +279,11 @@ async fn cancel_team_invitation(
     Path((id, invitation_id)): Path<(String, String)>,
 ) -> ApiResult<()> {
     ensure_manager(device, deviceless, helper)?;
-    ok(state.service.cancel_team_invitation(&user.id, &id, &invitation_id).await.map_err(to_api_error)?)
+    ok(state
+        .service
+        .cancel_team_invitation(&user.id, &id, &invitation_id)
+        .await
+        .map_err(to_api_error)?)
 }
 
 async fn vote_local_team_invitation(
@@ -263,7 +295,11 @@ async fn vote_local_team_invitation(
     Json(request): Json<aionui_api_types::PeerInvitationVoteRequest>,
 ) -> ApiResult<aionui_api_types::PeerInvitationVoteResponse> {
     ensure_manager(device, deviceless, helper)?;
-    ok(state.service.vote_local_team_invitation(&user.id, request).await.map_err(to_api_error)?)
+    ok(state
+        .service
+        .vote_local_team_invitation(&user.id, request)
+        .await
+        .map_err(to_api_error)?)
 }
 
 async fn remote_team_invitations(
@@ -271,7 +307,11 @@ async fn remote_team_invitations(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Vec<aionui_api_types::PeerTeamInvitation>> {
-    ok(state.service.remote_team_invitations(&user.id, &id).await.map_err(to_api_error)?)
+    ok(state
+        .service
+        .remote_team_invitations(&user.id, &id)
+        .await
+        .map_err(to_api_error)?)
 }
 
 async fn team_deliveries(
@@ -279,7 +319,11 @@ async fn team_deliveries(
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
 ) -> ApiResult<Vec<aionui_api_types::LanTeamDeliveryStatus>> {
-    ok(state.service.lan_team_delivery_statuses(&user.id, &id).await.map_err(to_api_error)?)
+    ok(state
+        .service
+        .lan_team_delivery_statuses(&user.id, &id)
+        .await
+        .map_err(to_api_error)?)
 }
 
 async fn vote_team_invitation(
@@ -292,7 +336,11 @@ async fn vote_team_invitation(
     Json(request): Json<aionui_api_types::PeerInvitationVoteRequest>,
 ) -> ApiResult<aionui_api_types::PeerInvitationVoteResponse> {
     ensure_manager(device, deviceless, helper)?;
-    ok(state.service.vote_remote_team_invitation(&user.id, &id, request).await.map_err(to_api_error)?)
+    ok(state
+        .service
+        .vote_remote_team_invitation(&user.id, &id, request)
+        .await
+        .map_err(to_api_error)?)
 }
 
 async fn reconcile_team_invitation(
@@ -304,7 +352,11 @@ async fn reconcile_team_invitation(
     Path((peer_id, invitation_id)): Path<(String, String)>,
 ) -> ApiResult<()> {
     ensure_manager(device, deviceless, helper)?;
-    ok(state.service.reconcile_team_invitation(&user.id, &peer_id, &invitation_id).await.map_err(to_api_error)?)
+    ok(state
+        .service
+        .reconcile_team_invitation(&user.id, &peer_id, &invitation_id)
+        .await
+        .map_err(to_api_error)?)
 }
 
 async fn set_team_shared(

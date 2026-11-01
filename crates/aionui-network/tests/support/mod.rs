@@ -183,7 +183,10 @@ pub async fn pair(a: &TestHost, b: &TestHost) {
     let on_b = b.peer_id_of(a).await;
     b.service.approve_peer(OWNER, &on_b).await.unwrap();
     let peers = a.service.list_peers(OWNER).await.unwrap();
-    assert_eq!(peers.iter().find(|peer| peer.id == view.id).unwrap().state, PeerState::Trusted);
+    assert_eq!(
+        peers.iter().find(|peer| peer.id == view.id).unwrap().state,
+        PeerState::Trusted
+    );
 }
 
 /// Poll `check` until it returns `Some`, up to 10 s.

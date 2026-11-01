@@ -361,8 +361,13 @@ async fn an_agent_helper_token_cannot_manage_devices_or_lan_trust() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let (status, body) = send(json_with_token(
-        "GET", "/api/network/teams/team-x/invitations", json!(null), &desktop, "c",
-    )).await;
+        "GET",
+        "/api/network/teams/team-x/invitations",
+        json!(null),
+        &desktop,
+        "c",
+    ))
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["data"].is_null());
 }

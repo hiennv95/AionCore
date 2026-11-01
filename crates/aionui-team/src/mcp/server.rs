@@ -14,7 +14,9 @@ use crate::scheduler::TeammateManager;
 use crate::service::TeamSessionService;
 use crate::session::{AgentMessageQueueResult, SpawnAgentRequest};
 use crate::tool_executor::{TeamToolContext, TeamToolExecutor, team_tool_call_from_name};
-use crate::types::{MailboxMessage, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus, decode_remote_agent};
+use crate::types::{
+    MailboxMessage, TaskStatus, TeamAgent, TeamTask, TeammateRole, TeammateStatus, decode_remote_agent,
+};
 use crate::work_source::WorkSource;
 
 use super::protocol::{
@@ -846,15 +848,27 @@ async fn exec_send_message(
 
     let targets = if resolved_to == "*" {
         let agents = scheduler.list_agents().await;
-        if agents.iter().any(|agent| agent.slot_id != caller_slot_id && decode_remote_agent(agent).is_some()) {
-            if !agents.iter().any(|agent| agent.slot_id == caller_slot_id && agent.role == TeammateRole::Lead && decode_remote_agent(agent).is_none()) {
-                return Err(ToolCallError::from_message("only the local leader can message a LAN leader"));
+        if agents
+            .iter()
+            .any(|agent| agent.slot_id != caller_slot_id && decode_remote_agent(agent).is_some())
+        {
+            if !agents.iter().any(|agent| {
+                agent.slot_id == caller_slot_id
+                    && agent.role == TeammateRole::Lead
+                    && decode_remote_agent(agent).is_none()
+            }) {
+                return Err(ToolCallError::from_message(
+                    "only the local leader can message a LAN leader",
+                ));
             }
             if !input.files.is_empty() {
-                return Err(ToolCallError::from_message("files are not supported for LAN team messages"));
+                return Err(ToolCallError::from_message(
+                    "files are not supported for LAN team messages",
+                ));
             }
         }
-        agents.iter()
+        agents
+            .iter()
             .filter(|a| a.slot_id != caller_slot_id)
             .map(|a| a.slot_id.clone())
             .collect::<Vec<_>>()

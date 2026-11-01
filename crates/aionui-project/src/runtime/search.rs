@@ -106,7 +106,7 @@ impl Budget {
         let taken = self
             .0
             .remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| cur.checked_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| cur.checked_sub(1))
             .is_ok();
         if !taken {
             self.0.hit_cap.store(true, Ordering::Relaxed);

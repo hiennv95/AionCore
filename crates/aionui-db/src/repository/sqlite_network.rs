@@ -4,8 +4,9 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use crate::error::{DbError, message_indicates_unique_violation};
 use crate::models::{NetworkInboundRequestRow, NetworkOutboundRequestRow, NetworkPeerRow, NetworkShareRow};
 use crate::repository::network::{
-    ActiveLanTeamMember, INetworkRepository, InsertInboundParams, InsertOutboundParams, InsertPeerParams, InsertShareParams, LanMessageEnqueue, LanTeamOutboxRow, OutboundUpdate,
-    PendingLanInvitation, RequestUpdate, UpdatePeerParams,
+    ActiveLanTeamMember, INetworkRepository, InsertInboundParams, InsertOutboundParams, InsertPeerParams,
+    InsertShareParams, LanMessageEnqueue, LanTeamOutboxRow, OutboundUpdate, PendingLanInvitation, RequestUpdate,
+    UpdatePeerParams,
 };
 
 /// Terminal request states; rows in these states never change again.
@@ -69,13 +70,19 @@ fn push_state_list(builder: &mut QueryBuilder<'_, Sqlite>, states: &[&str]) {
 #[async_trait::async_trait]
 impl INetworkRepository for SqliteNetworkRepository {
     async fn enqueue_lan_team_outbound_with_mailbox(
-        &self, user_id: &str, peer_id: &str, remote_team_id: &str, message: &crate::models::MailboxMessageRow,
+        &self,
+        user_id: &str,
+        peer_id: &str,
+        remote_team_id: &str,
+        message: &crate::models::MailboxMessageRow,
     ) -> Result<bool, DbError> {
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query("INSERT INTO lan_team_outbox (id, user_id, team_id, peer_id, remote_team_id, content, state, created_at) SELECT ?, teams.user_id, teams.id, peer.id, member.remote_team_id, ?, 'pending', ? FROM teams JOIN lan_shared_teams shared ON shared.team_id = teams.id JOIN lan_team_members member ON member.team_id = teams.id AND member.state = 'active' JOIN network_peers peer ON peer.fingerprint = member.fingerprint AND peer.state = 'trusted' WHERE teams.user_id = ? AND teams.id = ? AND peer.id = ? AND member.remote_team_id = ?")
             .bind(&message.id).bind(&message.content).bind(message.created_at).bind(user_id).bind(&message.team_id).bind(peer_id).bind(remote_team_id)
             .execute(&mut *tx).await?;
-        if inserted.rows_affected() != 1 { return Ok(false); }
+        if inserted.rows_affected() != 1 {
+            return Ok(false);
+        }
         sqlx::query("INSERT INTO mailbox (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&message.id).bind(&message.team_id).bind(&message.to_agent_id).bind(&message.from_agent_id).bind(&message.msg_type)
             .bind(&message.content).bind(&message.summary).bind(&message.files).bind(message.read).bind(message.created_at)
@@ -84,7 +91,13 @@ impl INetworkRepository for SqliteNetworkRepository {
         Ok(true)
     }
     async fn enqueue_lan_team_outbound(
-        &self, id: &str, user_id: &str, team_id: &str, peer_id: &str, remote_team_id: &str, content: &str,
+        &self,
+        id: &str,
+        user_id: &str,
+        team_id: &str,
+        peer_id: &str,
+        remote_team_id: &str,
+        content: &str,
     ) -> Result<bool, DbError> {
         let result = sqlx::query("INSERT INTO lan_team_outbox (id, user_id, team_id, peer_id, remote_team_id, content, state, created_at) SELECT ?, teams.user_id, teams.id, peer.id, member.remote_team_id, ?, 'pending', ? FROM teams JOIN lan_shared_teams shared ON shared.team_id = teams.id JOIN lan_team_members member ON member.team_id = teams.id AND member.state = 'active' JOIN network_peers peer ON peer.fingerprint = member.fingerprint AND peer.state = 'trusted' WHERE teams.user_id = ? AND teams.id = ? AND peer.id = ? AND member.remote_team_id = ?")
             .bind(id).bind(content).bind(now_ms()).bind(user_id).bind(team_id).bind(peer_id).bind(remote_team_id)
@@ -96,13 +109,29 @@ impl INetworkRepository for SqliteNetworkRepository {
             .bind(now).bind(limit).fetch_all(&self.pool).await?)
     }
     async fn defer_lan_team_outbound(&self, id: &str, until: i64) -> Result<bool, DbError> {
-        Ok(sqlx::query("UPDATE lan_team_outbox SET next_attempt_at = ? WHERE id = ? AND state = 'pending'")
-            .bind(until).bind(id).execute(&self.pool).await?.rows_affected() == 1)
+        Ok(
+            sqlx::query("UPDATE lan_team_outbox SET next_attempt_at = ? WHERE id = ? AND state = 'pending'")
+                .bind(until)
+                .bind(id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                == 1,
+        )
     }
     async fn finish_lan_team_outbound(&self, id: &str, state: &str) -> Result<bool, DbError> {
-        if state != "delivered" && state != "revoked" { return Ok(false); }
-        Ok(sqlx::query("UPDATE lan_team_outbox SET state = ? WHERE id = ? AND state = 'pending'")
-            .bind(state).bind(id).execute(&self.pool).await?.rows_affected() == 1)
+        if state != "delivered" && state != "revoked" {
+            return Ok(false);
+        }
+        Ok(
+            sqlx::query("UPDATE lan_team_outbox SET state = ? WHERE id = ? AND state = 'pending'")
+                .bind(state)
+                .bind(id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+                == 1,
+        )
     }
     async fn lan_team_delivery_statuses(&self, user_id: &str, team_id: &str) -> Result<Vec<(String, String)>, DbError> {
         Ok(sqlx::query_as("SELECT outbox.id, outbox.state FROM lan_team_outbox outbox JOIN teams ON teams.id = outbox.team_id WHERE teams.user_id = ? AND outbox.user_id = ? AND outbox.team_id = ? ORDER BY outbox.rowid")
@@ -113,15 +142,23 @@ impl INetworkRepository for SqliteNetworkRepository {
             .bind(user_id).fetch_all(&self.pool).await?)
     }
     async fn enqueue_lan_team_message(
-        &self, user_id: &str, fingerprint: &str, remote_team_id: &str, request_id: &str,
+        &self,
+        user_id: &str,
+        fingerprint: &str,
+        remote_team_id: &str,
+        request_id: &str,
         message: &crate::models::MailboxMessageRow,
     ) -> Result<LanMessageEnqueue, DbError> {
         let mut tx = self.pool.begin().await?;
         let locked = sqlx::query("UPDATE network_peers SET state = state WHERE fingerprint = ? AND state = 'trusted' AND EXISTS (SELECT 1 FROM lan_team_members member JOIN teams ON teams.id = member.team_id JOIN lan_shared_teams shared ON shared.team_id = teams.id WHERE member.team_id = ? AND teams.user_id = ? AND member.fingerprint = network_peers.fingerprint AND member.remote_team_id = ? AND member.state = 'active')")
             .bind(fingerprint).bind(&message.team_id).bind(user_id).bind(remote_team_id).execute(&mut *tx).await?;
-        if locked.rows_affected() != 1 { return Ok(LanMessageEnqueue::Unauthorized); }
+        if locked.rows_affected() != 1 {
+            return Ok(LanMessageEnqueue::Unauthorized);
+        }
         let peer_id: String = sqlx::query_scalar("SELECT id FROM network_peers WHERE fingerprint = ?")
-            .bind(fingerprint).fetch_one(&mut *tx).await?;
+            .bind(fingerprint)
+            .fetch_one(&mut *tx)
+            .await?;
         let existing: Option<(String, String, String)> = sqlx::query_as("SELECT team_id, remote_team_id, mailbox_id FROM lan_team_message_receipts WHERE peer_id = ? AND request_id = ?")
             .bind(&peer_id).bind(request_id).fetch_optional(&mut *tx).await?;
         if let Some((team, remote, mailbox_id)) = existing {
@@ -129,7 +166,11 @@ impl INetworkRepository for SqliteNetworkRepository {
                 .bind(mailbox_id).bind(&message.team_id).bind(&message.to_agent_id).bind(&message.from_agent_id)
                 .bind(&message.msg_type).bind(&message.content).bind(&message.summary).bind(&message.files)
                 .fetch_one(&mut *tx).await?;
-            return Ok(if same && team == message.team_id && remote == remote_team_id { LanMessageEnqueue::Duplicate } else { LanMessageEnqueue::Conflict });
+            return Ok(if same && team == message.team_id && remote == remote_team_id {
+                LanMessageEnqueue::Duplicate
+            } else {
+                LanMessageEnqueue::Conflict
+            });
         }
         sqlx::query("INSERT INTO mailbox (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(&message.id).bind(&message.team_id).bind(&message.to_agent_id).bind(&message.from_agent_id)
@@ -141,7 +182,13 @@ impl INetworkRepository for SqliteNetworkRepository {
         Ok(LanMessageEnqueue::Inserted)
     }
     async fn record_team_pair_attestation(
-        &self, user_id: &str, invitation_id: &str, fingerprint: &str, participants: &str, local: bool, now: i64,
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+        fingerprint: &str,
+        participants: &str,
+        local: bool,
+        now: i64,
     ) -> Result<bool, DbError> {
         let result = sqlx::query("INSERT INTO lan_team_pair_attestations (invitation_id, fingerprint, attested_at) SELECT invitation.id, ?, ? FROM lan_team_invitations invitation JOIN teams ON teams.id = invitation.team_id JOIN lan_team_invitation_votes voter ON voter.invitation_id = invitation.id AND voter.fingerprint = ? WHERE invitation.id = ? AND teams.user_id = ? AND invitation.state = 'pending' AND voter.decision = 'approved' AND (? = 1 OR EXISTS (SELECT 1 FROM network_peers WHERE fingerprint = ? AND state = 'trusted')) AND NOT EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND (vote.decision <> 'approved' OR NOT EXISTS (SELECT 1 FROM json_each(?) item WHERE item.value = vote.fingerprint))) AND (SELECT COUNT(*) FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id) = (SELECT COUNT(DISTINCT value) FROM json_each(?)) ON CONFLICT (invitation_id, fingerprint) DO UPDATE SET attested_at = excluded.attested_at")
             .bind(fingerprint).bind(now).bind(fingerprint).bind(invitation_id).bind(user_id).bind(local).bind(fingerprint).bind(participants).bind(participants)
@@ -149,12 +196,21 @@ impl INetworkRepository for SqliteNetworkRepository {
         Ok(result.rows_affected() == 1)
     }
 
-    async fn team_pair_attestations_complete(&self, user_id: &str, invitation_id: &str, since: i64) -> Result<bool, DbError> {
+    async fn team_pair_attestations_complete(
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+        since: i64,
+    ) -> Result<bool, DbError> {
         Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM lan_team_invitations invitation JOIN teams ON teams.id = invitation.team_id WHERE invitation.id = ? AND teams.user_id = ? AND invitation.state = 'pending' AND EXISTS (SELECT 1 FROM lan_team_invitation_votes WHERE invitation_id = invitation.id) AND NOT EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND (vote.decision <> 'approved' OR NOT EXISTS (SELECT 1 FROM lan_team_pair_attestations attestation WHERE attestation.invitation_id = vote.invitation_id AND attestation.fingerprint = vote.fingerprint AND attestation.attested_at >= ?))))")
             .bind(invitation_id).bind(user_id).bind(since).fetch_one(&self.pool).await?)
     }
     async fn complete_team_invitation(
-        &self, user_id: &str, invitation_id: &str, local_fingerprint: &str, since: i64,
+        &self,
+        user_id: &str,
+        invitation_id: &str,
+        local_fingerprint: &str,
+        since: i64,
     ) -> Result<bool, DbError> {
         let mut tx = self.pool.begin().await?;
         let updated = sqlx::query("UPDATE lan_team_invitations AS invitation SET state = 'completed' WHERE invitation.id = ? AND invitation.state = 'pending' AND EXISTS (SELECT 1 FROM teams JOIN lan_shared_teams shared ON shared.team_id = teams.id WHERE teams.id = invitation.team_id AND teams.user_id = ?) AND EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND vote.fingerprint = ? AND vote.remote_team_id = invitation.team_id) AND EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND vote.fingerprint = invitation.candidate_fingerprint) AND NOT EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND (vote.decision <> 'approved' OR vote.remote_team_id IS NULL OR length(trim(vote.remote_team_id)) = 0 OR (vote.fingerprint <> ? AND NOT EXISTS (SELECT 1 FROM network_peers peer WHERE peer.fingerprint = vote.fingerprint AND peer.state = 'trusted')) OR NOT EXISTS (SELECT 1 FROM lan_team_pair_attestations attestation WHERE attestation.invitation_id = vote.invitation_id AND attestation.fingerprint = vote.fingerprint AND attestation.attested_at >= ?))) AND NOT EXISTS (SELECT 1 FROM lan_team_members member WHERE member.team_id = invitation.team_id AND member.state = 'active' AND NOT EXISTS (SELECT 1 FROM lan_team_invitation_votes vote WHERE vote.invitation_id = invitation.id AND vote.fingerprint = member.fingerprint AND vote.remote_team_id = member.remote_team_id))")
@@ -170,7 +226,12 @@ impl INetworkRepository for SqliteNetworkRepository {
         Ok(true)
     }
     async fn record_team_poll_consent(
-        &self, user_id: &str, team_id: &str, coordinator: &str, invitation_id: &str, participants: &str,
+        &self,
+        user_id: &str,
+        team_id: &str,
+        coordinator: &str,
+        invitation_id: &str,
+        participants: &str,
     ) -> Result<bool, DbError> {
         let result = sqlx::query("INSERT INTO lan_team_poll_consents (coordinator_fingerprint, invitation_id, team_id, participants) SELECT ?, ?, teams.id, ? FROM teams JOIN lan_shared_teams ON lan_shared_teams.team_id = teams.id JOIN network_peers ON network_peers.fingerprint = ? AND network_peers.state = 'trusted' WHERE teams.user_id = ? AND teams.id = ? AND NOT EXISTS (SELECT 1 FROM lan_team_members member WHERE member.team_id = teams.id AND member.state = 'active' AND NOT EXISTS (SELECT 1 FROM json_each(?) participant WHERE participant.value = member.fingerprint)) AND NOT EXISTS (SELECT 1 FROM lan_team_invitations invitation WHERE invitation.team_id = teams.id AND invitation.state = 'pending') AND NOT EXISTS (SELECT 1 FROM lan_team_poll_consents consent WHERE consent.team_id = teams.id AND (consent.coordinator_fingerprint <> ? OR consent.invitation_id <> ?)) ON CONFLICT (coordinator_fingerprint, invitation_id) DO UPDATE SET participants = excluded.participants WHERE lan_team_poll_consents.team_id = excluded.team_id AND lan_team_poll_consents.participants = excluded.participants")
             .bind(coordinator).bind(invitation_id).bind(participants).bind(coordinator).bind(user_id).bind(team_id).bind(participants).bind(coordinator).bind(invitation_id)
@@ -178,18 +239,30 @@ impl INetworkRepository for SqliteNetworkRepository {
         Ok(result.rows_affected() == 1)
     }
 
-    async fn remove_team_poll_consent(&self, user_id: &str, coordinator: &str, invitation_id: &str) -> Result<bool, DbError> {
+    async fn remove_team_poll_consent(
+        &self,
+        user_id: &str,
+        coordinator: &str,
+        invitation_id: &str,
+    ) -> Result<bool, DbError> {
         Ok(sqlx::query("DELETE FROM lan_team_poll_consents WHERE coordinator_fingerprint = ? AND invitation_id = ? AND EXISTS (SELECT 1 FROM teams WHERE teams.id = lan_team_poll_consents.team_id AND teams.user_id = ?)")
             .bind(coordinator).bind(invitation_id).bind(user_id).execute(&self.pool).await?.rows_affected() == 1)
     }
     async fn team_poll_consent(
-        &self, user_id: &str, coordinator: &str, invitation_id: &str,
+        &self,
+        user_id: &str,
+        coordinator: &str,
+        invitation_id: &str,
     ) -> Result<Option<(String, String)>, DbError> {
         Ok(sqlx::query_as("SELECT consent.team_id, consent.participants FROM lan_team_poll_consents consent JOIN teams ON teams.id = consent.team_id JOIN lan_shared_teams ON lan_shared_teams.team_id = teams.id JOIN network_peers peer ON peer.fingerprint = consent.coordinator_fingerprint AND peer.state = 'trusted' WHERE teams.user_id = ? AND consent.coordinator_fingerprint = ? AND consent.invitation_id = ?")
             .bind(user_id).bind(coordinator).bind(invitation_id).fetch_optional(&self.pool).await?)
     }
     async fn apply_team_poll_membership(
-        &self, user_id: &str, coordinator: &str, invitation_id: &str, local_fingerprint: &str,
+        &self,
+        user_id: &str,
+        coordinator: &str,
+        invitation_id: &str,
+        local_fingerprint: &str,
         members: &[(String, String)],
     ) -> Result<bool, DbError> {
         let mut tx = self.pool.begin().await?;
@@ -201,34 +274,63 @@ impl INetworkRepository for SqliteNetworkRepository {
         }
         let (team_id, participants): (String, String) = sqlx::query_as("SELECT team_id, participants FROM lan_team_poll_consents WHERE coordinator_fingerprint = ? AND invitation_id = ?")
             .bind(coordinator).bind(invitation_id).fetch_one(&mut *tx).await?;
-        let Ok(expected) = serde_json::from_str::<Vec<String>>(&participants) else { return Ok(false) };
-        let mut actual = members.iter().map(|(fingerprint, _)| fingerprint.clone()).collect::<Vec<_>>();
+        let Ok(expected) = serde_json::from_str::<Vec<String>>(&participants) else {
+            return Ok(false);
+        };
+        let mut actual = members
+            .iter()
+            .map(|(fingerprint, _)| fingerprint.clone())
+            .collect::<Vec<_>>();
         actual.sort_unstable();
         let mut expected_sorted = expected.clone();
         expected_sorted.sort_unstable();
-        if actual != expected_sorted || actual.windows(2).any(|pair| pair[0] == pair[1])
+        if actual != expected_sorted
+            || actual.windows(2).any(|pair| pair[0] == pair[1])
             || !actual.iter().any(|fingerprint| fingerprint == coordinator)
-            || members.iter().any(|(fingerprint, team)| fingerprint.is_empty() || team.trim().is_empty())
-            || !members.iter().any(|(fingerprint, team)| fingerprint == local_fingerprint && team == &team_id)
+            || members
+                .iter()
+                .any(|(fingerprint, team)| fingerprint.is_empty() || team.trim().is_empty())
+            || !members
+                .iter()
+                .any(|(fingerprint, team)| fingerprint == local_fingerprint && team == &team_id)
         {
             return Ok(false);
         }
-        for (fingerprint, _) in members.iter().filter(|(fingerprint, _)| fingerprint != local_fingerprint) {
-            let trusted: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM network_peers WHERE fingerprint = ? AND state = 'trusted')")
-                .bind(fingerprint).fetch_one(&mut *tx).await?;
-            if !trusted { return Ok(false); }
+        for (fingerprint, _) in members
+            .iter()
+            .filter(|(fingerprint, _)| fingerprint != local_fingerprint)
+        {
+            let trusted: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM network_peers WHERE fingerprint = ? AND state = 'trusted')",
+            )
+            .bind(fingerprint)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !trusted {
+                return Ok(false);
+            }
         }
-        let active: Vec<(String, String)> = sqlx::query_as("SELECT fingerprint, remote_team_id FROM lan_team_members WHERE team_id = ? AND state = 'active'")
-            .bind(&team_id).fetch_all(&mut *tx).await?;
+        let active: Vec<(String, String)> = sqlx::query_as(
+            "SELECT fingerprint, remote_team_id FROM lan_team_members WHERE team_id = ? AND state = 'active'",
+        )
+        .bind(&team_id)
+        .fetch_all(&mut *tx)
+        .await?;
         if active.iter().any(|member| !members.contains(member)) {
             return Ok(false);
         }
-        for (fingerprint, remote_team) in members.iter().filter(|(fingerprint, _)| fingerprint != local_fingerprint) {
+        for (fingerprint, remote_team) in members
+            .iter()
+            .filter(|(fingerprint, _)| fingerprint != local_fingerprint)
+        {
             sqlx::query("INSERT INTO lan_team_members (team_id, fingerprint, remote_team_id, state) VALUES (?, ?, ?, 'active') ON CONFLICT (team_id, fingerprint) DO UPDATE SET remote_team_id = excluded.remote_team_id, state = excluded.state")
                 .bind(&team_id).bind(fingerprint).bind(remote_team).execute(&mut *tx).await?;
         }
         sqlx::query("DELETE FROM lan_team_poll_consents WHERE coordinator_fingerprint = ? AND invitation_id = ?")
-            .bind(coordinator).bind(invitation_id).execute(&mut *tx).await?;
+            .bind(coordinator)
+            .bind(invitation_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -237,7 +339,11 @@ impl INetworkRepository for SqliteNetworkRepository {
             .bind(user_id).fetch_all(&self.pool).await?)
     }
     async fn authorized_lan_team_member(
-        &self, user_id: &str, team_id: &str, fingerprint: &str, remote_team_id: &str,
+        &self,
+        user_id: &str,
+        team_id: &str,
+        fingerprint: &str,
+        remote_team_id: &str,
     ) -> Result<Option<String>, DbError> {
         Ok(sqlx::query_scalar("SELECT peer.id FROM lan_team_members member JOIN teams ON teams.id = member.team_id JOIN lan_shared_teams shared ON shared.team_id = teams.id JOIN network_peers peer ON peer.fingerprint = member.fingerprint WHERE teams.user_id = ? AND teams.id = ? AND member.fingerprint = ? AND member.remote_team_id = ? AND member.state = 'active' AND peer.state = 'trusted'")
             .bind(user_id).bind(team_id).bind(fingerprint).bind(remote_team_id).fetch_optional(&self.pool).await?)
@@ -268,8 +374,12 @@ impl INetworkRepository for SqliteNetworkRepository {
         if result.rows_affected() != 1 {
             let blocked: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM lan_team_poll_consents consent JOIN teams ON teams.id = consent.team_id WHERE teams.id = ? AND teams.user_id = ?)")
                 .bind(team_id).bind(user_id).fetch_one(&mut *tx).await?;
-            if blocked { return Err(DbError::Conflict("conversation has an active invitation".into())); }
-            return Err(DbError::NotFound("shared team or eligible trusted peer not found".into()));
+            if blocked {
+                return Err(DbError::Conflict("conversation has an active invitation".into()));
+            }
+            return Err(DbError::NotFound(
+                "shared team or eligible trusted peer not found".into(),
+            ));
         }
         sqlx::query("INSERT INTO lan_team_invitation_votes (invitation_id, fingerprint, decision) SELECT ?, fingerprint, 'pending' FROM (SELECT ? AS fingerprint UNION SELECT candidate_fingerprint FROM lan_team_invitations WHERE id = ? UNION SELECT fingerprint FROM lan_team_members WHERE team_id = ? AND state = 'active')")
             .bind(invitation_id)
@@ -348,7 +458,11 @@ impl INetworkRepository for SqliteNetworkRepository {
         Ok(recorded)
     }
 
-    async fn pending_local_team_invitation(&self, user_id: &str, team_id: &str) -> Result<Option<(String, String, String)>, DbError> {
+    async fn pending_local_team_invitation(
+        &self,
+        user_id: &str,
+        team_id: &str,
+    ) -> Result<Option<(String, String, String)>, DbError> {
         Ok(sqlx::query_as("SELECT invitation.id, invitation.candidate_fingerprint, invitation.state FROM lan_team_invitations invitation JOIN teams ON teams.id = invitation.team_id WHERE teams.user_id = ? AND teams.id = ? AND invitation.id = (SELECT id FROM lan_team_invitations WHERE team_id = teams.id ORDER BY rowid DESC LIMIT 1) AND invitation.state IN ('pending', 'rejected', 'cancelled')")
             .bind(user_id).bind(team_id).fetch_optional(&self.pool).await?)
     }
@@ -391,13 +505,15 @@ impl INetworkRepository for SqliteNetworkRepository {
 
     async fn revoke_peer_and_memberships(&self, id: &str, expected: Option<&str>) -> Result<bool, DbError> {
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query("UPDATE network_peers SET state = 'revoked', updated_at = ? WHERE id = ? AND (? IS NULL OR state = ?)")
-            .bind(now_ms())
-            .bind(id)
-            .bind(expected)
-            .bind(expected)
-            .execute(&mut *tx)
-            .await?;
+        let result = sqlx::query(
+            "UPDATE network_peers SET state = 'revoked', updated_at = ? WHERE id = ? AND (? IS NULL OR state = ?)",
+        )
+        .bind(now_ms())
+        .bind(id)
+        .bind(expected)
+        .bind(expected)
+        .execute(&mut *tx)
+        .await?;
         if result.rows_affected() == 0 {
             tx.commit().await?;
             return Ok(false);
@@ -432,7 +548,9 @@ impl INetworkRepository for SqliteNetworkRepository {
                 .await?;
         } else {
             sqlx::query("DELETE FROM lan_team_poll_consents WHERE team_id = ?")
-                .bind(team_id).execute(&mut *tx).await?;
+                .bind(team_id)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("UPDATE lan_team_invitations SET state = 'cancelled' WHERE team_id = ? AND state = 'pending'")
                 .bind(team_id)
                 .execute(&mut *tx)

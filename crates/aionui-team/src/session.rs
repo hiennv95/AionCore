@@ -539,14 +539,13 @@ impl TeamSession {
 
     pub(crate) async fn settle_background_batch(&self, batch: &WorkBatch) {
         let completion = self.work_coordinator.complete_batch_with_ack(batch);
-        if completion.commit_result == CommitResult::Committed {
-            if let Err(error) = self
+        if completion.commit_result == CommitResult::Committed
+            && let Err(error) = self
                 .mailbox
                 .mark_read_batch(&self.team.id, &completion.ack_message_ids)
                 .await
-            {
-                warn!(team_id = %self.team.id, slot_id = %batch.slot_id, error = %error, "failed to acknowledge idle notifications");
-            }
+        {
+            warn!(team_id = %self.team.id, slot_id = %batch.slot_id, error = %error, "failed to acknowledge idle notifications");
         }
         info!(
             team_id = %self.team.id,
@@ -966,23 +965,42 @@ impl TeamSession {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn receive_lan_message(
-        &self, network: &dyn aionui_db::INetworkRepository, fingerprint: &str, remote_team_id: &str,
-        request_id: &str, from_slot_id: &str, to_slot_id: &str, content: &str,
+        &self,
+        network: &dyn aionui_db::INetworkRepository,
+        fingerprint: &str,
+        remote_team_id: &str,
+        request_id: &str,
+        from_slot_id: &str,
+        to_slot_id: &str,
+        content: &str,
     ) -> Result<bool, TeamError> {
         let to_agent = self.scheduler.get_agent(to_slot_id).await?;
         let from_agent = self.scheduler.get_agent(from_slot_id).await?;
         self.ensure_member_runtime_lazy(to_slot_id, true).await?;
         self.publish_runtime_constraint(to_slot_id).await?;
         let lease = self.work_coordinator.acquire_enqueue(EnqueueRequest {
-            slot_id: to_slot_id.to_owned(), role: target_role_for(to_agent.role), source: WorkSource::McpSendMessage,
-            binding: CausalBinding::InheritRunningBatch { caller_slot_id: from_slot_id.to_owned() },
+            slot_id: to_slot_id.to_owned(),
+            role: target_role_for(to_agent.role),
+            source: WorkSource::McpSendMessage,
+            binding: CausalBinding::InheritRunningBatch {
+                caller_slot_id: from_slot_id.to_owned(),
+            },
         })?;
         let row = aionui_db::models::MailboxMessageRow {
-            id: generate_id(), team_id: self.team.id.clone(), to_agent_id: to_slot_id.to_owned(),
-            from_agent_id: from_slot_id.to_owned(), msg_type: MailboxMessageType::Message.to_string(),
-            content: content.to_owned(), summary: None, files: None, read: false, created_at: aionui_common::now_ms(),
+            id: generate_id(),
+            team_id: self.team.id.clone(),
+            to_agent_id: to_slot_id.to_owned(),
+            from_agent_id: from_slot_id.to_owned(),
+            msg_type: MailboxMessageType::Message.to_string(),
+            content: content.to_owned(),
+            summary: None,
+            files: None,
+            read: false,
+            created_at: aionui_common::now_ms(),
         };
-        let result = network.enqueue_lan_team_message(&self.user_id, fingerprint, remote_team_id, request_id, &row).await;
+        let result = network
+            .enqueue_lan_team_message(&self.user_id, fingerprint, remote_team_id, request_id, &row)
+            .await;
         match result {
             Ok(aionui_db::LanMessageEnqueue::Inserted) => {}
             Ok(aionui_db::LanMessageEnqueue::Duplicate) => {
@@ -1004,14 +1022,25 @@ impl TeamSession {
             }
         }
         TeamEventEmitter::new(self.team.id.clone(), self.user_id.clone(), self.broadcaster.clone())
-            .broadcast_mailbox_changed(crate::activity_mapping::mailbox_row_to_response(&row), aionui_api_types::TeamMailboxChange::Created);
+            .broadcast_mailbox_changed(
+                crate::activity_mapping::mailbox_row_to_response(&row),
+                aionui_api_types::TeamMailboxChange::Created,
+            );
         let projection = TeamMessageProjection::new(self.projection_store.clone(), self.broadcaster.clone());
         let request = TeamProjectionRequest {
-            user_id: self.user_id.clone(), team_id: self.team.id.clone(), slot_id: to_slot_id.to_owned(),
+            user_id: self.user_id.clone(),
+            team_id: self.team.id.clone(),
+            slot_id: to_slot_id.to_owned(),
             conversation_id: to_agent.conversation_id.clone(),
-            source: TeamProjectionSource::Teammate { from_slot_id: from_slot_id.to_owned(), from_name: from_agent.name,
-                sender_backend: Some(from_agent.backend), sender_conversation_id: Some(from_agent.conversation_id) },
-            content: content.to_owned(), files: Vec::new(), visibility: crate::visibility::TeamVisibilityPolicy::teammate_message(),
+            source: TeamProjectionSource::Teammate {
+                from_slot_id: from_slot_id.to_owned(),
+                from_name: from_agent.name,
+                sender_backend: Some(from_agent.backend),
+                sender_conversation_id: Some(from_agent.conversation_id),
+            },
+            content: content.to_owned(),
+            files: Vec::new(),
+            visibility: crate::visibility::TeamVisibilityPolicy::teammate_message(),
             dedupe_key: Some(teammate_dedupe_key(&self.team.id, &row.id, &to_agent.conversation_id)),
         };
         if let Err(error) = projection.project(request).await {

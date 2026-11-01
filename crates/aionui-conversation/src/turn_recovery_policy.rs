@@ -212,10 +212,7 @@ mod tests {
             let retry = sink.send();
             assert!(retry.acknowledged, "a before-effect drop may be retried");
         } else {
-            assert!(
-                first_uncertain,
-                "an after-effect drop must remain visibly uncertain"
-            );
+            assert!(first_uncertain, "an after-effect drop must remain visibly uncertain");
         }
         sink
     }

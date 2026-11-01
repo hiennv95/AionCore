@@ -57,10 +57,11 @@ impl TeamSessionService {
             });
         }
 
-        if decode_remote_agent(agent).is_some() || !self
-            .conversation_port
-            .supports_context_reset(user_id, &agent.conversation_id)
-            .await?
+        if decode_remote_agent(agent).is_some()
+            || !self
+                .conversation_port
+                .supports_context_reset(user_id, &agent.conversation_id)
+                .await?
         {
             return Ok(TeamContextResetCapability {
                 supported: false,

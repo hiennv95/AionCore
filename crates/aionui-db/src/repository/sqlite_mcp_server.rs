@@ -318,7 +318,7 @@ fn merge_update(existing: McpServerRow, params: UpdateMcpServerParams<'_>) -> Mc
             .original_json
             .map_or(existing.original_json, |v| v.map(String::from)),
         builtin: params.builtin.unwrap_or(existing.builtin),
-        deleted_at: params.deleted_at.map_or(existing.deleted_at, |v| v),
+        deleted_at: params.deleted_at.unwrap_or(existing.deleted_at),
         created_at: existing.created_at,
         updated_at: now,
     }

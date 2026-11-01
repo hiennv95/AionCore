@@ -10,8 +10,8 @@ use crate::protocol::send_error::AgentSendError;
 use crate::shared_kernel::SessionId as DomainSessionId;
 use crate::types::SendMessageData;
 use agent_client_protocol::schema::v1::{
-    AudioContent, AuthMethod, ContentBlock, ForkSessionRequest, ImageContent, LoadSessionRequest, McpServer, PromptRequest,
-    PromptResponse, SessionId, StopReason, Usage, UsageUpdate,
+    AudioContent, AuthMethod, ContentBlock, ForkSessionRequest, ImageContent, LoadSessionRequest, McpServer,
+    PromptRequest, PromptResponse, SessionId, StopReason, Usage, UsageUpdate,
 };
 use aionui_api_types::SlashCommandItem;
 use serde_json::Value;
@@ -33,9 +33,9 @@ pub(super) enum PromptOutcome {
 }
 
 fn has_team_mcp(servers: &[McpServer]) -> bool {
-    servers.iter().any(|server| {
-        matches!(server, McpServer::Stdio(server) if server.name == aionui_api_types::TEAM_MCP_SERVER_NAME)
-    })
+    servers.iter().any(
+        |server| matches!(server, McpServer::Stdio(server) if server.name == aionui_api_types::TEAM_MCP_SERVER_NAME),
+    )
 }
 
 impl AcpAgentManager {
@@ -232,7 +232,9 @@ impl AcpAgentManager {
         // A fresh process cannot receive the current Team MCP endpoint without
         // session/load or the metadata resume handshake above.
         if has_team_mcp(&self.params.mcp_servers) {
-            return Err(AgentError::bad_request(aionui_api_types::TEAM_SESSION_RESUME_UNSUPPORTED));
+            return Err(AgentError::bad_request(
+                aionui_api_types::TEAM_SESSION_RESUME_UNSUPPORTED,
+            ));
         }
 
         // Legacy path: backend advertised neither claude-meta-resume nor

@@ -522,15 +522,23 @@ impl TeamConversationProvisioningPort for TeamConversationAdapters {
         let Some(row) = self.conversation_repo.get(user_id, conversation_id).await? else {
             return Ok(None);
         };
-        if let Some(snapshot) = self.conversation_repo.get_assistant_snapshot(user_id, conversation_id).await? {
+        if let Some(snapshot) = self
+            .conversation_repo
+            .get_assistant_snapshot(user_id, conversation_id)
+            .await?
+        {
             let id = snapshot.agent_id.trim();
             if !id.is_empty() {
                 return Ok(Some(id.to_owned()));
             }
         }
         let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or(serde_json::Value::Null);
-        Ok(extra.get("agent_id").and_then(serde_json::Value::as_str).map(str::trim)
-            .filter(|id| !id.is_empty()).map(str::to_owned))
+        Ok(extra
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned))
     }
 
     async fn create_team_temp_workspace(&self, user_id: &str, team_id: &str) -> Result<String, TeamError> {
@@ -760,8 +768,9 @@ fn map_conversation_update_error(error: ConversationError) -> TeamError {
         ConversationError::WorkspacePathUnavailable { path } => TeamError::WorkspacePathUnavailable(path),
         ConversationError::WorkspacePathRuntimeUnavailable { path } => TeamError::WorkspacePathRuntimeUnavailable(path),
         ConversationError::Forbidden { reason } => TeamError::Forbidden(reason),
-        ConversationError::BadRequest { reason } if reason == aionui_api_types::TEAM_SESSION_RESUME_UNSUPPORTED =>
-            TeamError::SessionResumeUnsupported,
+        ConversationError::BadRequest { reason } if reason == aionui_api_types::TEAM_SESSION_RESUME_UNSUPPORTED => {
+            TeamError::SessionResumeUnsupported
+        }
         ConversationError::ActiveAgentNotFound { conversation_id } => TeamError::RuntimeNotReady { conversation_id },
         ConversationError::NotFound { id } => TeamError::InvalidRequest(format!("conversation not found: {id}")),
         ConversationError::NotFoundReason { reason } => TeamError::InvalidRequest(reason),

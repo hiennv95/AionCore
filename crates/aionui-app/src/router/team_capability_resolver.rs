@@ -188,12 +188,25 @@ mod tests {
             ("8e1acf31", r#"{"mcp_capabilities":{}}"#),
         ] {
             sqlx::query("UPDATE agent_metadata SET agent_capabilities = ? WHERE agent_id = ?")
-                .bind(snapshot).bind(id).execute(db.pool()).await.unwrap();
+                .bind(snapshot)
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
         }
         let resolver = TeamCapabilityResolver::new(Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone())));
-        let mcp = resolver.resolve("system_default_user", "acp", Some("2d23ff1c")).await.unwrap();
-        let cli = resolver.resolve("system_default_user", "acp", Some("8e1acf31")).await.unwrap();
-        let missing = resolver.resolve("system_default_user", "acp", Some("missing")).await.unwrap();
+        let mcp = resolver
+            .resolve("system_default_user", "acp", Some("2d23ff1c"))
+            .await
+            .unwrap();
+        let cli = resolver
+            .resolve("system_default_user", "acp", Some("8e1acf31"))
+            .await
+            .unwrap();
+        let missing = resolver
+            .resolve("system_default_user", "acp", Some("missing"))
+            .await
+            .unwrap();
         assert!(mcp.mcp.stdio);
         assert!(!cli.mcp.stdio);
         assert!(cli.cli_fallback);
