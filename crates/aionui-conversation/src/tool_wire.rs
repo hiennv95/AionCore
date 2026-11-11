@@ -141,6 +141,21 @@ mod tests {
     }
 
     #[test]
+    fn truncated_url_password_is_redacted_in_stream_and_history() {
+        let output = format!("{} https://alice:abc;EXAMPLESECRET@localhost/path", "x".repeat(65_508));
+        let mut stream = json!({"type": "tool_call", "data": {"call_id": "c", "output": output}});
+        let mut history = stream["data"].clone();
+        sanitize_stream_payload(&mut stream);
+        sanitize_message_content("tool_call", &mut history, Limits::BOUNDED);
+        assert_eq!(stream["data"], history);
+        assert_eq!(history["output_truncated"], true);
+        assert!(!history.to_string().contains("EXAMPLE"));
+        let output = history["output"].as_str().unwrap();
+        assert!(output.starts_with(&"x".repeat(65_508)));
+        assert!(output.ends_with("[redacted]"));
+    }
+
+    #[test]
     fn a_tool_call_keeps_its_shape_and_loses_secrets_and_bulk() {
         let mut data = json!({
             "call_id": "toolu_1", "name": "Run curl", "status": "completed",

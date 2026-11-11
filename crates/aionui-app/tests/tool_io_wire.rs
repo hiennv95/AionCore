@@ -56,6 +56,12 @@ async fn history_redacts_and_bounds_tool_payloads_but_storage_stays_raw() {
             "tool_call_id": "a1", "status": "completed", "title": "Run ls", "raw_input": {"command": "ls", "password": "hunter2"},
             "raw_output": big()}}),
         ),
+        (
+            "t2",
+            "tool_call",
+            json!({"call_id": "t2", "name": "Run curl", "status": "completed",
+            "output": format!("{} https://alice:abc;EXAMPLESECRET@localhost/path", "x".repeat(65_508))}),
+        ),
     ];
     for (n, (id, kind, content)) in rows.iter().enumerate() {
         let row = aionui_db::models::MessageRow {
@@ -84,7 +90,7 @@ async fn history_redacts_and_bounds_tool_payloads_but_storage_stays_raw() {
     .await;
     assert_eq!(status, StatusCode::OK, "{list}");
     let wire = list.to_string();
-    for leaked in ["RAWSECRET", "ENVSECRET", "hunter2"] {
+    for leaked in ["RAWSECRET", "ENVSECRET", "hunter2", "EXAMPLE"] {
         assert!(!wire.contains(leaked), "{leaked} leaked in the history list");
     }
     assert!(wire.len() < 400_000, "list size {}", wire.len());
@@ -96,6 +102,11 @@ async fn history_redacts_and_bounds_tool_payloads_but_storage_stays_raw() {
     let acp = items.iter().find(|m| m["id"] == "a1").unwrap();
     assert_eq!(acp["content"]["update"]["tool_call_id"], "a1");
     assert_eq!(acp["content"]["update"]["raw_output_truncated"], true);
+    let cutoff = items.iter().find(|m| m["id"] == "t2").unwrap();
+    assert_eq!(cutoff["content"]["output_truncated"], true);
+    let cutoff_output = cutoff["content"]["output"].as_str().unwrap();
+    assert!(cutoff_output.starts_with(&"x".repeat(65_508)));
+    assert!(cutoff_output.ends_with("[redacted]"));
 
     // An explicit fetch of one message keeps every byte but still masks secrets.
     let (status, full) = call(
@@ -116,4 +127,6 @@ async fn history_redacts_and_bounds_tool_payloads_but_storage_stays_raw() {
     // Storage is untouched.
     let stored = repo.get_message(&user_id, &conv, "t1").await.unwrap().unwrap();
     assert!(stored.content.contains("RAWSECRET") && stored.content.contains("ENVSECRET"));
+    let stored_cutoff = repo.get_message(&user_id, &conv, "t2").await.unwrap().unwrap();
+    assert!(stored_cutoff.content.contains("EXAMPLESECRET"));
 }

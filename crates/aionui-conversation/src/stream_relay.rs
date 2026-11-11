@@ -1382,6 +1382,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_tool_frame_masks_url_password_at_truncation_boundary() {
+        use aionui_ai_agent::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus};
+
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let mut ws_rx = bus.subscribe();
+        let (tx, rx) = broadcast::channel(8);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+        );
+        let output = format!("{} https://alice:abc;EXAMPLESECRET@localhost/path", "x".repeat(65_508));
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "tool-cutoff".into(),
+            name: "Run curl".into(),
+            args: serde_json::json!({}),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: Some(output),
+            description: None,
+            parent_call_id: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        relay.consume(rx).await;
+
+        let frame = std::iter::from_fn(|| ws_rx.try_recv().ok())
+            .find(|msg| msg.name == "message.stream" && msg.data["type"] == "tool_call")
+            .expect("tool frame");
+        assert_eq!(frame.data["data"]["output_truncated"], true);
+        let sanitized = frame.data["data"]["output"].as_str().unwrap();
+        assert!(sanitized.starts_with(&"x".repeat(65_508)));
+        assert!(sanitized.ends_with("[redacted]"));
+        assert!(!sanitized.contains("EXAMPLE"));
+        let persisted = repo
+            .take_inserts()
+            .into_iter()
+            .find(|m| m.r#type == "tool_call")
+            .unwrap();
+        assert!(persisted.content.contains("EXAMPLESECRET"));
+    }
+
+    #[tokio::test]
     async fn acp_session_info_never_renames_user_owned_name() {
         let repo = Arc::new(RecordingRepo::new());
         *repo.conversation.lock().unwrap() = Some(agent_title_test_row("my name", Some("user")));

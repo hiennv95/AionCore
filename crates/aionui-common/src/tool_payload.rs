@@ -230,7 +230,13 @@ fn bound_string(text: &str, budget: &mut Budget) -> String {
         budget.truncated = true;
     }
     // Redaction can change the length a little, so measure again after it.
-    let redacted = redact_secrets(&text[..cut]);
+    let prefix = &text[..cut];
+    let guarded = if cut < text.len() {
+        redact_truncated_url_authority(prefix)
+    } else {
+        prefix.to_owned()
+    };
+    let redacted = redact_secrets(&guarded);
     let end = prefix_within(&redacted, room);
     if end < redacted.len() {
         budget.truncated = true;
@@ -239,6 +245,23 @@ fn bound_string(text: &str, budget: &mut Budget) -> String {
     // `take` cannot fail here (the cost is within `room`), but a budget below 2 yields an empty string for free.
     let _ = budget.take(escaped_len(out) + 2);
     out.to_owned()
+}
+
+// A truncated authority may not include the final '@' needed to identify user-info.
+// Conservatively hide the tail after ':'; this can also hide a partial host port.
+fn redact_truncated_url_authority(prefix: &str) -> String {
+    let Some(scheme) = prefix.rfind("://") else {
+        return prefix.to_owned();
+    };
+    let start = scheme + 3;
+    let authority = &prefix[start..];
+    if authority.chars().any(is_url_authority_end) {
+        return prefix.to_owned();
+    }
+    let Some(colon) = authority.find(':') else {
+        return prefix.to_owned();
+    };
+    format!("{}{REDACTED}", &prefix[..start + colon + 1])
 }
 
 /// The longest prefix of `text`, on a char boundary, whose escaped length is at most `room`. Stops
@@ -287,7 +310,7 @@ fn redact_url_passwords(text: &str) -> String {
     while let Some(p) = text[from..].find("://") {
         let host_start = from + p + 3;
         let authority_end = text[host_start..]
-            .find(|c: char| matches!(c, '/' | '?' | '#') || is_delimiter(c))
+            .find(is_url_authority_end)
             .map_or(text.len(), |q| host_start + q);
         let authority = &text[host_start..authority_end];
         if let Some(at) = authority.rfind('@')
@@ -303,6 +326,10 @@ fn redact_url_passwords(text: &str) -> String {
     }
     out.push_str(&text[copied..]);
     out
+}
+
+fn is_url_authority_end(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '/' | '?' | '#' | '"' | '{' | '}')
 }
 
 /// A quote at `at`, possibly escaped (`\"`, `\\\"` in JSON printed inside JSON): the index after it,
@@ -491,6 +518,92 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn truncated_url_authority_does_not_leak_password_prefix() {
+        for input in [
+            "https://alice:EXAMPLESECRET@localhost/path",
+            "https://alice:EXAMPLE@STILLSECRET@localhost/path",
+            "https://alice:abc;EXAMPLESECRET@localhost/path",
+        ] {
+            for prefix in ["https://alice:EXAMPLE", "https://alice:EXAMPLE@STILL"] {
+                if !input.starts_with(prefix) {
+                    continue;
+                }
+                let (out, truncated) = redact_and_bound_text(
+                    input,
+                    Limits {
+                        max_bytes: prefix.len() + 2,
+                        max_depth: 16,
+                    },
+                );
+                assert!(truncated);
+                assert!(
+                    !out.contains("EXAMPLE") && !out.contains("STILL"),
+                    "password fragment leaked: {out}"
+                );
+                let bounded = redact_and_bound(
+                    json!(input),
+                    Limits {
+                        max_bytes: prefix.len() + 2,
+                        max_depth: 16,
+                    },
+                );
+                assert!(bounded.truncated);
+                assert!(!bounded.value.to_string().contains("EXAMPLE"));
+                assert!(bounded.value.to_string().len() <= prefix.len() + 2);
+            }
+        }
+        let punctuation = "https://alice:abc;EXAMPLESECRET@localhost/path";
+        let prefix = "https://alice:abc;EXAMPLE";
+        let (out, truncated) = redact_and_bound_text(
+            punctuation,
+            Limits {
+                max_bytes: prefix.len() + 2,
+                max_depth: 16,
+            },
+        );
+        assert!(truncated);
+        assert!(!out.contains("EXAMPLE"));
+        assert!(!redact_secrets(punctuation).contains("EXAMPLE"));
+        for separator in [",", ")", ";", "'"] {
+            let input = format!("https://alice:pré{separator}EXAMPLESECRET@localhost/path");
+            let prefix = format!("https://alice:pré{separator}EXAMPLE");
+            let (out, truncated) = redact_and_bound_text(
+                &input,
+                Limits {
+                    max_bytes: escaped_len(&prefix) + 2,
+                    max_depth: 16,
+                },
+            );
+            assert!(truncated);
+            assert!(!out.contains("EXAMPLE"), "password fragment leaked: {out}");
+            assert!(!redact_secrets(&input).contains("EXAMPLE"));
+            assert_eq!(redact_secrets(&out), out);
+        }
+        let multiple = "https://one:old@host/path https://two:EXAMPLESECRET@host/path";
+        let prefix = "https://one:old@host/path https://two:EXAMPLE";
+        let (out, truncated) = redact_and_bound_text(
+            multiple,
+            Limits {
+                max_bytes: prefix.len() + 2,
+                max_depth: 16,
+            },
+        );
+        assert!(truncated);
+        assert!(!out.contains("old") && !out.contains("EXAMPLE"));
+        let full = "https://alice:EXAMPLESECRET@localhost/path";
+        assert_eq!(
+            redact_and_bound_text(full, Limits::UNBOUNDED_BYTES).0,
+            "https://alice:[redacted]@localhost/path"
+        );
+
+        let long = format!("{} {full}", "x".repeat(TOOL_FIELD_MAX_BYTES - 28));
+        let (out, truncated) = redact_and_bound_text(&long, Limits::BOUNDED);
+        assert!(truncated);
+        assert!(!out.contains("EXAMPLE"));
+        assert!(serde_json::to_string(&out).unwrap().len() <= TOOL_FIELD_MAX_BYTES);
+    }
 
     #[test]
     fn secrets_are_masked_in_keys_and_strings() {

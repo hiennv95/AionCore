@@ -755,4 +755,91 @@ mod tests {
         assert_eq!(delivered["data"]["sequence"], 4);
         bridge.abort();
     }
+
+    #[tokio::test]
+    async fn relay_tool_redaction_reaches_only_owner_through_websocket_bridge() {
+        use aionui_ai_agent::{
+            AgentStreamEvent,
+            protocol::events::{FinishEventData, ToolCallEventData, ToolCallStatus},
+        };
+        use aionui_conversation::stream_relay::StreamRelay;
+        use aionui_db::{IConversationRepository, SqliteConversationRepository, models::ConversationRow};
+
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+        let now = aionui_common::now_ms();
+        repo.create(&ConversationRow {
+            id: "conv-1".into(),
+            user_id: "system_default_user".into(),
+            name: "test".into(),
+            r#type: "aionrs".into(),
+            extra: "{}".into(),
+            model: None,
+            status: Some("running".into()),
+            source: Some("aionui".into()),
+            channel_chat_id: None,
+            pinned: false,
+            pinned_at: None,
+            created_at: now,
+            updated_at: now,
+            project_id: None,
+            folder_id: None,
+            name_source: None,
+        })
+        .await
+        .unwrap();
+
+        let bus = Arc::new(BroadcastEventBus::new(64));
+        let ws_manager = Arc::new(WebSocketManager::new());
+        let (owner_tx, mut owner_rx) = tokio::sync::mpsc::channel(64);
+        let (other_tx, mut other_rx) = tokio::sync::mpsc::channel(64);
+        ws_manager.add_client_for_user("system_default_user".into(), "owner-token".into(), owner_tx);
+        ws_manager.add_client_for_user("other-user".into(), "other-token".into(), other_tx);
+        let bridge = tokio::spawn(forward_event_bus_to_websocket(bus.subscribe(), ws_manager));
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "system_default_user".into(),
+            repo,
+            bus.clone(),
+        );
+        let (tx, rx) = tokio::sync::broadcast::channel(8);
+        tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+            call_id: "tool-cutoff".into(),
+            name: "Run curl".into(),
+            args: json!({}),
+            status: ToolCallStatus::Completed,
+            input: None,
+            output: Some(format!(
+                "{} https://alice:abc;EXAMPLESECRET@localhost/path",
+                "x".repeat(65_508)
+            )),
+            description: None,
+            parent_call_id: None,
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+        relay.consume(rx).await;
+        drop(bus);
+        tokio::time::timeout(std::time::Duration::from_secs(2), bridge)
+            .await
+            .expect("bridge should drain and stop")
+            .unwrap();
+
+        let mut tool_frame = None;
+        while let Ok(WsOutbound::Text(text)) = owner_rx.try_recv() {
+            let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if event["name"] == "message.stream" && event["data"]["type"] == "tool_call" {
+                tool_frame = Some(event);
+            }
+        }
+        let frame = tool_frame.expect("owner receives the tool frame");
+        assert_eq!(frame["data"]["data"]["output_truncated"], true);
+        let output = frame["data"]["data"]["output"].as_str().unwrap();
+        assert!(output.starts_with(&"x".repeat(65_508)));
+        assert!(output.ends_with("[redacted]"));
+        assert!(!output.contains("EXAMPLE"));
+        assert!(other_rx.try_recv().is_err(), "another user must not receive the event");
+    }
 }
